@@ -10,6 +10,12 @@ v0.4 additions:
   LiquidSSD  — Mamba-2 SSD with liquid (input-adaptive) time constants
   ComplexityGate — Per-token complexity estimation for adaptive depth
   LiquidSSMTerpaduLayer — SSM layer with adaptive compute depth
+
+v0.5 additions:
+  FineGrainedGate — Per-head, per-position gating mechanism for DeltaNet
+  FG2GDN — Fine-Grained Gated DeltaNet (enhanced in-context learning)
+  DecaySpectrum — Learnable spectrum of decay rates per head
+  PoSTDecaySSM — SSM layer with position-dependent decay spectra
 """
 
 from losion.core.ssm.ssm_layer import SSMTerpaduLayer, SSMState, InterleavingScheduler
@@ -17,6 +23,8 @@ from losion.core.ssm.mamba2 import Mamba2SSD
 from losion.core.ssm.rwkv7 import RWKV7WKV
 from losion.core.ssm.delta_net import GatedDeltaNet
 from losion.core.ssm.liquid_ssm import LiquidSSD, ComplexityGate, LiquidSSMTerpaduLayer
+from losion.core.ssm.fg2_gdn import FineGrainedGate, FG2GDN
+from losion.core.ssm.post_decay import DecaySpectrum, PoSTDecaySSM
 
 __all__ = [
     "SSMTerpaduLayer",
@@ -28,4 +36,10 @@ __all__ = [
     "LiquidSSD",
     "ComplexityGate",
     "LiquidSSMTerpaduLayer",
+    # FG2-GDN
+    "FineGrainedGate",
+    "FG2GDN",
+    # PoST Decay Spectra
+    "DecaySpectrum",
+    "PoSTDecaySSM",
 ]

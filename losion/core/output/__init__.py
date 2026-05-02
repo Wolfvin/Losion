@@ -2,19 +2,27 @@
 Losion — Output Modules.
 
 Base modules:
-  FlowMatchingHead    — Flow Matching for high-quality generation
+  FlowMatchingDecoder — Flow Matching for high-quality generation
   DiffusionRefinement — Diffusion-based output refinement
+  SpeculativeDecoder  — Speculative decoding with MTP
+  MultiTokenPrediction — Multi-Token Prediction heads
 
-v0.4 addition:
-  MTPSpeculativeDecoder — Multi-Token Prediction speculative decoding
+v0.5 additions:
+  SSMDraftModel — SSM pathway as draft model for speculative decoding
+  MirrorSpeculativeDecoder — Mirror speculative decoding with SSM draft
 """
 
-from losion.core.output.flow_matching import FlowMatchingHead
+from losion.core.output.flow_matching import FlowMatchingDecoder
 from losion.core.output.diffusion_refinement import DiffusionRefinement
-from losion.core.output.speculative_decoder import MTPSpeculativeDecoder
+from losion.core.output.speculative_decoder import SpeculativeDecoder, MultiTokenPrediction
+from losion.core.output.mirror_speculative import SSMDraftModel, MirrorSpeculativeDecoder
 
 __all__ = [
-    "FlowMatchingHead",
+    "FlowMatchingDecoder",
     "DiffusionRefinement",
-    "MTPSpeculativeDecoder",
+    "SpeculativeDecoder",
+    "MultiTokenPrediction",
+    # Mirror Speculative Decoding
+    "SSMDraftModel",
+    "MirrorSpeculativeDecoder",
 ]

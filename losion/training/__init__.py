@@ -9,10 +9,12 @@ Mengimplementasikan training 4-fase dengan dukungan:
 - Advanced RLHF: Self-Play Preference, Value Head, Self-Consistency
 - Advanced Backprop: Chinchilla Scaling, Soft Capping, Scheduled Sampling
 - Advanced Memory/Data: Progressive KV, Attention Sinks, Modality-Aware Loss
+- ETR Entropy Trend Reward: Reduces thinking tokens up to 40%
 
 Penggunaan:
     >>> from losion.training import LosionTrainer, GRPOTrainer, CurriculumScheduler
     >>> from losion.training import AdvancedGRPOTrainer
+    >>> from losion.training import ETRTrainer, ETRRewardFunction, ETRConfig
     >>> from losion.config import LosionConfig
     >>> config = LosionConfig()
     >>> trainer = LosionTrainer(config)
@@ -52,6 +54,21 @@ from losion.training.advanced_memory_data import (
     SampleFilterPipeline,
     TemplateConditionalRouter,
 )
+from losion.training.gen_distillation import (
+    GenerationDistillationConfig,
+    GenerationDistiller,
+)
+from losion.training.compute_aligned import (
+    ComputeAlignedConfig,
+    ComputeAlignedTrainer,
+    ComputeTracker,
+)
+from losion.training.etr_reward import (
+    EntropyTrendTracker,
+    ETRConfig,
+    ETRRewardFunction,
+    ETRTrainer,
+)
 
 __all__ = [
     "LosionTrainer",
@@ -82,4 +99,16 @@ __all__ = [
     "ChinchillaDataSizer",
     "SampleFilterPipeline",
     "TemplateConditionalRouter",
+    # Generation-Focused Distillation
+    "GenerationDistillationConfig",
+    "GenerationDistiller",
+    # Compute-Aligned Training (TACO)
+    "ComputeAlignedConfig",
+    "ComputeAlignedTrainer",
+    "ComputeTracker",
+    # ETR Entropy Trend Reward
+    "EntropyTrendTracker",
+    "ETRConfig",
+    "ETRRewardFunction",
+    "ETRTrainer",
 ]

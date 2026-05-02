@@ -5,12 +5,17 @@ Berisi fungsi utilitas untuk:
 - Deteksi hardware dan kompatibilitas (CUDA, ROCm, CPU)
 - Setup logging untuk training
 - Estimasi memori dan resource
+- HyLo Upcycling: konversi dense checkpoint ke MoE tanpa full retraining
 
 Penggunaan:
     >>> from losion.utils import detect_device, get_gpu_info, setup_logging
     >>> device = detect_device()
     >>> gpu_info = get_gpu_info()
     >>> logger = setup_logging("losion-training")
+
+    >>> from losion.utils import HyLoUpcycler, UpcyclingConfig
+    >>> config = UpcyclingConfig(num_target_experts=8)
+    >>> upcycler = HyLoUpcycler(config)
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ from losion.utils.hardware import (
     recommend_settings,
 )
 from losion.utils.logging import setup_logging
+from losion.utils.upcycling import HyLoUpcycler, UpcyclingConfig
 
 __all__ = [
     # Hardware
@@ -35,4 +41,7 @@ __all__ = [
     "estimate_vram_needed",
     # Logging
     "setup_logging",
+    # HyLo Upcycling
+    "HyLoUpcycler",
+    "UpcyclingConfig",
 ]

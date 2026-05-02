@@ -10,6 +10,11 @@ v0.4 additions:
   MatryoshkaMoE         — Elastic expert count (Matryoshka-style nested MoE)
   GradientRoutedMoE     — Loss-aligned routing via gradient signals
   AsymmetricMoEPlacement — Selective MoE placement with layer-wise sparsity
+
+v0.5 additions (Priority 1):
+  AuxFreeMoERouter      — DeepSeek-V3 style aux-loss-free router
+  MTPMoEHead            — Multi-Token Prediction head for MoE training
+  AuxFreeMoE            — Complete aux-loss-free MoE with MTP training
 """
 
 from losion.core.retrieval.engram import EngramMemory, EngramEntry
@@ -18,6 +23,12 @@ from losion.core.retrieval.heterogeneous_moe import HeterogeneousMoE
 from losion.core.retrieval.matryoshka_moe import MatryoshkaMoE
 from losion.core.retrieval.gradient_routed_moe import GradientRoutedMoE
 from losion.core.retrieval.asymmetric_placement import AsymmetricMoEPlacement
+from losion.core.retrieval.aux_free_moe import (
+    AuxFreeMoERouter,
+    MTPMoEHead,
+    AuxFreeMoE,
+    AuxFreeRoutingInfo,
+)
 
 __all__ = [
     "EngramMemory",
@@ -28,4 +39,8 @@ __all__ = [
     "MatryoshkaMoE",
     "GradientRoutedMoE",
     "AsymmetricMoEPlacement",
+    "AuxFreeMoERouter",
+    "MTPMoEHead",
+    "AuxFreeMoE",
+    "AuxFreeRoutingInfo",
 ]
