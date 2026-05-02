@@ -1,0 +1,118 @@
+# ============================================================================
+# Losion-48B v0.4 — Konfigurasi Produksi 48B Parameter
+# ============================================================================
+# Model produksi skala penuh. Memerlukan cluster multi-GPU
+# (8x H100 80GB atau lebih). Mendukung sequence length hingga 4M
+# token (4.194.304) dengan Lightning Attention + MLA compression.
+# Mengaktifkan semua v0.4 features untuk kualitas dan efisiensi
+# tertinggi.
+# ============================================================================
+
+model:
+  d_model: 4096
+  n_layers: 48
+  vocab_size: 128256
+  max_seq_len: 4194304  # v0.4: 4M tokens via Lightning Attention
+
+  ssm:
+    d_state: 256
+    d_conv: 4
+    expand: 2
+    chunk_size: 512
+    use_wkv: true
+    use_delta_net: true
+    interleaving_ratios: [4, 1, 1]
+    # v0.4: Liquid SSM
+    use_liquid: true
+    complexity_bottleneck: 128
+    depth_entropy_weight: 0.01
+
+  attention:
+    n_heads: 32
+    d_kv: 128
+    mla_latent_dim: 1024
+    use_irope: true
+    irope_ratio: 3
+    base_interleaving_ratio: 5
+    thinking_interleaving_ratio: 2
+    # v0.4: Lightning Attention — 4M context
+    use_lightning: true
+    lightning_window_size: 4096
+    lightning_chunk_size: 8192
+    lightning_feature_map: "elu"
+    lightning_max_context: 4194304  # 4M tokens
+    # v0.4: Shared Attention (Zamba2-style)
+    use_shared_attention: true
+    shared_n_groups: 4
+    shared_pattern: "interleaved"
+    shared_unique_ratio: 0.20
+
+  retrieval:
+    num_experts: 256
+    num_active_experts: 8
+    d_ff: 8192
+    use_engram: true
+    engram_dim: 512
+    use_shared_expert: true
+    # v0.4: Heterogeneous MoE
+    use_heterogeneous: true
+    heterogeneous_min_dim: 2048
+    heterogeneous_max_dim: 16384
+    # v0.4: Matryoshka MoE
+    use_matryoshka: true
+    matryoshka_min_experts: 4
+    matryoshka_max_experts: 8
+    # v0.4: Gradient-routed MoE
+    use_gradient_routed: true
+    gradient_routed_lr: 0.005
+    # v0.4: Asymmetric placement
+    use_asymmetric: true
+    asymmetric_moe_layers: [6, 12, 18, 24, 30, 36, 42]
+
+  router:
+    top_k_pathways: 2
+    use_thinking_toggle: true
+    bias_lr: 0.01
+    aux_loss_weight: 0.0  # aux-loss-free!
+
+  output:
+    use_mtp: true
+    mtp_num_tokens: 4
+    use_flow_matching: true
+    fm_num_steps: 4
+    # v0.4: MTP Speculative Decoding
+    use_speculative: true
+    speculative_draft_tokens: 4
+
+  # v0.4: BitNet 1.58-bit quantization
+  quantization:
+    bitnet:
+      enabled: true
+      warmup_steps: 8000
+      initial_quant_ratio: 0.0
+      threshold: 0.0
+      ste_mode: "atan"
+    fp8:
+      enabled: true
+      fp8_scheme: "dynamic"
+
+  # v0.4: Post-training NAS
+  nas:
+    enabled: false  # run after initial training
+    search_epochs: 40
+    darts_lr: 0.0005
+
+training:
+  batch_size: 512
+  learning_rate: 1.0e-4
+  weight_decay: 0.1
+  warmup_steps: 8000
+  max_steps: 500000
+  grad_clip: 1.0
+  fp8_enabled: true  # v0.4: FP8 training on H100
+  precision: bf16
+
+hardware:
+  device: auto
+  backend: auto
+  compile_model: true

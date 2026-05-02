@@ -1,0 +1,117 @@
+# ============================================================================
+# Losion-1B v0.4 — Konfigurasi Prototipe 1B Parameter
+# ============================================================================
+# Model prototipe untuk eksperimen dan pengembangan. Cukup kecil untuk
+# di-training di single GPU (RTX 4090 / A10G), cukup besar untuk
+# menguji semua fitur arsitektur Tri-Jalur Router.
+#
+# v0.4 additions:
+#   - Lightning Attention (Jalur 2)
+#   - Liquid SSM with adaptive depth (Jalur 1)
+#   - Parallel-head mode (eliminate routing overhead)
+#   - BitNet 1.58-bit quantization
+#   - MTP speculative decoding
+# ============================================================================
+
+model:
+  d_model: 768
+  n_layers: 12
+  vocab_size: 32000
+  max_seq_len: 32768
+
+  ssm:
+    d_state: 64
+    d_conv: 4
+    expand: 2
+    chunk_size: 256
+    use_wkv: true
+    use_delta_net: true
+    interleaving_ratios: [4, 1, 1]
+    # v0.4: Liquid SSM
+    use_liquid: true
+    complexity_bottleneck: 64
+    depth_entropy_weight: 0.01
+
+  attention:
+    n_heads: 12
+    d_kv: 64
+    mla_latent_dim: 128
+    use_irope: true
+    irope_ratio: 3
+    base_interleaving_ratio: 5
+    thinking_interleaving_ratio: 2
+    # v0.4: Lightning Attention
+    use_lightning: true
+    lightning_window_size: 2048
+    lightning_chunk_size: 4096
+    lightning_feature_map: "elu"
+    # v0.4: Shared Attention (Zamba2-style)
+    use_shared_attention: false  # disabled for 1B (only 12 layers)
+    shared_n_groups: 1
+    shared_pattern: "all_shared"
+
+  retrieval:
+    num_experts: 16
+    num_active_experts: 2
+    d_ff: 1536
+    use_engram: true
+    engram_dim: 128
+    use_shared_expert: true
+    # v0.4: Heterogeneous MoE
+    use_heterogeneous: false  # too few experts for 1B
+    # v0.4: Matryoshka MoE
+    use_matryoshka: false
+    # v0.4: Gradient-routed MoE
+    use_gradient_routed: false
+    # v0.4: Asymmetric placement
+    use_asymmetric: false
+
+  router:
+    top_k_pathways: 2
+    use_thinking_toggle: true
+    bias_lr: 0.01
+    aux_loss_weight: 0.0  # aux-loss-free!
+
+  output:
+    use_mtp: true
+    mtp_num_tokens: 2
+    use_flow_matching: false  # too heavy for 1B
+    # v0.4: MTP Speculative Decoding
+    use_speculative: true
+    speculative_draft_tokens: 2
+
+  # v0.4: Parallel-head mode for 1B
+  use_parallel_head: true
+  parallel_head_blend_gate: true
+
+  # v0.4: BitNet 1.58-bit quantization
+  quantization:
+    bitnet:
+      enabled: false  # enable after initial training
+      warmup_steps: 2000
+      initial_quant_ratio: 0.0
+      threshold: 0.0
+      ste_mode: "identity"
+    fp8:
+      enabled: false  # not recommended for 1B on consumer GPUs
+
+  # v0.4: Post-training NAS
+  nas:
+    enabled: false  # run after training
+    search_epochs: 10
+    darts_lr: 0.001
+
+training:
+  batch_size: 32
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  warmup_steps: 2000
+  max_steps: 100000
+  grad_clip: 1.0
+  fp8_enabled: false
+  precision: bf16
+
+hardware:
+  device: auto
+  backend: auto
+  compile_model: true

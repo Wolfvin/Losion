@@ -1,0 +1,125 @@
+# ============================================================================
+# Losion-7B v0.4 — Konfigurasi Menengah 7B Parameter
+# ============================================================================
+# Model menengah untuk produksi skala kecil. Memerlukan multi-GPU
+# atau GPU high-end (A100 80GB / H100). Mendukung sequence length
+# hingga 131K token.
+#
+# v0.4 additions:
+#   - Lightning Attention (Jalur 2)
+#   - Liquid SSM with adaptive depth (Jalur 1)
+#   - Shared Attention (Zamba2-style, 6x KV cache reduction)
+#   - Heterogeneous MoE + Matryoshka MoE (Jalur 3)
+#   - Gradient-routed MoE
+#   - BitNet 1.58-bit quantization
+#   - FP8 training
+#   - MTP speculative decoding
+#   - Post-training NAS
+# ============================================================================
+
+model:
+  d_model: 2048
+  n_layers: 24
+  vocab_size: 128256
+  max_seq_len: 131072
+
+  ssm:
+    d_state: 128
+    d_conv: 4
+    expand: 2
+    chunk_size: 256
+    use_wkv: true
+    use_delta_net: true
+    interleaving_ratios: [4, 1, 1]
+    # v0.4: Liquid SSM
+    use_liquid: true
+    complexity_bottleneck: 96
+    depth_entropy_weight: 0.01
+
+  attention:
+    n_heads: 16
+    d_kv: 128
+    mla_latent_dim: 512
+    use_irope: true
+    irope_ratio: 3
+    base_interleaving_ratio: 5
+    thinking_interleaving_ratio: 2
+    # v0.4: Lightning Attention
+    use_lightning: true
+    lightning_window_size: 2048
+    lightning_chunk_size: 4096
+    lightning_feature_map: "elu"
+    # v0.4: Shared Attention (Zamba2-style)
+    use_shared_attention: true
+    shared_n_groups: 2
+    shared_pattern: "interleaved"
+    shared_unique_ratio: 0.25
+
+  retrieval:
+    num_experts: 64
+    num_active_experts: 4
+    d_ff: 4096
+    use_engram: true
+    engram_dim: 256
+    use_shared_expert: true
+    # v0.4: Heterogeneous MoE
+    use_heterogeneous: true
+    heterogeneous_min_dim: 1024
+    heterogeneous_max_dim: 8192
+    # v0.4: Matryoshka MoE
+    use_matryoshka: true
+    matryoshka_min_experts: 2
+    matryoshka_max_experts: 4
+    # v0.4: Gradient-routed MoE
+    use_gradient_routed: true
+    gradient_routed_lr: 0.01
+    # v0.4: Asymmetric placement
+    use_asymmetric: true
+    asymmetric_moe_layers: [4, 8, 12, 16, 20]
+
+  router:
+    top_k_pathways: 2
+    use_thinking_toggle: true
+    bias_lr: 0.01
+    aux_loss_weight: 0.0  # aux-loss-free!
+
+  output:
+    use_mtp: true
+    mtp_num_tokens: 3
+    use_flow_matching: false  # optional for 7B
+    # v0.4: MTP Speculative Decoding
+    use_speculative: true
+    speculative_draft_tokens: 3
+
+  # v0.4: BitNet 1.58-bit quantization
+  quantization:
+    bitnet:
+      enabled: false  # enable after initial training
+      warmup_steps: 4000
+      initial_quant_ratio: 0.0
+      threshold: 0.0
+      ste_mode: "atan"
+    fp8:
+      enabled: false  # enable on H100/H200
+      fp8_scheme: "dynamic"
+
+  # v0.4: Post-training NAS
+  nas:
+    enabled: false  # run after training
+    search_epochs: 20
+    darts_lr: 0.001
+
+training:
+  batch_size: 128
+  learning_rate: 2.0e-4
+  weight_decay: 0.1
+  warmup_steps: 4000
+  max_steps: 300000
+  grad_clip: 1.0
+  fp8_enabled: false
+  precision: bf16
+
+hardware:
+  device: auto
+  backend: auto
+  compile_model: true

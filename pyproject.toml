@@ -1,0 +1,82 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "losion"
+version = "0.4.0"
+description = "Losion — Hybrid AI Framework with Tri-Jalur Router Architecture"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Losion Contributors"},
+]
+keywords = ["ai", "llm", "mamba", "moe", "attention", "hybrid-model", "state-space-model"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.1.0",
+    "numpy>=1.24.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+training = [
+    "wandb>=0.15.0",
+    "tensorboard>=2.14.0",
+    "datasets>=2.14.0",
+    "tokenizers>=0.14.0",
+    "transformers>=4.35.0",
+]
+eval = [
+    "lm-eval>=0.4.0",
+]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "mypy>=1.6.0",
+    "ruff>=0.1.0",
+    "pre-commit>=3.5.0",
+]
+all = [
+    "losion[training,eval,dev]",
+]
+
+[project.urls]
+Homepage = "https://github.com/losion/losion"
+Documentation = "https://losion.readthedocs.io"
+Repository = "https://github.com/losion/losion"
+Issues = "https://github.com/losion/issues"
+
+[tool.setuptools.packages.find]
+include = ["losion*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
+ignore = ["E501", "SIM108"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "-v --tb=short"

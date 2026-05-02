@@ -1,0 +1,31 @@
+"""
+Losion — Jalur 1: State Space Models.
+
+Sub-layers (4:1:1 interleaving):
+  Mamba2SSD  — Mamba-2 State Space Dual computation
+  RWKV7WKV   — RWKV-7 Weighted Key-Value attention
+  GatedDeltaNet — Gated DeltaNet recurrence
+
+v0.4 additions:
+  LiquidSSD  — Mamba-2 SSD with liquid (input-adaptive) time constants
+  ComplexityGate — Per-token complexity estimation for adaptive depth
+  LiquidSSMTerpaduLayer — SSM layer with adaptive compute depth
+"""
+
+from losion.core.ssm.ssm_layer import SSMTerpaduLayer, SSMState, InterleavingScheduler
+from losion.core.ssm.mamba2 import Mamba2SSD
+from losion.core.ssm.rwkv7 import RWKV7WKV
+from losion.core.ssm.delta_net import GatedDeltaNet
+from losion.core.ssm.liquid_ssm import LiquidSSD, ComplexityGate, LiquidSSMTerpaduLayer
+
+__all__ = [
+    "SSMTerpaduLayer",
+    "SSMState",
+    "InterleavingScheduler",
+    "Mamba2SSD",
+    "RWKV7WKV",
+    "GatedDeltaNet",
+    "LiquidSSD",
+    "ComplexityGate",
+    "LiquidSSMTerpaduLayer",
+]

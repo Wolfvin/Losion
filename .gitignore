@@ -1,0 +1,79 @@
+# ============================================================================
+# Losion .gitignore — Standard Python + AI/ML project
+# ============================================================================
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+eggs/
+*.whl
+
+# ---- Virtual environments ----
+.env
+.venv
+env/
+venv/
+ENV/
+
+# ---- Jupyter Notebook ----
+.ipynb_checkpoints/
+*.ipynb
+
+# ---- IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ---- Testing / Coverage ----
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# ---- MyPy / Type checking ----
+.mypy_cache/
+.pytype/
+
+# ---- Model weights / Checkpoints ----
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+checkpoints/
+outputs/
+runs/
+
+# ---- Training data ----
+data/
+*.csv
+*.tsv
+*.jsonl
+!configs/*.yaml
+
+# ---- Logs ----
+logs/
+wandb/
+mlruns/
+*.log
+
+# ---- OS ----
+Thumbs.db
+.DS_Store
+
+# ---- Pre-commit ----
+.pre-commit-config.yaml.bak
+
+# ---- Project-specific ----
+agent-ctx/
