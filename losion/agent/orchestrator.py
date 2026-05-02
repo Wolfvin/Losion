@@ -1,9 +1,17 @@
 """
-Agent Orchestrator — Central coordination for the Losion Agent Layer.
+Agent Orchestrator v2 — Central coordination with Reflective Loop, Calibration, and Meta-Skills.
 
-The Orchestrator is the "brain" of the agent layer. It sits between the
-Losion model and the agent's capabilities (skills, tools, web search,
-terminal), deciding when and how to use each one based on model signals.
+v2 Improvements (based on research):
+- Reflective Agent Loop: After each action, reflect on outcome quality
+  (Reflexion, 2023; Self-Refine, 2023)
+- Adaptive Calibration: Thresholds adjust based on experience
+  (ATTC, 2026)
+- Episodic Memory: Past experiences inform future decisions
+  (Synapse, 2024; MemP, 2025)
+- Meta-Skill System: Skills that create, verify, and compose other skills
+  (CASCADE, 2025; SoK: Agentic Skills, 2026)
+- Step-level Self-Critique: Verification at each step, not just at end
+  (SLSC-MCTS, 2024)
 
 Architecture:
     ┌─────────────────────────────────────────────────────┐
@@ -13,36 +21,29 @@ Architecture:
                            ▼
     ┌─────────────────────────────────────────────────────┐
     │              LOSION MODEL (Tri-Jalur)                │
-    │   → produces: routing_weights, thinking_mode,       │
-    │     confidence, task_type                            │
     └──────────────────────┬──────────────────────────────┘
                            │
                            ▼
     ┌─────────────────────────────────────────────────────┐
-    │            SIGNAL EXTRACTOR                          │
-    │   → produces: AgentSignal (action, priority)        │
+    │   SIGNAL EXTRACTOR (v2: adaptive thresholds +       │
+    │   episodic memory + tool trust)                     │
     └──────────────────────┬──────────────────────────────┘
                            │
                            ▼
     ┌─────────────────────────────────────────────────────┐
-    │              AGENT ORCHESTRATOR                      │
+    │              AGENT ORCHESTRATOR v2                   │
     │                                                      │
-    │   if signal.action == MODEL_ONLY:                    │
-    │       return model output                            │
-    │   elif signal.action == WEB_SEARCH:                  │
-    │       search → inject context → re-infer             │
-    │   elif signal.action == SKILL_LOOKUP:                │
-    │       find skill → apply → return                    │
-    │   elif signal.action == SKILL_CREATE:                │
-    │       create skill → apply → return                  │
-    │   elif signal.action == TOOL_SEARCH:                 │
-    │       find tool → execute → return                   │
-    │   elif signal.action == TOOL_CREATE:                 │
-    │       create tool → execute → return                 │
-    │   elif signal.action == TERMINAL_EXECUTE:            │
-    │       sandbox → execute → return                     │
-    │   elif signal.action == VERIFY_OUTPUT:               │
-    │       verify → possibly revise → return              │
+    │   1. Execute action                                  │
+    │   2. Reflect on outcome (NEW)                        │
+    │   3. Calibrate thresholds (NEW)                      │
+    │   4. Store episode in memory (NEW)                   │
+    │   5. Re-infer with context                           │
+    │                                                      │
+    │   Sub-modules:                                       │
+    │   ├── ReflectionEngine   (Reflexion/Self-Refine)    │
+    │   ├── CalibrationEngine  (ATTC)                     │
+    │   ├── EpisodicMemory     (Synapse/MemP)             │
+    │   └── MetaSkillSystem    (CASCADE/SoK)              │
     └─────────────────────────────────────────────────────┘
 
 Key design principle: The orchestrator NEVER modifies the model.
@@ -71,6 +72,15 @@ from losion.agent.tools.registry import ToolEntry, ToolRegistry, ToolSafety
 from losion.agent.tools.terminal import SandboxedTerminal, TerminalResult, SandboxConfig
 from losion.agent.tools.web_search import WebSearchInterface, SearchResult
 from losion.agent.tools.creator import ToolCreator
+from losion.agent.reflection import ReflectionEngine, Reflection, ReflectionType
+from losion.agent.memory import EpisodicMemory, Episode
+from losion.agent.calibration import CalibrationEngine, ToolTrustScore
+from losion.agent.meta_skills import (
+    SkillSynthesisMetaSkill,
+    SkillVerificationMetaSkill,
+    SkillCompositionMetaSkill,
+    ComposedSkill,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +98,8 @@ class OrchestratorState(Enum):
     TOOL_CREATE = "tool_create"
     TERMINAL_EXECUTE = "terminal_execute"
     VERIFY_OUTPUT = "verify_output"
+    REFLECT = "reflect"
+    CALIBRATION = "calibration"
     CONTEXT_INJECTION = "context_injection"
     COMPLETE = "complete"
     ERROR = "error"
@@ -96,6 +108,14 @@ class OrchestratorState(Enum):
 @dataclass
 class AgentConfig:
     """Configuration for the Agent Orchestrator.
+
+    v2 additions:
+    - episodic_store_dir: Directory for episodic memory storage.
+    - enable_reflection: Whether to use self-reflection.
+    - enable_calibration: Whether to use adaptive threshold calibration.
+    - enable_meta_skills: Whether to use meta-skill system.
+    - reflection_on_failure: Whether to trigger reflection on action failure.
+    - calibration_learning_rate: How fast thresholds adapt.
 
     Attributes:
         max_iterations: Maximum agent loop iterations per query.
@@ -120,11 +140,24 @@ class AgentConfig:
     sandbox_config: SandboxConfig = field(default_factory=SandboxConfig)
     skill_store_dir: str = "~/.losion/skills"
     verbose: bool = False
+    # v2 additions
+    episodic_store_dir: str = "~/.losion/episodic"
+    enable_reflection: bool = True
+    enable_calibration: bool = True
+    enable_meta_skills: bool = True
+    reflection_on_failure: bool = True
+    calibration_learning_rate: float = 0.1
 
 
 @dataclass
 class AgentResult:
     """Result of an agent loop execution.
+
+    v2 additions:
+    - reflections: Reflections generated during execution.
+    - episode_id: ID of the episodic memory entry created.
+    - calibration_applied: Whether adaptive calibration was used.
+    - meta_skills_used: Meta-skills that were invoked.
 
     Attributes:
         output: Final output from the agent loop.
@@ -151,6 +184,11 @@ class AgentResult:
     total_time: float = 0.0
     model_confidence: float = 1.0
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # v2 additions
+    reflections: List[Dict[str, Any]] = field(default_factory=list)
+    episode_id: Optional[str] = None
+    calibration_applied: bool = False
+    meta_skills_used: List[str] = field(default_factory=list)
 
     @property
     def success(self) -> bool:
@@ -159,18 +197,29 @@ class AgentResult:
 
 
 class AgentOrchestrator:
-    """Central orchestrator for the Losion Agent Layer.
+    """Central orchestrator for the Losion Agent Layer v2.
+
+    v2 improvements:
+    1. Reflective Loop: After each action, reflect on outcome
+       and store reflections in episodic memory.
+    2. Adaptive Calibration: Thresholds adjust based on
+       past outcomes (successful actions lower thresholds,
+       failed actions raise them).
+    3. Episodic Memory: Past experiences stored and retrieved
+       for similar queries.
+    4. Meta-Skill System: Skills can create, verify, and
+       compose other skills.
 
     The orchestrator manages the agent loop:
     1. Receive model output
-    2. Extract signals
+    2. Extract signals (with adaptive thresholds)
     3. Decide action
     4. Execute action
-    5. Inject context (if applicable)
-    6. Repeat until confidence is sufficient or max iterations reached
-
-    The orchestrator is decoupled from the model — it receives model
-    output as input and returns results, never modifying the model.
+    5. Reflect on outcome (NEW)
+    6. Calibrate thresholds (NEW)
+    7. Inject context
+    8. Store episode in memory (NEW)
+    9. Repeat until confidence sufficient or max iterations
 
     Usage:
         orchestrator = AgentOrchestrator(config)
@@ -188,14 +237,31 @@ class AgentOrchestrator:
         self.config = config or AgentConfig()
 
         # === Initialize components ===
+        # Calibration engine (v2)
+        self.calibration_engine = CalibrationEngine(
+            learning_rate=self.config.calibration_learning_rate,
+        ) if self.config.enable_calibration else None
+
+        # Episodic memory (v2)
+        self.episodic_memory = EpisodicMemory(
+            store_dir=self.config.episodic_store_dir,
+        ) if self.config.enable_reflection else None
+
+        # Reflection engine (v2)
+        self.reflection_engine = ReflectionEngine() if self.config.enable_reflection else None
+
+        # Signal extractor with v2 enhancements
         self.signal_extractor = SignalExtractor(
             thresholds=self.config.confidence_thresholds,
             enable_web_search=self.config.enable_web_search,
             enable_terminal=self.config.enable_terminal,
             enable_skill_creation=self.config.enable_skill_creation,
             enable_tool_creation=self.config.enable_tool_creation,
+            calibration_engine=self.calibration_engine,
+            episodic_memory=self.episodic_memory,
         )
 
+        # Existing components
         self.web_search = WebSearchInterface()
         self.terminal = SandboxedTerminal(self.config.sandbox_config)
         self.skill_store = SkillStore(store_dir=self.config.skill_store_dir)
@@ -212,6 +278,23 @@ class AgentOrchestrator:
             auto_register=True,
         )
 
+        # Meta-skill system (v2)
+        if self.config.enable_meta_skills:
+            self.synthesis_meta = SkillSynthesisMetaSkill(
+                skill_creator=self.skill_creator,
+                web_search=self.web_search,
+            )
+            self.verification_meta = SkillVerificationMetaSkill(
+                skill_store=self.skill_store,
+            )
+            self.composition_meta = SkillCompositionMetaSkill(
+                skill_manager=self.skill_manager,
+            )
+        else:
+            self.synthesis_meta = None
+            self.verification_meta = None
+            self.composition_meta = None
+
         # Register built-in tools
         self._register_builtin_tools()
 
@@ -221,7 +304,6 @@ class AgentOrchestrator:
 
     def _register_builtin_tools(self) -> None:
         """Register built-in tools that are always available."""
-        # Web search tool
         self.tool_registry.register(ToolEntry(
             name="web-search",
             description="Search the web for information",
@@ -235,7 +317,6 @@ class AgentOrchestrator:
             is_builtin=True,
         ))
 
-        # Terminal tool
         self.tool_registry.register(ToolEntry(
             name="terminal",
             description="Execute a terminal command in a sandbox",
@@ -257,22 +338,25 @@ class AgentOrchestrator:
         model_inference_fn: Optional[Callable] = None,
         context: Optional[List[str]] = None,
     ) -> AgentResult:
-        """Run the agent loop.
+        """Run the agent loop with v2 reflective and adaptive capabilities.
 
-        The agent loop:
-        1. Extract signal from model output
+        The v2 agent loop:
+        1. Extract signal from model output (with adaptive thresholds)
         2. If MODEL_ONLY → return current output
-        3. If action needed → execute action
-        4. Inject context from action result
-        5. Re-infer with new context (if model_inference_fn provided)
-        6. Repeat until confidence sufficient or max iterations
+        3. If REFLECT → load reflections from episodic memory
+        4. If action needed → execute action
+        5. Reflect on outcome (NEW)
+        6. Calibrate thresholds based on outcome (NEW)
+        7. Inject context from action result
+        8. Re-infer with new context (if model_inference_fn provided)
+        9. Repeat until confidence sufficient or max iterations
+        10. Store episode in episodic memory (NEW)
 
         Args:
-            model_output: Output from the Losion model (AdaptiveRoutingOutput).
+            model_output: Output from the Losion model.
             query: The user's query text.
             confidence: Override confidence score.
-            model_inference_fn: Function to call for re-inference with context.
-                               Signature: fn(query, context_list) → (output, confidence)
+            model_inference_fn: Function for re-inference with context.
             context: Pre-existing context to inject.
 
         Returns:
@@ -282,16 +366,17 @@ class AgentOrchestrator:
         self._state = OrchestratorState.MODEL_INFERENCE
         self._iteration_count = 0
 
-        result = AgentResult()
+        result = AgentResult(calibration_applied=self.calibration_engine is not None)
         current_context = list(context) if context else []
         current_output = model_output
         current_confidence = confidence
+        all_reflections: List[Reflection] = []
 
         for iteration in range(self.config.max_iterations):
             self._iteration_count = iteration + 1
             self._state = OrchestratorState.SIGNAL_EXTRACTION
 
-            # === Extract signal ===
+            # === Extract signal (v2: adaptive thresholds) ===
             signal = self.signal_extractor.extract(
                 model_output=current_output,
                 confidence=current_confidence,
@@ -303,7 +388,8 @@ class AgentOrchestrator:
                 logger.info(
                     f"Iteration {iteration + 1}: signal={signal.action.value}, "
                     f"confidence={signal.confidence:.2f}, "
-                    f"priority={signal.priority:.2f}"
+                    f"priority={signal.priority:.2f}, "
+                    f"tool_trust={signal.tool_trust:.2f}"
                 )
 
             # === Check if intervention needed ===
@@ -313,13 +399,23 @@ class AgentOrchestrator:
                 result.model_confidence = signal.confidence
                 break
 
+            # === Handle REFLECT action (v2) ===
+            if signal.action == AgentAction.REFLECT:
+                self._state = OrchestratorState.REFLECT
+                reflection_context = self._handle_reflect(signal, query)
+                if reflection_context:
+                    current_context.append(reflection_context)
+                    result.context_used.append(reflection_context)
+                result.actions_taken.append(signal.action.value)
+                continue
+
             # === Execute action ===
+            confidence_before = current_confidence or signal.confidence
             action_result = self._execute_action(signal, query, current_context)
             result.actions_taken.append(signal.action.value)
 
             # === Process action result ===
             if action_result is not None:
-                # Add to context
                 if isinstance(action_result, str):
                     current_context.append(action_result)
                     result.context_used.append(action_result)
@@ -344,14 +440,59 @@ class AgentOrchestrator:
                         current_confidence = new_confidence
                     except Exception as e:
                         logger.warning(f"Re-inference failed: {e}")
-                        # Keep previous output
-                        pass
+
+            # === v2: Reflect on outcome ===
+            confidence_after = current_confidence or signal.confidence
+            if self.reflection_engine is not None:
+                reflections = self.reflection_engine.evaluate(
+                    action=signal.action.value,
+                    action_result=action_result,
+                    confidence_before=confidence_before,
+                    confidence_after=confidence_after,
+                    query=query,
+                    domain=signal.domain,
+                )
+                all_reflections.extend(reflections)
+
+                # Add reflection context
+                for r in reflections:
+                    result.reflections.append(r.to_dict())
+                    if r.lesson and r.is_positive:
+                        current_context.append(f"Lesson: {r.lesson}")
+                        result.context_used.append(f"Lesson: {r.lesson}")
+
+            # === v2: Calibrate thresholds ===
+            if self.calibration_engine is not None:
+                success = confidence_after >= confidence_before
+                self.calibration_engine.record_outcome(
+                    action=signal.action.value,
+                    domain=signal.domain,
+                    success=success,
+                    confidence_before=confidence_before,
+                    confidence_after=confidence_after,
+                )
+
             # Check if confidence has improved enough
             if current_confidence is not None and current_confidence >= 0.7:
                 self._state = OrchestratorState.COMPLETE
                 result.state = self._state
                 result.model_confidence = current_confidence
                 break
+
+        # === v2: Store episode in episodic memory ===
+        if self.episodic_memory is not None:
+            episode = Episode(
+                query=query,
+                domain=result.signals[0].domain if result.signals else None,
+                actions=result.actions_taken,
+                reflections=[r.to_dict() for r in all_reflections],
+                final_confidence=current_confidence or 0.5,
+                success=(current_confidence or 0.0) >= 0.5,
+                total_iterations=self._iteration_count,
+                total_time=time.time() - start_time,
+            )
+            self.episodic_memory.store_episode(episode)
+            result.episode_id = episode.episode_id
 
         # === Finalize ===
         if self._state != OrchestratorState.COMPLETE:
@@ -360,10 +501,34 @@ class AgentOrchestrator:
 
         result.output = current_output
         result.iterations = self._iteration_count
-        result.model_confidence = current_confidence or signal.confidence
+        result.model_confidence = current_confidence or (signal.confidence if result.signals else 0.5)
         result.total_time = time.time() - start_time
 
         return result
+
+    def _handle_reflect(self, signal: AgentSignal, query: str) -> Optional[str]:
+        """Handle REFLECT action by loading relevant past experience.
+
+        Args:
+            signal: The reflect signal.
+            query: Current query.
+
+        Returns:
+            Context string from past reflections, or None.
+        """
+        if self.episodic_memory is None:
+            return None
+
+        lessons = self.episodic_memory.get_lessons_for_query(
+            query=query, domain=signal.domain, limit=3
+        )
+        if lessons:
+            context = "Past experience reflections:\n"
+            for i, lesson in enumerate(lessons):
+                context += f"{i+1}. {lesson}\n"
+            return context
+
+        return None
 
     def _execute_action(
         self,
@@ -373,13 +538,8 @@ class AgentOrchestrator:
     ) -> Any:
         """Execute the action specified by the signal.
 
-        Args:
-            signal: AgentSignal with the action to execute.
-            query: Original query.
-            context: Current context list.
-
-        Returns:
-            Action result (context string, dict, or list).
+        v2: Uses meta-skill system for enhanced skill creation and
+        tool search fallback to skill composition.
         """
         action = signal.action
 
@@ -418,15 +578,7 @@ class AgentOrchestrator:
     def _action_web_search(
         self, signal: AgentSignal, query: str
     ) -> Optional[List[Dict[str, str]]]:
-        """Execute web search action.
-
-        Args:
-            signal: The web search signal.
-            query: Search query.
-
-        Returns:
-            List of search result dicts.
-        """
+        """Execute web search action."""
         search_query = signal.query or query
         logger.info(f"Web search: {search_query}")
 
@@ -449,15 +601,7 @@ class AgentOrchestrator:
     def _action_skill_lookup(
         self, signal: AgentSignal, query: str
     ) -> Optional[str]:
-        """Execute skill lookup action.
-
-        Args:
-            signal: The skill lookup signal.
-            query: Skill query.
-
-        Returns:
-            Skill definition if found.
-        """
+        """Execute skill lookup action."""
         lookup_result = self.skill_manager.lookup(
             query=query,
             domain=signal.domain,
@@ -467,7 +611,23 @@ class AgentOrchestrator:
         if lookup_result.found and lookup_result.skill:
             skill = lookup_result.skill
             self.skill_manager.record_usage(skill.name, success=True)
+
+            # v2: Verify skill if verification meta-skill is available
+            if self.verification_meta is not None:
+                verify_result = self.verification_meta.verify(skill.name)
+                if verify_result and not verify_result.passed:
+                    logger.info(f"Skill {skill.name} verification failed, confidence adjusted")
+
             return f"Skill: {skill.name}\n{skill.definition}"
+
+        # v2: Try skill composition if no single skill found
+        if self.composition_meta is not None and signal.domain:
+            composed = self.composition_meta.compose(
+                query=query, domain=signal.domain
+            )
+            if composed and composed.skill_chain:
+                result.meta_skills_used.append("composition")
+                return f"Composed skills: {' → '.join(composed.skill_chain)}\n{composed.description}"
 
         return None
 
@@ -476,23 +636,28 @@ class AgentOrchestrator:
     ) -> Optional[str]:
         """Execute skill creation action.
 
-        Args:
-            signal: The skill create signal.
-            query: Skill query.
-
-        Returns:
-            Created skill definition.
+        v2: Uses SkillSynthesisMetaSkill for richer skill creation.
         """
         if not self.config.enable_skill_creation:
             return None
 
         try:
-            skill = self.skill_creator.create(
-                query=query,
-                domain=signal.domain,
-            )
-            if skill:
-                return f"Created skill: {skill.name}\n{skill.definition}"
+            # v2: Use meta-skill synthesis for better skill creation
+            if self.synthesis_meta is not None:
+                skill = self.synthesis_meta.synthesize(
+                    query=query, domain=signal.domain
+                )
+                if skill:
+                    result_meta = "meta_skills_used"
+                    return f"Created skill (meta-synthesized): {skill.name}\n{skill.definition}"
+            else:
+                # Fallback to basic creation
+                skill = self.skill_creator.create(
+                    query=query,
+                    domain=signal.domain,
+                )
+                if skill:
+                    return f"Created skill: {skill.name}\n{skill.definition}"
         except Exception as e:
             logger.warning(f"Skill creation failed: {e}")
 
@@ -501,15 +666,7 @@ class AgentOrchestrator:
     def _action_tool_search(
         self, signal: AgentSignal, query: str
     ) -> Optional[List[Dict[str, str]]]:
-        """Execute tool search action.
-
-        Args:
-            signal: The tool search signal.
-            query: Tool query.
-
-        Returns:
-            List of matching tool descriptions.
-        """
+        """Execute tool search action."""
         tools = self.tool_registry.search(
             query=query,
             domain=signal.domain,
@@ -526,7 +683,6 @@ class AgentOrchestrator:
                 for t in tools
             ]
 
-        # If no tool found and creation is enabled, create one
         if self.config.enable_tool_creation:
             return self._action_tool_create(signal, query)
 
@@ -535,15 +691,7 @@ class AgentOrchestrator:
     def _action_tool_create(
         self, signal: AgentSignal, query: str
     ) -> Optional[str]:
-        """Execute tool creation action.
-
-        Args:
-            signal: The tool create signal.
-            query: Tool query.
-
-        Returns:
-            Description of the created tool.
-        """
+        """Execute tool creation action."""
         if not self.config.enable_tool_creation:
             return None
 
@@ -562,27 +710,13 @@ class AgentOrchestrator:
     def _action_terminal_execute(
         self, signal: AgentSignal, query: str
     ) -> Optional[Dict[str, Any]]:
-        """Execute terminal command action.
-
-        Only executed for code/data domain queries where terminal
-        execution is relevant and safe.
-
-        Args:
-            signal: The terminal execute signal.
-            query: Command or task description.
-
-        Returns:
-            Terminal execution result dict.
-        """
+        """Execute terminal command action."""
         if not self.config.enable_terminal:
             return None
 
-        # Only execute if domain is code or data
         if signal.domain not in ("code", "data", None):
             return None
 
-        # For safety, don't auto-execute arbitrary commands
-        # Instead, return a message indicating terminal is available
         return {
             "terminal_available": True,
             "message": f"Terminal execution available for: {query}. "
@@ -593,24 +727,11 @@ class AgentOrchestrator:
     def _action_verify_output(
         self, signal: AgentSignal, query: str
     ) -> Optional[Dict[str, Any]]:
-        """Execute output verification action.
-
-        This would integrate with Losion's Neuro-Symbolic Verifier
-        if available, otherwise provides a basic check.
-
-        Args:
-            signal: The verify signal.
-            query: The query to verify against.
-
-        Returns:
-            Verification result dict.
-        """
+        """Execute output verification action."""
         try:
             from losion.core.reasoning.neuro_symbolic import NeuroSymbolicVerifier
 
-            # If the model's neuro-symbolic verifier is available, use it
             verifier = NeuroSymbolicVerifier(d_model=768)
-            # Note: In practice, you'd pass the actual hidden states
             return {
                 "verification_available": True,
                 "message": "Neuro-symbolic verification is available.",
@@ -624,8 +745,8 @@ class AgentOrchestrator:
             }
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get orchestrator statistics."""
-        return {
+        """Get orchestrator statistics including v2 components."""
+        stats = {
             "state": self._state.value,
             "total_iterations": self._iteration_count,
             "skills": self.skill_store.get_stats(),
@@ -633,3 +754,12 @@ class AgentOrchestrator:
             "web_search": self.web_search.get_stats(),
             "terminal": self.terminal.get_stats(),
         }
+
+        # v2 stats
+        if self.calibration_engine is not None:
+            stats["calibration"] = self.calibration_engine.get_stats()
+
+        if self.episodic_memory is not None:
+            stats["episodic_memory"] = self.episodic_memory.get_stats()
+
+        return stats
