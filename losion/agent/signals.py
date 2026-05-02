@@ -10,7 +10,17 @@ the model continue autonomously.
 This is the KEY integration point: the model provides "hints" about what
 it needs, and the agent layer responds with the appropriate action.
 
-v2 Improvements (based on research):
+v3 Improvements (based on research):
+- SMART Knowledge Sufficiency Check: Uses Tri-Jalur routing weights to
+  determine if parametric knowledge is sufficient, preventing tool overuse
+  (Self-Aware Agent for Tool Overuse Mitigation, 2025)
+- Perplexity-based confidence: Added token-level perplexity as a confidence
+  signal, inspired by Toolformer (Schick et al., 2023)
+- Paradigm-aware signal generation: Signals include paradigm routing hints
+  for the orchestrator to select the appropriate reasoning paradigm
+- Enhanced domain classification with context-awareness
+
+v2 Improvements (preserved):
 - Adaptive confidence thresholds via CalibrationEngine (ATTC, 2026)
 - Episodic memory integration for experience-based decisions (Reflexion, 2023)
 - Tool trust scores influence signal priority (ATTC, 2026)
@@ -23,6 +33,8 @@ Design:
             CalibrationEngine (adaptive thresholds)
             EpisodicMemory (past experience)
             ToolTrustScores (tool reliability)
+            KnowledgeSufficiency (SMART, v3)
+            PerplexitySignal (Toolformer, v3)
 """
 
 from __future__ import annotations
@@ -166,6 +178,10 @@ class AgentSignal:
     tool_trust: float = 0.5
     episodic_relevance: float = 0.0
     recommended_from_experience: bool = False
+    # v3 additions
+    knowledge_sufficient: bool = False    # SMART: parametric knowledge is enough
+    perplexity_signal: Optional[float] = None  # Toolformer-style perplexity score
+    recommended_paradigm: Optional[str] = None  # Paradigm routing hint
 
     @property
     def needs_intervention(self) -> bool:
@@ -275,6 +291,41 @@ class SignalExtractor:
             thresholds=thresholds,
             experience_recs=experience_recs,
         )
+
+        # === v3: SMART Knowledge Sufficiency Check ===
+        knowledge_sufficient = False
+        if routing_weights is not None and len(routing_weights) >= 3:
+            retrieval_weight = routing_weights[2]
+            attention_weight = routing_weights[1]
+            # SMART check: if retrieval weight is LOW and attention is HIGH and confidence is decent
+            # then parametric knowledge is sufficient — no tool use needed
+            knowledge_sufficient = (
+                retrieval_weight < 0.2
+                and attention_weight > 0.4
+                and effective_confidence > 0.5
+            )
+
+        # Apply knowledge sufficiency: suppress tool-use signals if knowledge is sufficient
+        if knowledge_sufficient:
+            signals = [s for s in signals if s.action in (
+                AgentAction.MODEL_ONLY, AgentAction.VERIFY_OUTPUT
+            )]
+            # If all signals were suppressed, return MODEL_ONLY
+            if not signals:
+                return AgentSignal(
+                    action=AgentAction.MODEL_ONLY,
+                    confidence=effective_confidence,
+                    reasoning="SMART: Parametric knowledge sufficient (retrieval weight low, attention high). No tool use needed.",
+                    thinking_mode=thinking_mode,
+                    routing_weights=routing_weights,
+                    task_type=task_type,
+                    domain=domain,
+                    knowledge_sufficient=True,
+                    recommended_paradigm="direct",
+                )
+            # Mark remaining signals as knowledge-sufficient
+            for s in signals:
+                s.knowledge_sufficient = True
 
         # === Return highest-priority signal ===
         if not signals:
@@ -581,7 +632,12 @@ class SignalExtractor:
         return None
 
     def _extract_confidence(self, model_output: Any) -> float:
-        """Extract or estimate model confidence."""
+        """Extract or estimate model confidence.
+
+        v3: Also considers perplexity signal (Toolformer-inspired).
+        When output logits are available, compute perplexity as an
+        additional confidence indicator. High perplexity = low confidence.
+        """
         if model_output is None:
             return 0.5
         if hasattr(model_output, "thinking_assessment"):
@@ -601,6 +657,21 @@ class SignalExtractor:
                 if max_entropy > 0:
                     uncertainty = entropy / max_entropy
                     return 1.0 - uncertainty
+
+        # v3: Try to extract perplexity signal (Toolformer-inspired)
+        # If model_output has logits or loss, use it as a confidence proxy
+        if hasattr(model_output, "loss") and model_output.loss is not None:
+            # Cross-entropy loss ≈ log(perplexity)
+            # Higher loss → lower confidence
+            try:
+                perplexity = math.exp(float(model_output.loss))
+                # Map perplexity to confidence: lower perplexity = higher confidence
+                # Using sigmoid mapping: conf = 1 / (1 + log(perplexity))
+                if perplexity > 1:
+                    return 1.0 / (1.0 + math.log(perplexity))
+            except (ValueError, OverflowError):
+                pass
+
         return 0.5
 
     def _extract_task_type(self, model_output: Any) -> Optional[str]:

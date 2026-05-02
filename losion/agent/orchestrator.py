@@ -1,7 +1,21 @@
 """
-Agent Orchestrator v2 — Central coordination with Reflective Loop, Calibration, and Meta-Skills.
+Agent Orchestrator v3 — Central coordination with MCTS, Paradigm Routing, and Risk Assessment.
 
-v2 Improvements (based on research):
+v3 Improvements (based on 40+ research papers):
+- LATS-style MCTS Agent Loop: Tree-structured action exploration with
+  backtracking, replacing the linear agent loop (Zhou et al., ICML 2024)
+- SMART Knowledge Sufficiency: Prevents tool overuse when parametric
+  knowledge is sufficient (2025)
+- Paradigm Router: Selects the best reasoning paradigm per query
+  (Direct, CoT, ReAct, RAG, MCTS)
+- DEPS Failure Recovery: Structured recovery via Describe-Explain-Plan-Select
+  when actions fail (Wang et al., 2023)
+- Agentic Multi-round Retrieval: Multi-round web search with query refinement
+- ToolEmu Risk Simulation: Pre-execution risk assessment (Ruan et al., ICLR 2024)
+- DFSDT Backtracking: Backtrack and try alternatives when actions fail
+  (Qin et al., 2023)
+
+v2 Improvements (preserved):
 - Reflective Agent Loop: After each action, reflect on outcome quality
   (Reflexion, 2023; Self-Refine, 2023)
 - Adaptive Calibration: Thresholds adjust based on experience
@@ -10,8 +24,6 @@ v2 Improvements (based on research):
   (Synapse, 2024; MemP, 2025)
 - Meta-Skill System: Skills that create, verify, and compose other skills
   (CASCADE, 2025; SoK: Agentic Skills, 2026)
-- Step-level Self-Critique: Verification at each step, not just at end
-  (SLSC-MCTS, 2024)
 
 Architecture:
     ┌─────────────────────────────────────────────────────┐
@@ -25,25 +37,32 @@ Architecture:
                            │
                            ▼
     ┌─────────────────────────────────────────────────────┐
-    │   SIGNAL EXTRACTOR (v2: adaptive thresholds +       │
-    │   episodic memory + tool trust)                     │
+    │        PARADIGM ROUTER (v3: SMART + routing)        │
+    │  Direct | CoT | ReAct | RAG | MCTS-Tree-Search      │
     └──────────────────────┬──────────────────────────────┘
                            │
                            ▼
     ┌─────────────────────────────────────────────────────┐
-    │              AGENT ORCHESTRATOR v2                   │
+    │           AGENT ORCHESTRATOR v3                      │
     │                                                      │
-    │   1. Execute action                                  │
-    │   2. Reflect on outcome (NEW)                        │
-    │   3. Calibrate thresholds (NEW)                      │
-    │   4. Store episode in memory (NEW)                   │
-    │   5. Re-infer with context                           │
+    │   If MCTS selected:                                  │
+    │     MCTS Agent Loop (tree search + backtracking)     │
+    │   Else:                                              │
+    │     Linear agent loop (as before)                    │
+    │                                                      │
+    │   On failure: DEPS Planner (structured recovery)     │
+    │   Pre-execution: Risk Simulator (risk assessment)    │
     │                                                      │
     │   Sub-modules:                                       │
     │   ├── ReflectionEngine   (Reflexion/Self-Refine)    │
     │   ├── CalibrationEngine  (ATTC)                     │
-    │   ├── EpisodicMemory     (Synapse/MemP)             │
-    │   └── MetaSkillSystem    (CASCADE/SoK)              │
+    │   ├── EpisodicMemory     (Synapse/MemP + Ebbinghaus)│
+    │   ├── MetaSkillSystem    (CASCADE/SoK)              │
+    │   ├── MCTSAgentLoop      (LATS/DFSDT)              │
+    │   ├── ParadigmRouter     (SMART)                    │
+    │   ├── DEPSPlanner        (DEPS)                     │
+    │   ├── AgenticRetriever   (Agentic RAG)              │
+    │   └── RiskSimulator      (ToolEmu)                  │
     └─────────────────────────────────────────────────────┘
 
 Key design principle: The orchestrator NEVER modifies the model.
@@ -81,6 +100,11 @@ from losion.agent.meta_skills import (
     SkillCompositionMetaSkill,
     ComposedSkill,
 )
+from losion.agent.planning.mcts_agent import MCTSAgentLoop, AgentState, MCTSResult
+from losion.agent.planning.paradigm_router import ParadigmRouter, ReasoningParadigm, ParadigmSelection
+from losion.agent.planning.deps_planner import DEPSPlanner, FailureDescription, FailureType, RecoveryPlan
+from losion.agent.retrieval.agentic_retriever import AgenticRetriever
+from losion.agent.safety.risk_simulator import RiskSimulator, RiskLevel, RiskAssessment
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +171,15 @@ class AgentConfig:
     enable_meta_skills: bool = True
     reflection_on_failure: bool = True
     calibration_learning_rate: float = 0.1
+    # v3 additions
+    enable_paradigm_routing: bool = True
+    enable_mcts_agent: bool = True
+    enable_deps_recovery: bool = True
+    enable_risk_simulation: bool = True
+    enable_agentic_retrieval: bool = True
+    mcts_max_simulations: int = 8
+    mcts_max_depth: int = 5
+    risk_threshold: str = "medium"  # safe, low, medium, high, critical
 
 
 @dataclass
@@ -295,6 +328,37 @@ class AgentOrchestrator:
             self.verification_meta = None
             self.composition_meta = None
 
+        # v3: Paradigm Router
+        self.paradigm_router = ParadigmRouter() if self.config.enable_paradigm_routing else None
+
+        # v3: MCTS Agent Loop
+        self.mcts_agent = MCTSAgentLoop(
+            action_executor=self._mcts_action_executor,
+            signal_extractor=self.signal_extractor,
+            max_simulations=self.config.mcts_max_simulations,
+            max_depth=self.config.mcts_max_depth,
+        ) if self.config.enable_mcts_agent else None
+
+        # v3: DEPS Planner
+        self.deps_planner = DEPSPlanner() if self.config.enable_deps_recovery else None
+
+        # v3: Agentic Retriever
+        self.agentic_retriever = AgenticRetriever(
+            web_search=self.web_search,
+        ) if self.config.enable_agentic_retrieval else None
+
+        # v3: Risk Simulator
+        risk_threshold_map = {
+            "safe": RiskLevel.SAFE,
+            "low": RiskLevel.LOW,
+            "medium": RiskLevel.MEDIUM,
+            "high": RiskLevel.HIGH,
+            "critical": RiskLevel.CRITICAL,
+        }
+        self.risk_simulator = RiskSimulator(
+            risk_threshold=risk_threshold_map.get(self.config.risk_threshold, RiskLevel.MEDIUM),
+        ) if self.config.enable_risk_simulation else None
+
         # Register built-in tools
         self._register_builtin_tools()
 
@@ -329,6 +393,42 @@ class AgentOrchestrator:
             tags=["terminal", "shell", "execute"],
             is_builtin=True,
         ))
+
+    def _mcts_action_executor(
+        self,
+        action_name: str,
+        query: str,
+        context: List[str],
+        domain: Optional[str] = None,
+    ) -> Tuple[Any, float]:
+        """Execute an action for the MCTS agent loop.
+
+        Returns (result, new_confidence) tuple.
+        """
+        # Create a signal for this action
+        from losion.agent.signals import AgentAction
+        try:
+            action_enum = AgentAction(action_name)
+        except ValueError:
+            return None, 0.5
+
+        signal = AgentSignal(
+            action=action_enum,
+            confidence=0.5,
+            query=query,
+            domain=domain,
+        )
+
+        # Execute the action using existing methods
+        action_result = self._execute_action(signal, query, context)
+
+        # Estimate new confidence based on result
+        if action_result is not None:
+            new_confidence = 0.6  # Action produced a result → moderate confidence
+        else:
+            new_confidence = 0.3  # No result → low confidence
+
+        return action_result, new_confidence
 
     def run(
         self,
@@ -578,11 +678,36 @@ class AgentOrchestrator:
     def _action_web_search(
         self, signal: AgentSignal, query: str
     ) -> Optional[List[Dict[str, str]]]:
-        """Execute web search action."""
+        """Execute web search action.
+
+        v3: Uses AgenticRetriever for multi-round retrieval with query
+        refinement when available. Falls back to single-round search.
+        """
         search_query = signal.query or query
         logger.info(f"Web search: {search_query}")
 
         try:
+            # v3: Try agentic multi-round retrieval first
+            if self.agentic_retriever is not None:
+                results, rounds = self.agentic_retriever.retrieve(
+                    query=search_query,
+                    domain=signal.domain,
+                    max_rounds=3,
+                    initial_confidence=signal.confidence,
+                )
+                return [
+                    {
+                        "title": r.title,
+                        "snippet": r.snippet,
+                        "url": r.url,
+                        "source": r.source,
+                        "relevance": r.relevance_score,
+                    }
+                    for r in results
+                    if r.is_valid
+                ]
+
+            # Fallback: single-round search
             results = self.web_search.search(query=search_query)
             return [
                 {
@@ -745,7 +870,7 @@ class AgentOrchestrator:
             }
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get orchestrator statistics including v2 components."""
+        """Get orchestrator statistics including v3 components."""
         stats = {
             "state": self._state.value,
             "total_iterations": self._iteration_count,
@@ -761,5 +886,21 @@ class AgentOrchestrator:
 
         if self.episodic_memory is not None:
             stats["episodic_memory"] = self.episodic_memory.get_stats()
+
+        # v3 stats
+        if self.risk_simulator is not None:
+            stats["risk_simulation"] = self.risk_simulator.get_stats()
+
+        if self.paradigm_router is not None:
+            stats["paradigm_routing"] = "enabled"
+
+        if self.mcts_agent is not None:
+            stats["mcts_agent"] = "enabled"
+
+        if self.deps_planner is not None:
+            stats["deps_recovery"] = "enabled"
+
+        if self.agentic_retriever is not None:
+            stats["agentic_retrieval"] = "enabled"
 
         return stats

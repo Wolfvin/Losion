@@ -1,5 +1,5 @@
 """
-Episodic Memory — Experience-based memory for the Agent Layer.
+Episodic Memory — Experience-based memory with Ebbinghaus forgetting.
 
 Inspired by:
 - Synapse (2024): "Empowering LLM Agents with Episodic-Semantic Memory
@@ -7,23 +7,24 @@ Inspired by:
 - MemP (2025): "Exploring Agent Procedural Memory" — procedural memory
   is separate from semantic memory.
 - Reflexion (2023): Reflections stored for future decision-making.
+- MemoryBank (Zhong et al., 2023, cited 790×): Human-like long-term memory
+  with Ebbinghaus forgetting curve — memories decay over time unless
+  reinforced by access.
+- Generative Agents (Park et al., 2023): Multi-factor retrieval with
+  recency × importance × relevance scoring.
 
 This module implements a three-layer memory architecture:
 1. **Procedural Memory**: How to do things (stored in SkillStore)
 2. **Semantic Memory**: Facts and knowledge (linked to Engram Memory)
 3. **Episodic Memory**: Past experiences and outcomes (this module)
 
-Episodic Memory is the KEY addition — it stores the agent's experiences:
-- What actions were taken
-- What the outcomes were
-- What reflections were generated
-- What worked and what didn't
-
-This enables the agent to:
-- Avoid repeating failed strategies
-- Reuse successful strategies for similar queries
-- Build up domain expertise over time
-- Provide context for the ReflectionEngine
+v3 Improvements:
+- Ebbinghaus forgetting curve: Memory strength decays over time,
+  reinforced by access. Prevents unbounded memory growth and keeps
+  the memory focused on relevant experiences.
+- Multi-factor retrieval: Recency × Importance × Relevance scoring
+  (from Generative Agents), replacing simple Jaccard similarity.
+- Periodic consolidation: Merge similar episodes, discard weak ones.
 
 Storage:
     episodic_dir/
@@ -33,8 +34,8 @@ Storage:
     │   └── ...
     └── stats.json          # Usage statistics
 
-Retrieval uses query similarity (keyword overlap + domain match)
-rather than exact hash, enabling generalization across similar queries.
+Retrieval uses multi-factor scoring (recency × importance × relevance)
+with spreading activation, enabling generalization across similar queries.
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, field, asdict
@@ -84,6 +86,10 @@ class Episode:
     total_time: float = 0.0
     created_at: float = 0.0
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # v3: Ebbinghaus forgetting curve fields
+    strength: float = 1.0          # Memory strength [0.0, 1.0], decays over time
+    access_count: int = 0          # Number of times this episode was accessed
+    last_accessed_at: float = 0.0  # Timestamp of last access
 
     def __post_init__(self) -> None:
         if not self.episode_id:
@@ -91,6 +97,8 @@ class Episode:
             self.episode_id = hashlib.sha256(content.encode()).hexdigest()[:16]
         if self.created_at == 0.0:
             self.created_at = time.time()
+        if self.last_accessed_at == 0.0:
+            self.last_accessed_at = self.created_at
 
     @property
     def key_lessons(self) -> List[str]:
@@ -118,6 +126,59 @@ class Episode:
             for r in self.reflections
             if r.get("reflection_type") == "action_failure"
         ]
+
+    @property
+    def importance(self) -> float:
+        """Importance score based on confidence and success (Generative Agents).
+
+        Higher importance = more likely to be retrieved and retained.
+        Successful episodes with high confidence are most important.
+        """
+        base = self.final_confidence
+        if self.success:
+            base *= 1.2
+        else:
+            base *= 0.6
+        return min(1.0, base)
+
+    def get_effective_strength(self, current_time: Optional[float] = None) -> float:
+        """Compute effective memory strength with Ebbinghaus forgetting curve.
+
+        Memory strength decays over time following the Ebbinghaus curve:
+            strength = base_decay^age * reinforcement_from_access
+
+        Where:
+        - base_decay = e^(-0.1 * age_in_days) — exponential forgetting
+        - reinforcement = 1 + 0.2 * log(1 + access_count) — access strengthens memory
+
+        This prevents stale memories from dominating retrieval while keeping
+        frequently-accessed memories strong.
+        """
+        import math
+        now = current_time or time.time()
+        age_seconds = now - self.created_at
+        age_days = age_seconds / 86400.0
+
+        # Ebbinghaus exponential decay
+        decay = math.exp(-0.1 * age_days)
+
+        # Reinforcement from repeated access
+        reinforcement = 1.0 + 0.2 * math.log(1 + self.access_count)
+
+        # Combined effective strength
+        effective = self.strength * decay * reinforcement
+        return min(1.0, max(0.0, effective))
+
+    def reinforce(self) -> None:
+        """Reinforce this memory by recording an access.
+
+        Following MemoryBank's Ebbinghaus model: each access strengthens
+        the memory, counteracting natural decay.
+        """
+        self.access_count += 1
+        self.last_accessed_at = time.time()
+        # Boost strength on access (partial recovery from decay)
+        self.strength = min(1.0, self.strength + 0.1)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to dictionary."""
@@ -219,8 +280,14 @@ class EpisodicMemory:
     ) -> List[Tuple[Episode, float]]:
         """Retrieve episodes similar to the given query.
 
-        Uses keyword overlap (Jaccard similarity) for matching,
-        with domain bonus for same-domain episodes.
+        v3: Uses multi-factor retrieval scoring (from Generative Agents):
+            score = recency × importance × relevance × effective_strength
+
+        Where:
+        - recency: Exponential decay based on time since creation
+        - importance: Based on final confidence and success
+        - relevance: Jaccard similarity of query terms
+        - effective_strength: Ebbinghaus forgetting curve with access reinforcement
 
         Spreading Activation:
         After finding the top matches, also activate related episodes
@@ -240,49 +307,51 @@ class EpisodicMemory:
                 return []
 
             query_terms = set(query.lower().split())
+            now = time.time()
             candidates: List[Tuple[Episode, float]] = []
 
             for episode in self._episodes.values():
-                # Domain filter
-                if domain and episode.domain and episode.domain != domain:
-                    # Reduce similarity for different domain but don't exclude
-                    domain_penalty = 0.3
-                else:
-                    domain_penalty = 0.0
+                # === Multi-factor scoring (Generative Agents style) ===
 
-                # Keyword overlap (Jaccard similarity)
+                # 1. Relevance: Jaccard similarity
                 episode_terms = set(episode.query.lower().split())
                 if query_terms and episode_terms:
                     intersection = len(query_terms & episode_terms)
                     union = len(query_terms | episode_terms)
-                    similarity = intersection / union if union > 0 else 0.0
+                    relevance = intersection / union if union > 0 else 0.0
                 else:
-                    similarity = 0.0
+                    relevance = 0.0
 
                 # Domain bonus
                 if domain and episode.domain == domain:
-                    similarity += 0.2
+                    relevance += 0.2
+                elif domain and episode.domain and episode.domain != domain:
+                    relevance -= 0.15
 
-                # Success bonus — prefer successful episodes
-                if episode.success:
-                    similarity += 0.1
+                # 2. Recency: Exponential decay (Park et al.)
+                age_hours = (now - episode.created_at) / 3600.0
+                recency = math.exp(-0.05 * age_hours)  # Half-life ~14 hours
 
-                # Apply domain penalty
-                similarity -= domain_penalty
+                # 3. Importance: Based on confidence and success
+                importance = episode.importance
 
-                if similarity >= min_similarity:
-                    candidates.append((episode, similarity))
+                # 4. Effective strength: Ebbinghaus forgetting curve
+                effective_strength = episode.get_effective_strength(now)
 
-            # Sort by similarity
+                # === Composite score: recency × importance × relevance × strength ===
+                composite = recency * importance * max(relevance, 0.01) * effective_strength
+
+                if composite >= min_similarity:
+                    candidates.append((episode, composite))
+
+            # Sort by composite score
             candidates.sort(key=lambda x: x[1], reverse=True)
 
             # === Spreading Activation ===
-            # Activate related episodes with decayed strength
             top_episodes = candidates[:limit]
             if top_episodes and self.activation_decay > 0:
                 activated_ids: Set[str] = {ep.episode_id for ep, _ in top_episodes}
                 for ep, sim in top_episodes:
-                    # Find episodes that share actions
                     for other_id in self._domain_index.get(ep.domain or "", set()):
                         if other_id not in activated_ids:
                             other = self._episodes.get(other_id)
@@ -292,8 +361,11 @@ class EpisodicMemory:
                                     candidates.append((other, decayed_sim))
                                     activated_ids.add(other_id)
 
-                # Re-sort
                 candidates.sort(key=lambda x: x[1], reverse=True)
+
+            # === Reinforce accessed memories (Ebbinghaus) ===
+            for episode, _ in candidates[:limit]:
+                episode.reinforce()
 
             return candidates[:limit]
 
@@ -482,3 +554,67 @@ class EpisodicMemory:
     def size(self) -> int:
         """Number of episodes in memory."""
         return len(self._episodes)
+
+    def consolidate(self, strength_threshold: float = 0.05, similarity_threshold: float = 0.8) -> Dict[str, int]:
+        """Consolidate memory by removing weak and redundant episodes.
+
+        v3: Following MemoryBank's consolidation process:
+        1. Remove episodes whose effective strength has decayed below threshold
+        2. Merge very similar episodes (keeping the stronger one)
+
+        This prevents unbounded memory growth and keeps the memory
+        focused on relevant, well-established experiences.
+
+        Args:
+            strength_threshold: Remove episodes with effective strength below this.
+            similarity_threshold: Merge episodes with similarity above this.
+
+        Returns:
+            Dictionary with consolidation statistics.
+        """
+        with self._lock:
+            removed_weak = 0
+            merged = 0
+            now = time.time()
+
+            # Step 1: Remove decayed episodes
+            to_remove = []
+            for eid, episode in self._episodes.items():
+                effective = episode.get_effective_strength(now)
+                if effective < strength_threshold:
+                    to_remove.append(eid)
+
+            for eid in to_remove:
+                self._remove_episode(eid)
+                removed_weak += 1
+
+            # Step 2: Merge very similar episodes
+            episode_list = list(self._episodes.values())
+            for i, ep1 in enumerate(episode_list):
+                for ep2 in episode_list[i+1:]:
+                    if ep1.episode_id not in self._episodes or ep2.episode_id not in self._episodes:
+                        continue
+                    terms1 = set(ep1.query.lower().split())
+                    terms2 = set(ep2.query.lower().split())
+                    if terms1 and terms2:
+                        intersection = len(terms1 & terms2)
+                        union = len(terms1 | terms2)
+                        sim = intersection / union if union > 0 else 0.0
+
+                        if sim >= similarity_threshold and ep1.domain == ep2.domain:
+                            # Keep the stronger episode
+                            s1 = ep1.get_effective_strength(now)
+                            s2 = ep2.get_effective_strength(now)
+                            if s1 >= s2:
+                                self._remove_episode(ep2.episode_id)
+                                merged += 1
+                            else:
+                                self._remove_episode(ep1.episode_id)
+                                merged += 1
+
+            if self.auto_save:
+                self._save()
+
+            stats = {"removed_weak": removed_weak, "merged": merged, "remaining": len(self._episodes)}
+            logger.info(f"Memory consolidation: {stats}")
+            return stats

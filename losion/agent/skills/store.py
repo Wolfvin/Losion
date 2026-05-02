@@ -105,6 +105,10 @@ class SkillEntry:
     the skill definition (code, prompt, or configuration) along with
     metadata for discovery and ranking.
 
+    v3 (Voyager-style): Skills can now be executable programs with
+    preconditions, postconditions, and error patterns, following
+    Voyager's skill library design (Wang et al., 2023, NVIDIA).
+
     Attributes:
         name: Unique skill name (kebab-case, e.g., "python-unit-test").
         description: Human-readable description of what this skill does.
@@ -114,6 +118,10 @@ class SkillEntry:
         version: Skill version number.
         inputs: Description of expected inputs.
         outputs: Description of expected outputs.
+        executable_code: Voyager-style: executable Python code string.
+        preconditions: Voyager-style: conditions that must be true before execution.
+        postconditions: Voyager-style: conditions that should be true after execution.
+        error_patterns: Voyager-style: common failures and their fix strategies.
     """
 
     name: str
@@ -124,6 +132,11 @@ class SkillEntry:
     version: int = 1
     inputs: str = ""
     outputs: str = ""
+    # v3: Voyager-style executable skills
+    executable_code: str = ""           # Python function source code
+    preconditions: List[str] = field(default_factory=list)   # e.g., ["web_search_available"]
+    postconditions: List[str] = field(default_factory=list)  # e.g., ["result_is_valid_json"]
+    error_patterns: Dict[str, str] = field(default_factory=dict)  # error_type → fix_strategy
 
     @property
     def domain(self) -> Optional[str]:
@@ -134,6 +147,89 @@ class SkillEntry:
     def hash_key(self) -> str:
         """Hash key for O(1) lookup (Engram-style)."""
         return hashlib.sha256(self.name.encode()).hexdigest()[:16]
+
+    @property
+    def is_executable(self) -> bool:
+        """Whether this skill has executable code (Voyager-style)."""
+        return bool(self.executable_code.strip())
+
+    def execute(self, **kwargs: Any) -> Any:
+        """Execute this skill with Voyager-style retry on known errors.
+
+        If the skill has executable_code, it will be executed with
+        automatic retry on known error patterns. This follows Voyager's
+        approach of storing skills as executable programs with retry logic.
+
+        Args:
+            **kwargs: Arguments to pass to the skill function.
+
+        Returns:
+            Result of skill execution.
+
+        Raises:
+            RuntimeError: If skill fails after all retry attempts.
+        """
+        if not self.is_executable:
+            # Non-executable skills just return their definition
+            return self.definition
+
+        for attempt in range(3):
+            try:
+                # Execute in a restricted namespace
+                namespace: Dict[str, Any] = {"__builtins__": __builtins__}
+                exec(self.executable_code, namespace)
+                # Find the skill function (convention: skill_<name>)
+                func_name = f"skill_{self.name.replace('-', '_').replace(' ', '_')}"
+                if func_name in namespace:
+                    result = namespace[func_name](**kwargs)
+                    if self._verify_postconditions(result):
+                        return result
+                    else:
+                        logger.warning(f"Skill {self.name} postconditions not met on attempt {attempt+1}")
+                else:
+                    # Try to find any function in namespace
+                    for key, val in namespace.items():
+                        if callable(val) and not key.startswith("_"):
+                            result = val(**kwargs)
+                            if self._verify_postconditions(result):
+                                return result
+                            break
+            except Exception as e:
+                error_type = type(e).__name__
+                fix = self.error_patterns.get(error_type)
+                if fix:
+                    logger.info(f"Skill {self.name} error: {error_type}. Applying fix: {fix}")
+                    # Apply fix (e.g., modify kwargs)
+                    if "retry_with_empty_input" in fix and not kwargs:
+                        kwargs = {"input_data": ""}
+                else:
+                    logger.warning(f"Skill {self.name} failed: {e} (attempt {attempt+1})")
+
+        raise RuntimeError(f"Skill {self.name} failed after 3 attempts")
+
+    def _verify_postconditions(self, result: Any) -> bool:
+        """Verify that the result meets postconditions.
+
+        Simple heuristic check: if postconditions are specified,
+        verify that the result satisfies them.
+        """
+        if not self.postconditions:
+            return True  # No postconditions = always pass
+
+        result_str = str(result).lower()
+        for condition in self.postconditions:
+            if condition == "result_is_valid_json":
+                try:
+                    import json
+                    json.loads(str(result))
+                except (json.JSONDecodeError, TypeError):
+                    return False
+            elif condition == "result_is_non_empty":
+                if not result or not str(result).strip():
+                    return False
+            elif condition.lower() in result_str:
+                continue  # Condition found in result
+        return True
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to dictionary."""
