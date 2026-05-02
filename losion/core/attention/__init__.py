@@ -14,6 +14,17 @@ v0.4 additions:
 v0.5 additions (Priority 1):
   KDAProjection       — Key-Direction Attention projection (arXiv:2510.26692)
   KDAMLA              — KDA+MLA Hybrid Attention (~75% KV cache reduction)
+
+v0.6 additions (NeurIPS 2025 Best Paper):
+  GatedAttentionConfig  — Configuration for Gated Attention
+  GatedAttentionHead    — Single head with sigmoid gate after softmax
+  GatedMultiHeadAttention — Multi-head with per-head gating + MLA + RoPE
+
+v0.7 additions (NeurIPS 2025):
+  MoBAConfig       — Configuration for Mixture of Block Attention
+  BlockPartitioner — Sequence-to-block partitioning utility
+  MoBARouter       — Block-level MoE routing network
+  MoBAAttention    — Mixture of Block Attention (block-sparse attention via MoE routing)
 """
 
 from losion.core.attention.lightning_attention import (
@@ -30,6 +41,17 @@ from losion.core.attention.kda_mla import (
     KDAProjection,
     KDAMLA,
 )
+from losion.core.attention.gated_attention import (
+    GatedAttentionConfig,
+    GatedAttentionHead,
+    GatedMultiHeadAttention,
+)
+from losion.core.attention.moba import (
+    MoBAConfig,
+    BlockPartitioner,
+    MoBARouter,
+    MoBAAttention,
+)
 
 __all__ = [
     "InterleavedRoPE",
@@ -40,4 +62,11 @@ __all__ = [
     "SharedAttentionConfig",
     "KDAProjection",
     "KDAMLA",
+    "GatedAttentionConfig",
+    "GatedAttentionHead",
+    "GatedMultiHeadAttention",
+    "MoBAConfig",
+    "BlockPartitioner",
+    "MoBARouter",
+    "MoBAAttention",
 ]

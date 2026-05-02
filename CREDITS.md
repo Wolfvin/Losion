@@ -161,6 +161,124 @@ original authors for their contributions to the open research community.
 
 ---
 
+## v0.6 — "Mythos & Mamba" Improvements (8 New Components)
+
+### 13. Recurrent-Depth Transformer + LTI-Stable + ACT (`losion/core/recurrent/rdt.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Dehghani, M. et al. | "Universal Transformers" (arXiv:1807.03819) | 2019 | Original looped transformer concept — same weights applied iteratively for adaptive compute depth |
+| Kye Gomez | "OpenMythos" (github.com/kyegomez/OpenMythos) | 2026 | Open-source reconstruction of Claude Mythos architecture — Recurrent-Depth Transformer hypothesis with MoE + MLA/GQA + LTI stability |
+| Bae, S. et al. | "Relaxed Recursive Transformers" (arXiv:2410.20672) | 2024 | LoRA per loop iteration — allows per-iteration behavioral adaptation while preserving weight-sharing compactness |
+| Saunshi, N. et al. | "Reasoning with Latent Thoughts" (arXiv:2502.17416) | 2025 | Proves looped models simulate chain-of-thought reasoning in latent space |
+| Sachan, M. et al. | "COCONUT: Continuous Latent Reasoning" (arXiv:2412.06769) | 2024 | Training LLMs to reason in continuous latent space without explicit tokens |
+| Goyal, S. et al. | "Loop, Think, & Generalize" (arXiv:2604.07822) | 2026 | Implicit reasoning capabilities of recurrent-depth transformers |
+| Zhang, J. et al. | "Parcae: Scaling Laws for Looped Language Models" (arXiv:2604.12946) | 2026 | Scaling laws specific to looped architectures |
+| Graves, A. | "Adaptive Computation Time for Recurrent Neural Networks" (arXiv:1603.08983) | 2016 | Adaptive Computation Time (ACT) — learned halting criterion for variable compute depth |
+| Hyperloop Transformers | arXiv:2604.21254 | 2026 | Advanced looped transformer variant |
+| The Recurrent Transformer | arXiv:2604.21215 | 2026 | Greater effective depth and efficient decoding in looped models |
+
+**What we adapted:** Recurrent-Depth Transformer with LTI-stable injection (spectral radius constraint ρ(A) < 1 for training stability), Adaptive Computation Time for variable-depth halting, loop-index positional embeddings for iteration differentiation, and depth-wise LoRA for per-iteration adaptation. The full RecurrentDepthBlock orchestrates: Prelude → [Looped Block with LTI stability + ACT + DepthLoRA] → Coda.
+
+---
+
+### 14. MoBA — Mixture of Block Attention (`losion/core/attention/moba.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Moonshot AI | "MoBA: Mixture of Block Attention" (NeurIPS 2025) | 2025 | MoE routing applied directly to attention blocks — routes attention computation sparsely to relevant blocks instead of full O(n²) attention |
+| NeurIPS 2025 | https://neurips.cc/virtual/2025/poster/117997 | 2025 | Conference presentation and poster |
+
+**What we adapted:** Block-sparse attention via MoE routing. Sequence is partitioned into blocks, a router selects top-K relevant blocks per query, and attention is computed only within selected blocks. Supports MLA KV compression, hard and soft routing modes, and load balancing auxiliary loss. Drop-in replacement for standard attention with sub-quadratic complexity.
+
+---
+
+### 15. Gated Attention (`losion/core/attention/gated_attention.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Qwen Team | "Gated Attention" (NeurIPS 2025 Best Paper) | 2025 | Sigmoid gate after softmax attention — eliminates attention sinks, adds beneficial sparsity, synergizes with MoE routing |
+| Sun, Y. et al. | "Retentive Network: A Successor to Transformer" | 2023 | Gated retention mechanism inspiration |
+
+**What we adapted:** Per-head sigmoid gating after softmax attention output. Gate = sigmoid(W_g * output) with near-identity initialization (gates start ≈1 and gradually learn to suppress). Eliminates attention sink tokens, adds soft per-head sparsity that synergizes with MoE routing. Supports MLA KV compression and QK normalization.
+
+---
+
+### 16. Routing Mamba (RoM) (`losion/core/ssm/routing_mamba.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Microsoft Research | "Routing Mamba (RoM)" (NeurIPS 2025) | 2025 | Scales SSM parameters using sparse mixtures of linear projection experts — combines MoE routing with SSM efficiency |
+| NeurIPS 2025 | https://neurips.cc/virtual/2025/poster/116256 | 2025 | Conference presentation and poster |
+| Gu, A. & Dao, T. | "Mamba-2: A Generalized State Space Model" (arXiv:2405.21060) | 2024 | SSM with structured state space duality — base architecture for Routing Mamba |
+| DeepSeek-AI | "DeepSeek-V3 Technical Report" (arXiv:2412.19437) | 2024 | Aux-loss-free bias-based routing for load balancing |
+
+**What we adapted:** MoE routing over SSM linear projections. Multiple expert-specific B, C, dt projections with shared A matrix and D skip connection. DeepSeek-V3 style bias-based routing for load balancing. Soft mixture of expert projections → single SSM scan (efficient). Optional shared expert. Drop-in replacement for Mamba2SSD.
+
+---
+
+### 17. Mamba-3 SSD (`losion/core/ssm/mamba3.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| arXiv:2603.15569 | "Mamba-3: Inference-First State Space Models" | 2026 | Half the state size of Mamba-2 with comparable perplexity — three core methodological improvements from inference-first perspective |
+| Gu, A. & Dao, T. | "Mamba: Linear-Time Sequence Modeling with Selective State Spaces" (arXiv:2312.00752) | 2023 | Original Mamba SSM |
+| Gu, A. & Dao, T. | "Mamba-2" (arXiv:2405.21060) | 2024 | Predecessor architecture |
+
+**What we adapted:** Mamba-3 improvements: (1) Reduced state dimension d_state=32 vs Mamba-2's 64 with better utilization, (2) Dual token shift — two separate shift patterns (forward + backward) inspired by RWKV, (3) Inference-first dt discretization with clamped exponential and stabilized input scaling for stable O(1) per-token generation. Drop-in replacement for Mamba2SSD.
+
+---
+
+### 18. S'MoRE — Sub-tree MoE with Residual Experts (`losion/core/retrieval/smore.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Meta Research | "S'MoRE: Composing Experts from Shared Residual Sub-trees" (NeurIPS 2025) | 2025 | Parameter-efficient expert diversity by composing experts from shared sub-trees with residual connections |
+| DeepSeek-AI | "DeepSeekMoE: Towards Ultimate Expert Specialization" (arXiv:2401.06066) | 2024 | Fine-grained expert segmentation and shared expert design |
+
+**What we adapted:** S'MoRE expert composition with shared ResidualSubTree components (SwiGLU layers with residual connections) that multiple ComposedExperts reference for parameter sharing. Each composed expert softly blends sub-trees via learned composition weights plus an expert-specific residual branch. Achieves ~50% parameter savings vs standard MoE with equivalent expert count. Includes load balancing auxiliary loss.
+
+---
+
+### 19. Symbolic-MoE — Skill-based Discrete Routing (`losion/core/retrieval/symbolic_moe.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Symbolic-MoE (2025) | "Skill-based Discrete Routing for Mixture of Experts" | 2025 | Top-level orchestrator using skill-type classification for pathway routing instead of pure learned routing |
+| Fedus, W. et al. | "Switch Transformers: Scaling to Trillion Parameter Models" | 2022 | MoE routing fundamentals |
+| Lewis et al. | "Retrieval-Augmented Generation" | 2020 | Task-type conditioned routing inspiration |
+
+**What we adapted:** Two-stage routing: SkillClassifier (small MLP) classifies input into skill types (REASONING, NARRATIVE, KNOWLEDGE, CODING, CREATIVE, MATHEMATICAL), then SymbolicRoutingRule maps skill type to pathway allocation weights (e.g., REASONING → attention:0.7, NARRATIVE → SSM:0.8). Supports soft blending, hard discrete routing, and combination with Losion's BiasRouter for macro+micro routing.
+
+---
+
+### 20. LLM-JEPA — Joint-Embedding Predictive Architecture for LLMs (`losion/training/llm_jepa.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| LLM-JEPA (2025) | "LLM-JEPA: Predicting Future Latent States in Large Language Models" (arXiv, 19 citations) | 2025 | Predicts future latent states instead of next tokens — principled training objective for hybrid models |
+| LeCun, Y. | "A Path Towards Autonomous Machine Intelligence" (JEPA) | 2022 | Joint-Embedding Predictive Architecture — predict in latent space, not pixel/token space |
+| Assran, M. et al. | "I-JEPA: Self-Supervised Learning from Images via Joint-Embedding Predictive Architecture" (arXiv:2301.08243) | 2023 | Image JEPA with VICReg loss and EMA target encoder |
+| Bardes, A. et al. | "V-JEPA: Video Joint-Embedding Predictive Architecture" | 2024 | Video JEPA extending the framework to temporal sequences |
+
+**What we adapted:** JEPA training for LLMs: LatentPredictor predicts future hidden states (H steps ahead) from current representations, TargetEncoder (EMA teacher) provides stable targets, VICReg loss prevents representation collapse. Total loss = LM_loss + prediction_weight * JEPA_loss. Natural fit for SSM components that already model state transitions. Compatible with LosionTrainer's training loop.
+
+---
+
+## Additional Research Influencing v0.6 Design
+
+| Research | Source | Impact on Losion |
+|----------|--------|------------------|
+| Anthropic's Attention Interpretability | transformer-circuits.pub/2025/attention-update/ | Multi-head coordination analysis — informed how to preserve critical attention patterns in hybrid SSM+Attention architecture |
+| "The Hidden Attention of Mamba Models" (ACL 2025, 134 citations) | aclanthology.org/2025.acl-long.76.pdf | Proves Mamba implicitly computes attention — SSM and attention aren't independent, motivating unified SSM+Attention blocks |
+| Anthropic's "Context Engineering" (Sep 2025) | anthropic.com/engineering/effective-context-engineering | Attention budget analysis — directly motivates SSM for long-range state where attention is wasteful |
+| Claude Mythos System Card (Apr 2026) | Anthropic official documentation | Behavioral observations informing OpenMythos reconstruction |
+| Jamba / Jamba-1.5 (AI21 Labs) | arXiv:2403.19887, ICLR 2025 | Pioneering hybrid Transformer-Mamba-MoE with 1:7 attention-to-SSM ratio |
+| MoBA (Moonshot AI, NeurIPS 2025) | neurips.cc/virtual/2025/poster/117997 | MoE routing applied to attention — unifies MoE+Attention in single framework |
+| Routing Mamba (Microsoft, NeurIPS 2025) | neurips.cc/virtual/2025/poster/116256 | MoE over SSM projections — the missing piece for SSM+MoE integration |
+
+---
+
 ## Foundational Technologies Used Throughout Losion
 
 | Technology | Reference | Key Contribution to Losion |

@@ -77,6 +77,10 @@ class SSMConfig:
         use_liquid: Whether to use Liquid SSM (adaptive compute depth, v0.4).
         complexity_bottleneck: Bottleneck dimension for Liquid SSM complexity estimation.
         depth_entropy_weight: Weight for depth entropy regularization in Liquid SSM.
+        use_mamba3: Whether to use Mamba-3 SSD (half state, inference-first, v0.6).
+        use_routing_mamba: Whether to use Routing Mamba MoE over SSM projections (v0.6).
+        routing_mamba_num_experts: Number of SSM projection experts for Routing Mamba.
+        routing_mamba_active_experts: Number of active SSM experts per token.
     """
     d_state: int = 64
     d_conv: int = 4
@@ -88,6 +92,11 @@ class SSMConfig:
     use_liquid: bool = False
     complexity_bottleneck: int = 64
     depth_entropy_weight: float = 0.01
+    # v0.6 additions
+    use_mamba3: bool = False
+    use_routing_mamba: bool = False
+    routing_mamba_num_experts: int = 4
+    routing_mamba_active_experts: int = 2
 
 
 @dataclass
@@ -111,6 +120,10 @@ class AttentionConfig:
         shared_n_groups: Number of shared attention groups.
         shared_pattern: Pattern for shared attention ("all_shared", "interleaved").
         shared_unique_ratio: Ratio of unique (non-shared) parameters per layer.
+        use_gated_attention: Whether to use Gated Attention (Qwen, NeurIPS '25 Best Paper, v0.6).
+        use_moba: Whether to use MoBA Mixture of Block Attention (Moonshot AI, NeurIPS '25, v0.6).
+        moba_block_size: Block size for MoBA.
+        moba_top_k_blocks: Number of top-K blocks for MoBA routing.
     """
     n_heads: int = 8
     d_kv: int = 64
@@ -128,6 +141,11 @@ class AttentionConfig:
     shared_n_groups: int = 1
     shared_pattern: str = "all_shared"
     shared_unique_ratio: float = 0.25
+    # v0.6 additions
+    use_gated_attention: bool = False
+    use_moba: bool = False
+    moba_block_size: int = 512
+    moba_top_k_blocks: int = 4
 
 
 @dataclass
@@ -152,6 +170,10 @@ class RetrievalConfig:
         gradient_routed_lr: Learning rate for gradient-routed MoE.
         use_asymmetric: Whether to use Asymmetric MoE placement (v0.4).
         asymmetric_moe_layers: Layer indices with MoE (for asymmetric placement).
+        use_smore: Whether to use S'MoRE (Sub-tree MoE with Residual Experts, Meta NeurIPS '25, v0.6).
+        smore_num_sub_trees: Number of shared sub-trees for S'MoRE.
+        smore_sub_tree_depth: Depth of each sub-tree for S'MoRE.
+        use_symbolic_moe: Whether to use Symbolic-MoE (skill-based discrete routing, v0.6).
     """
     num_experts: int = 16
     num_active_experts: int = 2
@@ -170,6 +192,11 @@ class RetrievalConfig:
     gradient_routed_lr: float = 0.01
     use_asymmetric: bool = False
     asymmetric_moe_layers: List[int] = field(default_factory=list)
+    # v0.6 additions
+    use_smore: bool = False
+    smore_num_sub_trees: int = 4
+    smore_sub_tree_depth: int = 2
+    use_symbolic_moe: bool = False
 
     def __post_init__(self) -> None:
         if self.num_experts > 0 and self.top_k_routing < self.num_active_experts:
@@ -213,6 +240,57 @@ class OutputConfig:
     use_flow_matching: bool = False
     use_speculative: bool = False
     speculative_draft_tokens: int = 2
+
+
+@dataclass
+class RecurrentConfig:
+    """Configuration for Recurrent-Depth Transformer (RDT, v0.6).
+
+    Based on OpenMythos reconstruction of Claude Mythos architecture.
+    Enables looped transformer blocks with shared weights for parameter efficiency.
+
+    Attributes:
+        enabled: Whether to enable RDT looped blocks.
+        max_loop_iters: Maximum number of loop iterations (default ~16).
+        use_lti_stable: Whether to use LTI-stable injection for training stability.
+        use_act: Whether to use Adaptive Computation Time (variable depth halting).
+        act_halting_threshold: Threshold for ACT halting decision.
+        use_depth_lora: Whether to use per-iteration LoRA adaptation.
+        depth_lora_rank: Rank for depth LoRA modules.
+        use_loop_index_embedding: Whether to use loop-index positional embeddings.
+    """
+    enabled: bool = False
+    max_loop_iters: int = 16
+    use_lti_stable: bool = True
+    use_act: bool = True
+    act_halting_threshold: float = 0.99
+    use_depth_lora: bool = True
+    depth_lora_rank: int = 8
+    use_loop_index_embedding: bool = True
+
+
+@dataclass
+class JEPAConfig:
+    """Configuration for LLM-JEPA training (v0.6).
+
+    Predicts future latent states instead of next tokens for principled training.
+
+    Attributes:
+        enabled: Whether to enable JEPA training.
+        prediction_horizon: How many future latent states to predict.
+        latent_dim: Dimension of predicted latent states.
+        predictor_depth: Depth of the latent predictor network.
+        loss_type: JEPA loss type ("vicreg", "cosine", or "mse").
+        teacher_ema_decay: EMA decay rate for the target encoder.
+        prediction_weight: Weight for JEPA loss vs standard LM loss.
+    """
+    enabled: bool = False
+    prediction_horizon: int = 4
+    latent_dim: int = 256
+    predictor_depth: int = 3
+    loss_type: str = "vicreg"
+    teacher_ema_decay: float = 0.996
+    prediction_weight: float = 0.1
 
 
 @dataclass
@@ -363,6 +441,8 @@ class LosionConfig:
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     router: RouterConfig = field(default_factory=RouterConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    recurrent: RecurrentConfig = field(default_factory=RecurrentConfig)
+    jepa: JEPAConfig = field(default_factory=JEPAConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     hardware: HardwareConfig = field(default_factory=HardwareConfig)
     quantization: QuantizationConfig = field(default_factory=QuantizationConfig)

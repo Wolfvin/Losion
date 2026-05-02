@@ -10,6 +10,7 @@ Mengimplementasikan training 4-fase dengan dukungan:
 - Advanced Backprop: Chinchilla Scaling, Soft Capping, Scheduled Sampling
 - Advanced Memory/Data: Progressive KV, Attention Sinks, Modality-Aware Loss
 - ETR Entropy Trend Reward: Reduces thinking tokens up to 40%
+- LLM-JEPA: Joint-Embedding Predictive Architecture for LLMs
 
 Penggunaan:
     >>> from losion.training import LosionTrainer, GRPOTrainer, CurriculumScheduler
@@ -69,6 +70,13 @@ from losion.training.etr_reward import (
     ETRRewardFunction,
     ETRTrainer,
 )
+from losion.training.llm_jepa import (
+    JEPAConfig,
+    LatentPredictor,
+    TargetEncoder,
+    VICRegLoss,
+    LLMJEPA,
+)
 
 __all__ = [
     "LosionTrainer",
@@ -111,4 +119,10 @@ __all__ = [
     "ETRConfig",
     "ETRRewardFunction",
     "ETRTrainer",
+    # LLM-JEPA
+    "JEPAConfig",
+    "LatentPredictor",
+    "TargetEncoder",
+    "VICRegLoss",
+    "LLMJEPA",
 ]
