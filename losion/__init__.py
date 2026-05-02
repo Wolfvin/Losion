@@ -24,6 +24,10 @@ v0.4 Upgrades (12 total):
   LONG:   Liquid SSM variant (adaptive compute depth)
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __author__ = "Losion Contributors"
 __license__ = "MIT"
+
+# Agent Layer — autonomous agent capabilities on top of the model
+# Available as `losion.agent` — separate from the neural architecture
+from losion import agent
