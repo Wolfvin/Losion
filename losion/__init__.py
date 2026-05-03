@@ -1,7 +1,23 @@
 """
 Losion — Hybrid AI Framework with Tri-Jalur Router Architecture.
 
-Version 1.2.0 — "Bug-Squash Release"
+Version 1.2.1 — "Packaging & Tooling Release"
+
+v1.2.1 Packaging & Tooling Fixes:
+  - [WARNING] Added einops>=0.7.0 to pyproject.toml and setup.py dependencies.
+    Previously only in requirements.txt, causing ModuleNotFoundError on fresh
+    pip installs via PyPI or setup.py.
+  - [WARNING] Regenerated test_results.json — GatedAttention and MoBA now
+    show status OK (was stale FAIL from incorrect test API calls).
+  - [WARNING] Added MoBA as alias for MoBAAttention in attention __init__.py
+    for backward compatibility with documentation.
+  - [INFO] Fixed test script to call GatedAttention and MoBA with correct API
+    (component(x) instead of component(x, x, x) since both project QKV internally).
+  - [INFO] Added defensive past_key_value type checks in GatedAttention and MoBA
+    to gracefully ignore non-tuple past_key_value arguments.
+  - [INFO] Added GitHub Actions CI workflow (.github/workflows/ci.yml) with
+    lint (ruff), type-check (mypy), pytest, and integration test stages.
+  - [INFO] Updated requirements.txt version header from v0.4 to v1.2.1.
 
 v1.2.0 Bug Fixes & Improvements:
   - [CRITICAL] GatedAttention: Fixed tensor dimension mismatch in RoPE application.
@@ -69,6 +85,6 @@ Router:  Adaptive (BiasRouter + ThinkingToggle + Symbolic-MoE), GRPO/DAPO-traine
          + Router ↔ Expert Co-Evolution (Evoformer Level 5)
 """
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 __author__ = "Losion Contributors"
 __license__ = "MIT"

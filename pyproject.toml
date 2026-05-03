@@ -4,7 +4,7 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "losion"
-version = "1.2.0"
+version = "1.2.1"
 description = "Losion — Hybrid AI Framework with Tri-Jalur Router Architecture"
 readme = "README.md"
 license = {text = "MIT"}
@@ -28,6 +28,7 @@ classifiers = [
 dependencies = [
     "torch>=2.1.0",
     "numpy>=1.24.0",
+    "einops>=0.7.0",
     "pyyaml>=6.0",
 ]
 

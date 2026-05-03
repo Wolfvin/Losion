@@ -86,13 +86,13 @@
     },
     "V2_CausalLM": {
       "status": "OK",
-      "params": 17742467
+      "params": 18070291
     }
   },
   "forward": {
     "forward_loss": {
       "status": "OK",
-      "value": 7.896387577056885
+      "value": 7.7865495681762695
     },
     "forward_logits": {
       "status": "OK",
@@ -114,99 +114,78 @@
   },
   "backward": {
     "summary": {
-      "total": 530,
-      "with_grad": 482,
-      "without_grad": 48,
+      "total": 532,
+      "with_grad": 530,
+      "without_grad": 2,
       "nonfinite": 0
     },
     "grad_embedding": {
       "count": 2,
-      "avg_grad_norm": 11.027816236019135,
+      "avg_grad_norm": 33.805368593893945,
       "nonfinite": false
     },
     "grad_ssm": {
       "count": 60,
-      "avg_grad_norm": 0.6281963389279553,
+      "avg_grad_norm": 1.616150000863854,
       "nonfinite": false
     },
     "grad_attention": {
       "count": 44,
-      "avg_grad_norm": 0.294543964153325,
+      "avg_grad_norm": 0.3891512797722085,
       "nonfinite": false
     },
     "grad_moe": {
-      "count": 273,
-      "avg_grad_norm": 0.06380145731239217,
+      "count": 275,
+      "avg_grad_norm": 0.43661160683969,
       "nonfinite": false
     },
     "grad_router": {
-      "count": 52,
-      "avg_grad_norm": 0.013328378650853206,
+      "count": 86,
+      "avg_grad_norm": 0.18246143904980536,
       "nonfinite": false
     },
     "grad_rdt": {
-      "count": 19,
-      "avg_grad_norm": 0.23506880150862822,
+      "count": 21,
+      "avg_grad_norm": 0.24466347679078485,
       "nonfinite": false
     },
     "grad_evoformer": {
-      "count": 16,
-      "avg_grad_norm": 0.16028085023936,
+      "count": 22,
+      "avg_grad_norm": 0.11834615459768182,
       "nonfinite": false
     },
     "grad_dual_memory": {
-      "count": 2,
-      "avg_grad_norm": 0.26050931215286255,
+      "count": 6,
+      "avg_grad_norm": 0.0879827491407923,
       "nonfinite": false
     },
     "grad_jepa": {
       "count": 4,
-      "avg_grad_norm": 0.00960048008710146,
+      "avg_grad_norm": 0.26441647857427597,
       "nonfinite": false
     },
     "grad_mtp": {
       "count": 4,
-      "avg_grad_norm": 0.11729678697884083,
+      "avg_grad_norm": 0.11477205343544483,
       "nonfinite": false
     },
     "grad_lm_head": {
       "count": 1,
-      "avg_grad_norm": 2.957785129547119,
+      "avg_grad_norm": 2.9172096252441406,
       "nonfinite": false
     },
     "grad_other": {
       "count": 5,
-      "avg_grad_norm": 0.15666068941354752,
+      "avg_grad_norm": 0.1838270217180252,
       "nonfinite": false
     },
-    "no_grad_params": [
-      "model.layers.0.router.thinking_toggle.task_classifier.0.weight",
-      "model.layers.0.router.thinking_toggle.task_classifier.0.bias",
-      "model.layers.0.router.thinking_toggle.task_classifier.2.weight",
-      "model.layers.0.router.thinking_toggle.task_classifier.2.bias",
-      "model.layers.0.router.thinking_toggle.context_integrator.0.weight",
-      "model.layers.0.router.thinking_toggle.context_integrator.0.bias",
-      "model.layers.0.router.thinking_toggle.context_integrator.2.weight",
-      "model.layers.0.router.thinking_toggle.context_integrator.2.bias",
-      "model.layers.1.router.thinking_toggle.task_classifier.0.weight",
-      "model.layers.1.router.thinking_toggle.task_classifier.0.bias",
-      "model.layers.1.router.thinking_toggle.task_classifier.2.weight",
-      "model.layers.1.router.thinking_toggle.task_classifier.2.bias",
-      "model.layers.1.router.thinking_toggle.context_integrator.0.weight",
-      "model.layers.1.router.thinking_toggle.context_integrator.0.bias",
-      "model.layers.1.router.thinking_toggle.context_integrator.2.weight",
-      "model.layers.1.router.thinking_toggle.context_integrator.2.bias",
-      "model.layers.2.router.thinking_toggle.task_classifier.0.weight",
-      "model.layers.2.router.thinking_toggle.task_classifier.0.bias",
-      "model.layers.2.router.thinking_toggle.task_classifier.2.weight",
-      "model.layers.2.router.thinking_toggle.task_classifier.2.bias"
-    ]
+    "no_grad_params": []
   },
   "routing": {
     "routing_avg": {
-      "SSM (Jalur 1)": 0.4424957036972046,
-      "Attention (Jalur 2)": 0.2789050340652466,
-      "MoE (Jalur 3)": 0.27859926223754883
+      "SSM (Jalur 1)": 0.44366616010665894,
+      "Attention (Jalur 2)": 0.2809697985649109,
+      "MoE (Jalur 3)": 0.2753640413284302
     },
     "routing_status": "OK"
   },
@@ -239,12 +218,22 @@
       "finite": true
     },
     "GatedAttention": {
-      "status": "FAIL",
-      "error": "Tensors must have same number of dimensions: got 2 and 3"
+      "status": "OK",
+      "shape": [
+        2,
+        16,
+        256
+      ],
+      "finite": true
     },
     "MoBA": {
-      "status": "FAIL",
-      "error": "too many indices for tensor of dimension 2"
+      "status": "OK",
+      "shape": [
+        2,
+        16,
+        256
+      ],
+      "finite": true
     },
     "SmoreMoE": {
       "status": "OK",
@@ -257,7 +246,11 @@
     },
     "SymbolicMoERouter": {
       "status": "OK",
-      "shape": [2, 16, 3],
+      "shape": [
+        2,
+        16,
+        3
+      ],
       "finite": true
     },
     "AdaptiveRouter": {
@@ -287,21 +280,21 @@
   "training": {
     "training": {
       "status": "OK",
-      "initial_loss": 7.854245662689209,
-      "final_loss": 7.79072904586792,
-      "loss_decrease": 0.06351661682128906,
-      "converging": true,
+      "initial_loss": 7.78076171875,
+      "final_loss": 7.821887493133545,
+      "loss_decrease": -0.04112577438354492,
+      "converging": false,
       "all_losses": [
-        7.854245662689209,
-        7.800965309143066,
-        7.79783821105957,
-        7.826816082000732,
-        7.776360988616943,
-        7.810889720916748,
-        7.766499042510986,
-        7.781325340270996,
-        7.804731369018555,
-        7.79072904586792
+        7.78076171875,
+        7.967681407928467,
+        7.828277587890625,
+        7.783383369445801,
+        7.828610897064209,
+        7.811868667602539,
+        7.806028366088867,
+        7.691736698150635,
+        7.803443431854248,
+        7.821887493133545
       ]
     }
   },
@@ -317,7 +310,7 @@
   "save_load": {
     "save_load": {
       "status": "OK",
-      "max_diff": 0.0
+      "max_diff": 0.20155243575572968
     }
   },
   "interconnection": {
@@ -343,16 +336,16 @@
     "availability": 10.0,
     "instantiation": 10.0,
     "forward_pass": 10.0,
-    "backward_pass": 9.09433962264151,
+    "backward_pass": 9.962406015037594,
     "routing": 10.0,
-    "components": 7.0,
-    "training": 10.0,
+    "components": 10.0,
+    "training": 7.0,
     "generation": 10.0,
     "save_load": 10.0,
     "interconnection": 10.0
   },
-  "total_score": 9.60943396226415,
+  "total_score": 9.69624060150376,
   "issues": [
-    "components: 7.0/10"
+    "training: 7.0/10"
   ]
 }

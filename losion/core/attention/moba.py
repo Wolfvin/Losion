@@ -881,17 +881,14 @@ class MoBAAttention(nn.Module):
                 "present_key_value": (None, None),
             }
 
-        # ---- Unpack past cache ----
+        # ---- Unpack past cache (defensive: only accept tuple) ----
         kv_cache = None
         c_kv_cache = None
-        if past_key_value is not None:
-            if isinstance(past_key_value, tuple):
-                if len(past_key_value) >= 2:
-                    kv_cache, c_kv_cache = past_key_value[0], past_key_value[1]
-                else:
-                    kv_cache = past_key_value[0]
+        if past_key_value is not None and isinstance(past_key_value, tuple):
+            if len(past_key_value) >= 2:
+                kv_cache, c_kv_cache = past_key_value[0], past_key_value[1]
             else:
-                kv_cache = past_key_value
+                kv_cache = past_key_value[0]
 
         # ---- Project Q, K, V ----
         q = self._project_q(x)  # (batch, seq_len, n_heads, d_head)

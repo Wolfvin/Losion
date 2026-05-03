@@ -584,7 +584,8 @@ def test_individual_components(config: LosionConfig):
         from losion.core.attention.gated_attention import GatedMultiHeadAttention, GatedAttentionConfig
         ga_cfg = GatedAttentionConfig(d_model=d_model, n_heads=4, d_kv=64)
         component = GatedMultiHeadAttention(ga_cfg).to(device)
-        out = component(x, x, x)
+        # GatedMultiHeadAttention projects Q/K/V internally from x
+        out = component(x)
         output = out[0] if isinstance(out, tuple) else out
         results["GatedAttention"] = {"status": "OK", "shape": list(output.shape), "finite": bool(torch.isfinite(output).all())}
         print(f"  [OK] GatedAttention: output {output.shape}")
@@ -597,7 +598,8 @@ def test_individual_components(config: LosionConfig):
         from losion.core.attention.moba import MoBAAttention, MoBAConfig
         moba_cfg = MoBAConfig(block_size=8, top_k_blocks=2)
         component = MoBAAttention(d_model=d_model, n_heads=4, d_head=64, config=moba_cfg).to(device)
-        out = component(x, x, x)
+        # MoBAAttention projects Q/K/V internally from x
+        out = component(x)
         output = out[0] if isinstance(out, tuple) else out
         results["MoBA"] = {"status": "OK", "shape": list(output.shape), "finite": bool(torch.isfinite(output).all())}
         print(f"  [OK] MoBA: output {output.shape}")

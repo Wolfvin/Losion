@@ -542,9 +542,9 @@ class GatedMultiHeadAttention(nn.Module):
                 dummy = dummy.squeeze(0)
             return dummy, (None, None)
 
-        # ---- Unpack past state ----
+        # ---- Unpack past state (defensive: ignore non-tuple past_key_value) ----
         cached_kv = None
-        if past_key_value is not None:
+        if past_key_value is not None and isinstance(past_key_value, tuple):
             cached_kv = past_key_value[0]
 
         # ---- Q projection ----

@@ -68,6 +68,7 @@ from losion.core.attention.moba import (
     BlockPartitioner,
     MoBARouter,
     MoBAAttention,
+    MoBAAttention as MoBA,  # Alias for backward compatibility
 )
 from losion.core.attention.context_extension import (
     ContextExtensionConfig,
@@ -114,6 +115,7 @@ __all__ = [
     "BlockPartitioner",
     "MoBARouter",
     "MoBAAttention",
+    "MoBA",  # Alias for MoBAAttention
     # Context extension
     "ContextExtensionConfig",
     "RoPEExtension",
