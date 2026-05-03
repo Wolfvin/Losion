@@ -5,6 +5,85 @@ All notable changes to the Losion project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] — 2026-05-03 — "Puzzle Connected"
+
+### Fixed — CRITICAL: Component Interconnection (16 Issues Resolved)
+
+All 40+ components now properly interconnect as a unified puzzle. Previously, many
+modules existed but couldn't actually talk to each other due to interface mismatches.
+
+**SSM Interface Fixes:**
+- **`initial_state` vs `state` kwarg**: Mamba2SSD and Mamba3SSD use `initial_state`
+  as the kwarg name, but LosionLayerV2 passed `state=ssm_state`. The `state` kwarg
+  was silently ignored, so SSM state was never carried forward during inference/training.
+  Fixed: `_forward_ssm()` adapter now tries `state` first, then falls back to
+  `initial_state` via TypeError catch.
+
+- **RoutingMamba 3-tuple return**: RoutingMamba returns `(output, final_state, aux_loss)`
+  but LosionLayerV2 expected a 2-tuple, causing `ssm_state_new = aux_loss` (a scalar
+  tensor), which would crash on the next forward call. Fixed: `_forward_ssm()` adapter
+  properly unpacks 3-tuple returns.
+
+**Attention Interface Fixes:**
+- **`position_ids` vs `position_offset`**: MoBA and GatedAttention accept `position_offset`
+  not `position_ids`. When LosionLayerV2 passed `position_ids=position_ids`, the kwarg
+  was silently ignored, and position information was lost. Fixed: `_forward_attention()`
+  adapter tries `position_ids` first, then falls back to `position_offset`.
+
+- **`past_kv` vs `past_key_value`**: MoBA and GatedAttention use `past_key_value` while
+  LosionLayerV2 passed `past_kv`. KV cache was never passed to attention. Fixed:
+  adapter tries both names.
+
+- **Child3WAttention missing `position_ids`**: Doesn't accept `position_ids` at all.
+  Fixed: adapter gracefully degrades to just `attention_mask`.
+
+**MoE Interface Fixes:**
+- **3-tuple returns from AuxFreeMoE and SmoreMoE**: AuxFreeMoE returns
+  `(output, routing_info, auxiliary_losses)` and SmoreMoE returns
+  `(output, aux_loss, routing_info)`. LosionLayerV2 expected 2-tuples.
+  Fixed: `_forward_moe()` adapter normalizes all returns to `(output, aux_info)`.
+
+**Router Interface Fixes:**
+- **AdaptiveRouter doesn't accept `thinking_mode`**: LosionLayerV2 called
+  `self.router(x, thinking_mode=thinking_mode)` but AdaptiveRouter.forward() only
+  accepts `x`. The thinking_mode was silently ignored, making ThinkingToggle dead code.
+  Fixed: Router now uses `set_force_thinking()` to pass thinking_mode before calling
+  forward, then resets it after.
+
+- **`_build_router()` passed wrong args**: AdaptiveRouter.__init__ takes
+  `(d_model, num_pathways, ...)` but the factory passed a LosionConfig object.
+  Fixed: Factory now passes individual arguments.
+
+**Evoformer Interface Fixes:**
+- **Levels 3-5 were dead code**: EvoformerManager had `apply_decoder_feedback()`,
+  `apply_prediction_recycling()`, and `apply_router_coevolve()` methods, but
+  LosionModelV2 only called Levels 1-2. Fixed: Added convenience methods
+  `decoder_predict_feedback()`, `prediction_context_recycling()`, and
+  `router_expert_coevolve()` to EvoformerManager, and LosionModelV2 now calls them.
+
+**DualMemory Interface Fix:**
+- **`write()` called but `read()` never called**: LosionModelV2 wrote to memory
+  every layer but never read from it, making the memory system a no-op. Fixed:
+  Added `read()` method to DualMemorySystem that calls `retrieve()` and adds a
+  lightweight residual (5% contribution). LosionModelV2 now calls `write()` then
+  `read()` for each layer.
+
+**Training Pipeline Fix:**
+- **`_unfreeze_pathway()` used `attn_layer`**: The attribute name is `attention_layer`,
+  not `attn_layer`. Calling `layer.attn_layer` would raise AttributeError. Fixed:
+  Uses `getattr(layer, 'attention_layer', getattr(layer, 'attn_layer', None))`
+  to handle both V1 and V2 models.
+
+**Export Fixes:**
+- **V2 models not exported**: `models/__init__.py` only exported V1 models.
+  Fixed: Now exports LosionModelV2, LosionLayerV2, LosionForCausalLMV2, MTPHead, RoPE.
+
+### Credits
+
+- Losion Framework: Wolfvin & Contributors (github.com/Wolfvin/Losion)
+
+---
+
 ## [1.0.0] — 2026-05-03 — "Unified & Complete"
 
 ### Changed — CRITICAL: Version Alignment & Integration

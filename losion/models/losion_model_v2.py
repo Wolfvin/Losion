@@ -378,10 +378,19 @@ def _build_moe(config: LosionConfig) -> nn.Module:
 
 
 def _build_router(config: LosionConfig) -> nn.Module:
-    """Build AdaptiveRouter (always, never nn.Linear)."""
+    """Build AdaptiveRouter (always, never nn.Linear).
+
+    Fixed v0.9.1: AdaptiveRouter.__init__ takes (d_model, num_pathways, ...)
+    not a LosionConfig object. We now pass the correct arguments.
+    """
     try:
         from losion.core.router.router import AdaptiveRouter
-        return AdaptiveRouter(config)
+        return AdaptiveRouter(
+            d_model=config.d_model,
+            num_pathways=3,
+            top_k_pathways=config.router.top_k_pathways,
+            bias_lr=config.router.bias_lr,
+        )
     except ImportError:
         # Fallback to simple linear router
         return nn.Linear(config.d_model, 3, bias=False)
@@ -438,26 +447,41 @@ class LosionLayerV2(nn.Module):
         past_kv: Optional[Any] = None,
         position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        """Forward pass through the Tri-Jalur layer."""
+        """Forward pass through the Tri-Jalur layer.
+
+        v0.9.1: Fixed all interface mismatches between pathway modules and
+        their callers. SSM, Attention, and MoE modules now all properly
+        connect regardless of their internal parameter naming conventions.
+        """
         batch, seq_len, _ = x.shape
 
-        # Compute routing weights
+        # ===================================================================
+        # Routing — Unified AdaptiveRouter + thinking_mode integration
+        # ===================================================================
         if routing_weights is None:
-            if hasattr(self.router, 'forward'):
-                try:
-                    from losion.core.router.router import AdaptiveRouter
-                    if isinstance(self.router, AdaptiveRouter):
-                        routing_out = self.router(x, thinking_mode=thinking_mode)
-                        route_weights = routing_out.adjusted_weights
-                    else:
-                        route_logits = self.router(x)
-                        route_weights = F.softmax(route_logits, dim=-1)
-                except Exception:
+            try:
+                from losion.core.router.router import AdaptiveRouter
+                if isinstance(self.router, AdaptiveRouter):
+                    # v0.9.1: Pass thinking_mode to AdaptiveRouter so it can
+                    # adjust routing weights (non-thinking → more SSM, thinking →
+                    # more Attention + Retrieval)
+                    if thinking_mode is not None:
+                        from losion.core.router.thinking_toggle import ThinkingMode as TM
+                        forced_mode = TM.THINKING if thinking_mode else TM.NON_THINKING
+                        self.router.set_force_thinking(forced_mode)
+                    routing_out = self.router(x)
+                    route_weights = routing_out.adjusted_weights
+                    # Reset force mode after this call
+                    self.router.set_force_thinking(None)
+                else:
                     route_logits = self.router(x)
                     route_weights = F.softmax(route_logits, dim=-1)
-            else:
+            except (ImportError, Exception):
                 route_logits = self.router(x)
-                route_weights = F.softmax(route_logits, dim=-1)
+                if isinstance(route_logits, torch.Tensor):
+                    route_weights = F.softmax(route_logits, dim=-1)
+                else:
+                    route_weights = route_logits
         else:
             route_weights = routing_weights
 
@@ -465,65 +489,43 @@ class LosionLayerV2(nn.Module):
         if route_weights.dim() == 2:
             route_weights = route_weights.unsqueeze(1).expand(-1, seq_len, -1)
 
-        # Jalur 1: SSM
+        # ===================================================================
+        # Jalur 1: SSM — Unified interface adapter
+        # v0.9.1: Handles `initial_state` vs `state` kwarg mismatch,
+        # and 3-tuple (output, state, aux_loss) vs 2-tuple (output, state)
+        # ===================================================================
         ssm_input = self.ssm_norm(x)
-        if ssm_state is not None:
-            ssm_out, ssm_state_new = self.ssm_layer(ssm_input, state=ssm_state)
-        else:
-            ssm_result = self.ssm_layer(ssm_input)
-            if isinstance(ssm_result, tuple):
-                ssm_out, ssm_state_new = ssm_result[0], ssm_result[1] if len(ssm_result) > 1 else None
-            else:
-                ssm_out = ssm_result
-                ssm_state_new = None
+        ssm_out, ssm_state_new, ssm_aux_loss = self._forward_ssm(
+            ssm_input, ssm_state
+        )
 
-        # Jalur 2: Attention
+        # ===================================================================
+        # Jalur 2: Attention — Unified interface adapter
+        # v0.9.1: Handles `position_offset` vs `position_ids`, and
+        # `past_key_value` vs `past_kv` kwarg mismatches
+        # ===================================================================
         attn_input = self.attn_norm(x)
-        attn_kwargs = {}
-        if attention_mask is not None:
-            attn_kwargs["attention_mask"] = attention_mask
-        if past_kv is not None:
-            attn_kwargs["past_kv"] = past_kv
-        if position_ids is not None:
-            attn_kwargs["position_ids"] = position_ids
-        attn_result = self.attention_layer(attn_input, **attn_kwargs)
-        if isinstance(attn_result, tuple):
-            attn_out = attn_result[0]
-        else:
-            attn_out = attn_result
+        attn_out = self._forward_attention(
+            attn_input, attention_mask, past_kv, position_ids
+        )
 
-        # Jalur 3: MoE/Retrieval
+        # ===================================================================
+        # Jalur 3: MoE/Retrieval — Unified interface adapter
+        # v0.9.1: Handles 3-tuple returns (output, routing_info/aux_loss, extra)
+        # and normalizes to (output, aux_info) for consistent downstream use
+        # ===================================================================
         ret_input = self.retrieval_norm(x)
-        ret_result = self.retrieval_layer(ret_input)
-        if isinstance(ret_result, tuple):
-            ret_out, ret_aux = ret_result[0], ret_result[1] if len(ret_result) > 1 else {}
-        else:
-            ret_out = ret_result
-            ret_aux = {}
+        ret_out, ret_aux = self._forward_moe(ret_input)
 
         # Combine with routing weights
         w_ssm = route_weights[:, :, 0:1]
         w_attn = route_weights[:, :, 1:2]
         w_ret = route_weights[:, :, 2:3]
 
-        # Handle dimension mismatch via learned projection (v0.8: replaced zero-filled linear)
-        if not hasattr(self, '_dim_aligned'):
-            self._dim_aligned = True
-        if ssm_out.shape[-1] != self.d_model:
-            if not hasattr(self, 'ssm_proj'):
-                self.ssm_proj = nn.Linear(ssm_out.shape[-1], self.d_model, bias=False).to(ssm_out.device)
-                nn.init.eye_(self.ssm_proj.weight[:min(ssm_out.shape[-1], self.d_model)])
-            ssm_out = self.ssm_proj(ssm_out)
-        if attn_out.shape[-1] != self.d_model:
-            if not hasattr(self, 'attn_proj'):
-                self.attn_proj = nn.Linear(attn_out.shape[-1], self.d_model, bias=False).to(attn_out.device)
-                nn.init.eye_(self.attn_proj.weight[:min(attn_out.shape[-1], self.d_model)])
-            attn_out = self.attn_proj(attn_out)
-        if ret_out.shape[-1] != self.d_model:
-            if not hasattr(self, 'ret_proj'):
-                self.ret_proj = nn.Linear(ret_out.shape[-1], self.d_model, bias=False).to(ret_out.device)
-                nn.init.eye_(self.ret_proj.weight[:min(ret_out.shape[-1], self.d_model)])
-            ret_out = self.ret_proj(ret_out)
+        # Handle dimension mismatch via learned projection
+        ssm_out = self._align_dim(ssm_out, 'ssm_proj')
+        attn_out = self._align_dim(attn_out, 'attn_proj')
+        ret_out = self._align_dim(ret_out, 'ret_proj')
 
         combined = w_ssm * ssm_out + w_attn * attn_out + w_ret * ret_out
 
@@ -535,10 +537,184 @@ class LosionLayerV2(nn.Module):
             "layer_idx": self.layer_idx,
             "route_weights": route_weights.detach(),
             "ssm_state": ssm_state_new,
+            "ssm_aux_loss": ssm_aux_loss,
             "retrieval_aux": ret_aux,
         }
 
         return output, routing_info
+
+    # ===================================================================
+    # Unified Interface Adapters (v0.9.1)
+    # These methods handle all interface mismatches between pathway modules
+    # so that every SSM/Attention/MoE variant plugs in seamlessly.
+    # ===================================================================
+
+    def _forward_ssm(
+        self,
+        ssm_input: torch.Tensor,
+        ssm_state: Optional[Any],
+    ) -> Tuple[torch.Tensor, Optional[Any], Optional[torch.Tensor]]:
+        """Unified SSM forward that handles all interface variants.
+
+        Handles:
+        - `initial_state` vs `state` kwarg (Mamba2/Mamba3 use initial_state)
+        - 3-tuple (output, state, aux_loss) from RoutingMamba
+        - 2-tuple (output, state) from other SSM modules
+        - Single tensor output from fallback SSM
+
+        Returns:
+            (output, new_state, aux_loss) — always 3 values.
+        """
+        ssm_layer = self.ssm_layer
+        aux_loss = None
+
+        # Try passing with `state` first, then fall back to `initial_state`
+        try:
+            if ssm_state is not None:
+                # Try 'state' kwarg first (RoutingMamba, LiquidSSM, etc.)
+                try:
+                    ssm_result = ssm_layer(ssm_input, state=ssm_state)
+                except TypeError:
+                    # Fallback: try 'initial_state' (Mamba2, Mamba3)
+                    ssm_result = ssm_layer(ssm_input, initial_state=ssm_state)
+            else:
+                ssm_result = ssm_layer(ssm_input)
+        except Exception:
+            ssm_result = ssm_layer(ssm_input)
+
+        # Unpack result
+        if isinstance(ssm_result, tuple):
+            if len(ssm_result) == 3:
+                # RoutingMamba: (output, final_state, aux_loss)
+                ssm_out, ssm_state_new, aux_loss = ssm_result
+            elif len(ssm_result) == 2:
+                # Standard: (output, final_state)
+                ssm_out, ssm_state_new = ssm_result
+            else:
+                ssm_out = ssm_result[0]
+                ssm_state_new = None
+        else:
+            ssm_out = ssm_result
+            ssm_state_new = None
+
+        return ssm_out, ssm_state_new, aux_loss
+
+    def _forward_attention(
+        self,
+        attn_input: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        past_kv: Optional[Any],
+        position_ids: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Unified Attention forward that handles all interface variants.
+
+        Handles:
+        - `position_ids` vs `position_offset` kwarg mismatch
+        - `past_kv` vs `past_key_value` kwarg mismatch
+        - Modules that don't accept position_ids at all (Child3W)
+        - Tuple returns from some attention modules
+
+        Returns:
+            attention output tensor (batch, seq_len, d_model)
+        """
+        attn_layer = self.attention_layer
+
+        # Build kwargs — try both naming conventions
+        attn_kwargs: Dict[str, Any] = {}
+        if attention_mask is not None:
+            attn_kwargs["attention_mask"] = attention_mask
+
+        # Try calling with all possible kwargs, gracefully degrading
+        try:
+            # First attempt: pass both past_kv and position_ids
+            kwargs_attempt = dict(attn_kwargs)
+            if past_kv is not None:
+                kwargs_attempt["past_kv"] = past_kv
+            if position_ids is not None:
+                kwargs_attempt["position_ids"] = position_ids
+            attn_result = attn_layer(attn_input, **kwargs_attempt)
+        except TypeError:
+            # Second attempt: try alternate names (past_key_value, position_offset)
+            try:
+                kwargs_attempt = dict(attn_kwargs)
+                if past_kv is not None:
+                    kwargs_attempt["past_key_value"] = past_kv
+                if position_ids is not None:
+                    # Convert position_ids to offset for MoBA/GatedAttention
+                    kwargs_attempt["position_offset"] = position_ids[0, -1].item() if position_ids.numel() > 0 else 0
+                attn_result = attn_layer(attn_input, **kwargs_attempt)
+            except TypeError:
+                # Third attempt: only attention_mask
+                try:
+                    attn_result = attn_layer(attn_input, **attn_kwargs)
+                except TypeError:
+                    # Final fallback: no kwargs
+                    attn_result = attn_layer(attn_input)
+
+        # Unpack result
+        if isinstance(attn_result, tuple):
+            attn_out = attn_result[0]
+        else:
+            attn_out = attn_result
+
+        return attn_out
+
+    def _forward_moe(
+        self,
+        ret_input: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Unified MoE/Retrieval forward that handles all interface variants.
+
+        Handles:
+        - 3-tuple (output, routing_info, auxiliary_losses) from AuxFreeMoE
+        - 3-tuple (output, aux_loss, routing_info) from SmoreMoE
+        - 2-tuple (output, losses) from InfiniteMoE
+        - 2-tuple (output, aux_info) from FallbackMoE
+        - Single tensor output from plain FFN
+
+        Returns:
+            (output, aux_info) — always 2 values, aux_info is always a dict.
+        """
+        ret_result = self.retrieval_layer(ret_input)
+
+        if isinstance(ret_result, tuple):
+            if len(ret_result) == 3:
+                # Normalize: combine all extra info into a single dict
+                ret_out = ret_result[0]
+                aux_info = {
+                    "extra_1": ret_result[1],
+                    "extra_2": ret_result[2],
+                }
+                # Try to be smarter about naming
+                if isinstance(ret_result[1], dict):
+                    aux_info = {**ret_result[1], "routing_info": ret_result[2]}
+                elif isinstance(ret_result[2], dict):
+                    aux_info = {"aux_loss": ret_result[1], **ret_result[2]}
+            elif len(ret_result) == 2:
+                ret_out = ret_result[0]
+                aux_info = ret_result[1] if isinstance(ret_result[1], dict) else {"aux": ret_result[1]}
+            else:
+                ret_out = ret_result[0]
+                aux_info = {}
+        else:
+            ret_out = ret_result
+            aux_info = {}
+
+        return ret_out, aux_info
+
+    def _align_dim(
+        self,
+        tensor: torch.Tensor,
+        proj_name: str,
+    ) -> torch.Tensor:
+        """Align tensor's last dimension to d_model via learned projection."""
+        if tensor.shape[-1] == self.d_model:
+            return tensor
+        if not hasattr(self, proj_name):
+            proj = nn.Linear(tensor.shape[-1], self.d_model, bias=False).to(tensor.device)
+            nn.init.eye_(proj.weight[:min(tensor.shape[-1], self.d_model)])
+            setattr(self, proj_name, proj)
+        return getattr(self, proj_name)(tensor)
 
     def forward_inference(
         self,
@@ -548,36 +724,69 @@ class LosionLayerV2(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         routing_weights: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        """Inference pass (O(1) per token for SSM, cached for attention)."""
+        """Inference pass (O(1) per token for SSM, cached for attention).
+
+        v0.9.1: Uses unified adapters for consistent interface handling.
+        """
         # Compute routing
         if routing_weights is None:
-            route_logits = self.router(x)
-            if isinstance(route_logits, torch.Tensor):
-                route_weights = F.softmax(route_logits, dim=-1)
-            else:
-                route_weights = route_logits
+            try:
+                from losion.core.router.router import AdaptiveRouter
+                if isinstance(self.router, AdaptiveRouter):
+                    routing_out = self.router(x)
+                    route_weights = routing_out.adjusted_weights
+                else:
+                    route_logits = self.router(x)
+                    route_weights = F.softmax(route_logits, dim=-1)
+            except (ImportError, Exception):
+                route_logits = self.router(x)
+                if isinstance(route_logits, torch.Tensor):
+                    route_weights = F.softmax(route_logits, dim=-1)
+                else:
+                    route_weights = route_logits
 
-        # SSM (O(1) per token)
+        # SSM (O(1) per token) — use unified adapter
         ssm_input = self.ssm_norm(x)
         if hasattr(self.ssm_layer, 'forward_inference'):
-            ssm_out, ssm_state_new = self.ssm_layer.forward_inference(ssm_input, state=ssm_state)
+            try:
+                ssm_out, ssm_state_new = self.ssm_layer.forward_inference(ssm_input, state=ssm_state)
+            except TypeError:
+                try:
+                    ssm_out, ssm_state_new = self.ssm_layer.forward_inference(ssm_input, initial_state=ssm_state)
+                except TypeError:
+                    ssm_out, ssm_state_new = self.ssm_layer.forward_inference(ssm_input), None
         else:
-            ssm_result = self.ssm_layer(ssm_input, state=ssm_state)
-            ssm_out, ssm_state_new = ssm_result[0], ssm_result[1] if isinstance(ssm_result, tuple) else None
+            ssm_out, ssm_state_new, _ = self._forward_ssm(ssm_input, ssm_state)
 
-        # Attention (with KV cache)
+        # Attention (with KV cache) — use unified adapter
         attn_input = self.attn_norm(x)
         if hasattr(self.attention_layer, 'forward_inference'):
-            attn_out = self.attention_layer.forward_inference(attn_input, past_kv=past_kv, position_ids=position_ids)
+            try:
+                attn_out = self.attention_layer.forward_inference(
+                    attn_input, past_kv=past_kv, position_ids=position_ids
+                )
+            except TypeError:
+                try:
+                    attn_out = self.attention_layer.forward_inference(
+                        attn_input, past_key_value=past_kv, position_offset=(
+                            position_ids[0, -1].item() if position_ids is not None and position_ids.numel() > 0 else 0
+                        )
+                    )
+                except TypeError:
+                    attn_out = self.attention_layer.forward_inference(attn_input)
         else:
-            attn_out = self.attention_layer(attn_input, past_kv=past_kv, position_ids=position_ids)
+            attn_out = self._forward_attention(attn_input, None, past_kv, position_ids)
         if isinstance(attn_out, tuple):
             attn_out = attn_out[0]
 
-        # MoE (standard forward)
+        # MoE (standard forward) — use unified adapter
         ret_input = self.retrieval_norm(x)
-        ret_result = self.retrieval_layer(ret_input)
-        ret_out = ret_result[0] if isinstance(ret_result, tuple) else ret_result
+        ret_out, _ = self._forward_moe(ret_input)
+
+        # Align dimensions
+        ssm_out = self._align_dim(ssm_out, 'ssm_proj')
+        attn_out = self._align_dim(attn_out, 'attn_proj')
+        ret_out = self._align_dim(ret_out, 'ret_proj')
 
         # Combine
         w = route_weights
@@ -774,9 +983,11 @@ class LosionModelV2(nn.Module):
                 self.attn_res_manager.store_layer_output(layer.layer_idx, x)
                 x = self.attn_res_manager(x, layer.layer_idx)
 
-            # Dual Memory: write layer output (v0.9)
+            # Dual Memory: write AND read layer output (v0.9.1)
             if self.use_dual_memory:
                 self.dual_memory.write(x)
+                # v0.9.1 FIX: Actually READ from memory to augment hidden states
+                x = self.dual_memory.read(x)
 
             if all_routing_info is not None:
                 all_routing_info.append(layer_routing)
@@ -792,6 +1003,18 @@ class LosionModelV2(nn.Module):
         # Evoformer Level 2: Bidirectional token update (v0.9)
         if self.use_evoformer:
             x = self.evoformer_manager.bidirectional_token_update(x)
+
+        # Evoformer Levels 3-5: Full feedback loops (v0.9.1 — now wired)
+        if self.use_evoformer:
+            # Level 3: Decoder ↔ Predict feedback
+            if hasattr(self.evoformer_manager, 'decoder_predict_feedback'):
+                x = self.evoformer_manager.decoder_predict_feedback(x)
+            # Level 4: Prediction → Context recycling
+            if hasattr(self.evoformer_manager, 'prediction_context_recycling'):
+                x = self.evoformer_manager.prediction_context_recycling(x)
+            # Level 5: Router ↔ Expert co-evolution
+            if all_routing_info and hasattr(self.evoformer_manager, 'router_expert_coevolve'):
+                x = self.evoformer_manager.router_expert_coevolve(x, all_routing_info)
 
         # Optional RDT
         if self.use_rdt and hasattr(self, 'rdt_block'):

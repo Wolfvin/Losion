@@ -187,6 +187,25 @@ class DualMemorySystem(nn.Module):
             entries = x.detach()
         self.working_memory.write(entries)
 
+    def read(self, x: torch.Tensor) -> torch.Tensor:
+        """Read from memory and augment input hidden states.
+
+        v0.9.1: This method was missing — previously write() was called but
+        read() was never invoked, making the memory system a no-op. Now the
+        model properly reads from both working and long-term memory and
+        combines the result with the input via a residual connection.
+
+        Args:
+            x: Input hidden states (batch, seq_len, d_model).
+
+        Returns:
+            Augmented hidden states with memory context.
+        """
+        memory_context, info = self.retrieve(x)
+        # Lightweight residual: small contribution from memory
+        # to avoid disrupting the main computation path
+        return x + 0.05 * memory_context
+
     def consolidate(self) -> None:
         entries = self.working_memory.read_all()
         if entries.shape[0] > 0:

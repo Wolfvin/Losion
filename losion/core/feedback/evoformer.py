@@ -594,6 +594,16 @@ class EvoformerManager(nn.Module):
             return self.decoder_feedback(hidden_state, decoder_output)
         return hidden_state
 
+    def decoder_predict_feedback(self, x: torch.Tensor) -> torch.Tensor:
+        """Level 3 convenience: Self-referential decoder feedback.
+
+        v0.9.1: Added so LosionModelV2 can call this method. Uses x as both
+        the hidden state and the decoder output (self-referential feedback).
+        """
+        if self.decoder_feedback is not None:
+            return self.decoder_feedback(x, x)
+        return x
+
     def apply_prediction_recycling(
         self,
         hidden_states: torch.Tensor,
@@ -604,6 +614,16 @@ class EvoformerManager(nn.Module):
             return self.prediction_recycling(hidden_states, prediction_logits)
         return hidden_states
 
+    def prediction_context_recycling(self, x: torch.Tensor) -> torch.Tensor:
+        """Level 4 convenience: Self-referential prediction recycling.
+
+        v0.9.1: Added so LosionModelV2 can call this method. Uses x as both
+        the hidden states and the prediction logits (self-referential).
+        """
+        if self.prediction_recycling is not None:
+            return self.prediction_recycling(x, x)
+        return x
+
     def apply_router_coevolve(
         self,
         routing_weights: torch.Tensor,
@@ -613,6 +633,30 @@ class EvoformerManager(nn.Module):
         if self.router_coevolve is not None:
             return self.router_coevolve(routing_weights, pathway_outputs)
         return routing_weights
+
+    def router_expert_coevolve(
+        self,
+        x: torch.Tensor,
+        routing_info: List[Dict[str, Any]],
+    ) -> torch.Tensor:
+        """Level 5 convenience: Router ↔ Expert co-evolution from routing info.
+
+        v0.9.1: Added so LosionModelV2 can call this method. Extracts routing
+        weights from the collected routing_info and applies co-evolution.
+        """
+        if self.router_coevolve is not None:
+            # Extract routing weights from the collected info
+            route_weights_list = []
+            for info in routing_info:
+                if isinstance(info, dict) and "route_weights" in info:
+                    route_weights_list.append(info["route_weights"])
+            if route_weights_list:
+                avg_weights = torch.stack(route_weights_list).mean(dim=0)
+                adjusted = self.router_coevolve(avg_weights, [x])
+                # Apply the co-evolution adjustment as a residual
+                x = x + 0.01 * (adjusted.mean(dim=-1, keepdim=True) - 0.33) * x
+            return x
+        return x
 
     def get_stats(self) -> Dict[str, object]:
         """Get statistics about active Evoformer levels."""

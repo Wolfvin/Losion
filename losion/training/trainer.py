@@ -551,14 +551,16 @@ class LosionTrainer:
             if pathway == "ssm":
                 target = layer.ssm_layer
             elif pathway == "attention":
-                target = layer.attn_layer
+                # v0.9.1 FIX: attribute is 'attention_layer', not 'attn_layer'
+                target = getattr(layer, 'attention_layer', getattr(layer, 'attn_layer', None))
             elif pathway == "retrieval":
                 target = layer.retrieval_layer
             else:
                 continue
 
-            for param in target.parameters():
-                param.requires_grad = True
+            if target is not None:
+                for param in target.parameters():
+                    param.requires_grad = True
 
     def _create_optimizer_and_scheduler(
         self,
