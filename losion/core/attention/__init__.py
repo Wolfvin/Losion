@@ -25,6 +25,11 @@ v0.7 additions (NeurIPS 2025):
   BlockPartitioner — Sequence-to-block partitioning utility
   MoBARouter       — Block-level MoE routing network
   MoBAAttention    — Mixture of Block Attention (block-sparse attention via MoE routing)
+
+Context extension additions:
+  ContextExtensionConfig — Configuration for RoPE/SSM context extension
+  RoPEExtension          — Extends RoPE context window (YaRN, NTK, linear, dynamic NTK)
+  SSMStateExtension      — Extends SSM context by scaling state dimensions
 """
 
 from losion.core.attention.lightning_attention import (
@@ -52,6 +57,11 @@ from losion.core.attention.moba import (
     MoBARouter,
     MoBAAttention,
 )
+from losion.core.attention.context_extension import (
+    ContextExtensionConfig,
+    RoPEExtension,
+    SSMStateExtension,
+)
 
 __all__ = [
     "InterleavedRoPE",
@@ -69,4 +79,8 @@ __all__ = [
     "BlockPartitioner",
     "MoBARouter",
     "MoBAAttention",
+    # Context extension
+    "ContextExtensionConfig",
+    "RoPEExtension",
+    "SSMStateExtension",
 ]

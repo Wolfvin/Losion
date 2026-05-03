@@ -77,6 +77,17 @@ from losion.training.llm_jepa import (
     VICRegLoss,
     LLMJEPA,
 )
+from losion.training.losion_recipe import (
+    WSDLRScheduler,
+    WSDConfig,
+    LosionTrainingRecipe,
+    PhaseRecipe,
+    LosionTrainingState,
+    GradientStats,
+    ActivationStats,
+    ScalingRecipe,
+    ModelScaleConfig,
+)
 
 __all__ = [
     "LosionTrainer",
@@ -125,4 +136,14 @@ __all__ = [
     "TargetEncoder",
     "VICRegLoss",
     "LLMJEPA",
+    # Losion Training Recipe
+    "WSDLRScheduler",
+    "WSDConfig",
+    "LosionTrainingRecipe",
+    "PhaseRecipe",
+    "LosionTrainingState",
+    "GradientStats",
+    "ActivationStats",
+    "ScalingRecipe",
+    "ModelScaleConfig",
 ]

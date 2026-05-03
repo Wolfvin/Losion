@@ -5,6 +5,86 @@ All notable changes to the Losion project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] — 2026-05-03 — "Integrated & Complete"
+
+### Added — CRITICAL: Model Integration
+
+- **LosionModelV2** (`models/losion_model_v2.py`): Complete rewrite of the production model.
+  Config-driven module selection replaces ALL Simplified* placeholders with actual core
+  implementations. AdaptiveRouter replaces nn.Linear. RoPE replaces learned position
+  embeddings. MTP heads + JEPA loss integrated. Full .generate() with KV cache.
+  Credits: All v0.4-v0.6 component references.
+
+- **RoPE** (`models/losion_model_v2.py`): Rotary Position Embedding replacing learned
+  position embeddings. Supports standard RoPE, iRoPE, and context extension.
+  Credits: Su et al., 2021 (arXiv:2104.09864).
+
+### Added — Inference Optimization
+
+- **KV Cache** (`inference/kv_cache.py`): Standard + MLA compressed + Paged KV cache.
+  ChunkKV + EvolKV compression. Prefix caching for shared prompts.
+  Credits: vLLM PagedAttention, ChunkKV (NeurIPS 2025), EvolKV (EMNLP 2025).
+
+- **Generation Pipeline** (`inference/generation.py`): Full .generate() with temperature,
+  top-k, top-p, repetition penalty. Speculative decoding (SSM as draft). Continuous
+  batching server. Streaming generation.
+  Credits: vLLM, EAGLE-3 (Li et al., 2025), HuggingFace generate API.
+
+### Added — Data Pipeline
+
+- **LosionTokenizer** (`data/tokenizer.py`): Unified tokenizer wrapping tiktoken/sentencepiece.
+  Thinking tokens (<think_start>, <think_end>) for extended reasoning mode.
+  Credits: tiktoken (OpenAI), sentencepiece (Google), Bit-level BPE (arXiv:2506.07541).
+
+- **LosionDataset** (`data/dataset.py`): Memory-mapped pre-tokenized dataset with packed
+  sequences. Data curation pipeline (quality filtering, MinHash LSH dedup, PII removal).
+  Curriculum data loader with phase-aware difficulty.
+  Credits: FineWeb2 (ICLR 2025), ADAPT (ICLR 2026), MinHash LSH.
+
+### Added — Losion Training Recipe
+
+- **WSD LR Schedule** (`training/losion_recipe.py`): Warmup-Stable-Decay with WSM weight
+  averaging. Supports decay from any point.
+  Credits: WSD (ICLR 2025, 46 citations), WSM (arXiv:2507.17634).
+
+- **LosionTrainingRecipe** (`training/losion_recipe.py`): Complete 4-phase methodology:
+  Phase 1 (Individual + JEPA), Phase 2 (Joint + TACO), Phase 3 (RL + GRPO + ETR),
+  Phase 4 (Distillation + BitDistill). Per-phase hyperparams, loss configs, data configs.
+  Credits: DeepSeek training, TACO, ETR, JEPA.
+
+- **ScalingRecipe** (`training/losion_recipe.py`): Pre-configured recipes for 1B/7B/48B.
+  Each includes LosionConfig + LosionTrainingRecipe.
+
+### Added — Evaluation
+
+- **LosionEvaluator** (`evaluation/benchmarks.py`): Perplexity evaluation, MMLU/GSM8K/
+  HellaSwag benchmarks, routing behavior analysis with collapse detection.
+  Credits: lm-eval-harness (EleutherAI), DeepEval.
+
+### Added — Safety & Alignment
+
+- **Constitutional AI** (`safety/alignment.py`): 15 constitutional principles, safety
+  classifier (binary + multi-label), constitutional trainer with critique-revise loop,
+  red teamer (R-CAI adversarial prompts).
+  Credits: Constitutional AI (Anthropic, 2022), R-CAI (arXiv:2604.17769),
+  AlphaDPO (ICML 2025), DRO (OpenReview 2025).
+
+### Added — Distributed Training
+
+- **LosionDistributedTrainer** (`distributed/parallel.py`): 4D parallelism (DP+TP+PP+CP),
+  FSDP with configurable sharding, pipeline parallelism, context parallelism (ring
+  attention + SSM state propagation).
+  Credits: PyTorch FSDP2, WLB-LLM (OSDI 2025), AutoSP (arXiv:2604.27089).
+
+### Added — Long Context
+
+- **Context Extension** (`core/attention/context_extension.py`): RoPE extension via YaRN,
+  NTK-aware scaling, linear scaling, dynamic NTK. SSM state extension for longer
+  contexts.
+  Credits: YaRN (2024), NTK-Aware Scaling (2023-2025), ACL 2025 SSM state scaling.
+
+---
+
 ## [0.6.0] — 2026-05-03 — "Mythos & Mamba"
 
 ### Added — Recurrent-Depth Transformer (OpenMythos / Claude Mythos)

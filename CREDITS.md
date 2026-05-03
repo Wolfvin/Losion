@@ -310,6 +310,113 @@ original authors for their contributions to the open research community.
 
 ---
 
+## v0.7 — "Integrated & Complete" Improvements
+
+### 21. LosionModelV2 — Config-Driven Integration (`losion/models/losion_model_v2.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Su, J. et al. | "RoFormer: Enhanced Transformer with Rotary Position Embedding" (arXiv:2104.09864) | 2021 | Rotary position embeddings replacing learned position embeddings |
+| Losion Framework | Wolfvin & Contributors (github.com/Wolfvin/Losion) | 2024-2026 | Config-driven module selection replacing Simplified* placeholders |
+| DeepSeek-V2/V3 | arXiv:2405.04434, arXiv:2412.19437 | 2024 | MLA, aux-loss-free MoE integrated into production model |
+
+**What we adapted:** Complete rewrite of the production model. RoPE replaces learned position embeddings. Config-driven factory pattern selects SSM/Attention/MoE modules based on config flags (e.g., `use_mamba3` → Mamba3SSD, `use_gated_attention` → GatedMultiHeadAttention). AdaptiveRouter replaces nn.Linear. MTP heads and JEPA loss integrated into forward pass.
+
+---
+
+### 22. KV Cache + Inference Optimization (`losion/inference/`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| vLLM Team | "Efficient Memory Management for Large Language Model Serving with PagedAttention" | 2023 | PagedAttention — virtual memory for KV cache with page tables |
+| ChunkKV | NeurIPS 2025 (neurips.cc/virtual/2025/poster/120181) | 2025 | Semantic-preserving chunk-level KV cache compression |
+| EvolKV | EMNLP Findings 2025 (arXiv:2509.08315) | 2025 | Adaptive layer-wise KV cache compression via evolutionary optimization |
+| EAGLE-3 | Li et al., 2025 | 2025 | Multi-layer feature fusion speculative decoding |
+| HuggingFace | generate() API | 2024 | Generation API design patterns |
+
+**What we adapted:** Three-tier KV cache: standard (full K/V), MLA compressed (latent c_kv only), and paged (vLLM-style page allocation with prefix caching). ChunkKV + EvolKV compression. Full generation pipeline with temperature/top-k/top-p, speculative decoding (SSM as draft model), continuous batching, and streaming support.
+
+---
+
+### 23. Data Pipeline (`losion/data/`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| OpenAI | tiktoken tokenizer | 2023 | BPE tokenizer backend |
+| Google | SentencePiece | 2018 | Language-independent tokenizer |
+| Bit-level BPE | arXiv:2506.07541 | 2025 | Sub-byte tokenization for shorter sequences |
+| FineWeb2 | ICLR 2025 (87 citations) | 2025 | Adaptive data curation pipeline |
+| ADAPT | ICLR 2026 | 2026 | Online reweighting for data curation |
+| MinHash LSH | Broder, A. (1997) | 1997 | Scalable near-duplicate detection |
+
+**What we adapted:** Unified tokenizer wrapping tiktoken/sentencepiece with thinking tokens (<think_start>, <think_end>). Memory-mapped dataset with packed sequences. Data curation pipeline: quality filtering + MinHash LSH dedup + PII removal + domain mixing. Curriculum data loader with phase-aware difficulty progression.
+
+---
+
+### 24. Losion Training Recipe (`losion/training/losion_recipe.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| WSD Schedule | ICLR 2025 (46 citations, openreview.net/forum?id=m51BgoqvbP) | 2025 | Warmup-Stable-Decay LR schedule — high-quality intermediate models from any point |
+| WSM | arXiv:2507.17634 | 2025 | Decay-free schedule via checkpoint merging (stochastic weight averaging) |
+| DeepSeek Training | DeepSeek-V2/V3 Technical Reports | 2024 | Multi-stage training methodology |
+| TACO | DeepSeek-V2 (2024) | 2024 | Training with Compute Alignment |
+| ETR Reward | DeepSeekMath (2024), Gemini 2.5 (2025) | 2024-2025 | Entropy trend reward for efficient thinking tokens |
+
+**What we adapted:** Complete Losion-specific 4-phase training methodology with per-phase hyperparameters, loss configurations, and data difficulty settings. WSD LR schedule with WSM weight averaging. Scaling recipes for 1B/7B/48B with pre-configured LosionConfig + TrainingRecipe.
+
+---
+
+### 25. Evaluation Framework (`losion/evaluation/benchmarks.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| EleutherAI | lm-eval-harness | 2023 | Standard LLM evaluation harness |
+| DeepEval | confident-ai/deepeval | 2024 | Pytest-like LLM evaluation with specialized metrics |
+| AutoEvoEval | arXiv:2506.23735 | 2025 | Evolution-based evaluation that finds model weaknesses |
+
+**What we adapted:** Perplexity evaluator (full + sliding window). Benchmark evaluation for MMLU, GSM8K, HellaSwag, ARC. Routing behavior analyzer with utilization, specialization, entropy, and collapse detection metrics.
+
+---
+
+### 26. Safety & Alignment (`losion/safety/alignment.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Anthropic | "Constitutional AI: Harmlessness from AI Feedback" | 2022 | Constitutional AI with critique-revise training |
+| R-CAI | arXiv:2604.17769 | 2026 | Reverse Constitutional AI for automated red teaming |
+| AlphaDPO | ICML 2025 (icml.cc/virtual/2025/poster/45946) | 2025 | Adaptive reward margin in DPO |
+| DRO | OpenReview 2025 (openreview.net/forum?id=5EqAAgBMWZ) | 2025 | Direct Reward Optimization without pairwise preferences |
+
+**What we adapted:** 15 constitutional principles with auto-categorization. Safety classifier (binary safe/unsafe + multi-label toxicity/violence/hate/sexual/self-harm). Constitutional trainer with generate→evaluate→critique→revise loop. Red teamer with R-CAI adversarial prompt generation.
+
+---
+
+### 27. Distributed Training (`losion/distributed/parallel.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| PyTorch FSDP2 | docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html | 2025 | Fully Sharded Data Parallel v2 with implicit prefetching |
+| WLB-LLM | OSDI 2025 (arXiv:2503.17924, 24 citations) | 2025 | Workload-balanced 4D parallelism for LLM training |
+| AutoSP | arXiv:2604.27089 | 2026 | Compiler-based automated sequence parallelism |
+| DeepSpeed Ulysses | emergentmind.com/topics/deepspeed-ulysses | 2025 | Scalable sequence and head parallelism |
+
+**What we adapted:** 4D parallelism (DP+TP+PP+CP) with configurable FSDP sharding. Context parallelism with ring-style attention communication and sequential SSM state propagation. Expert parallelism for MoE layers. Distributed training loop with gradient accumulation and mixed precision.
+
+---
+
+### 28. Long Context Extension (`losion/core/attention/context_extension.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| YaRN | arXiv:2309.00071 | 2024 | Yet Another RoPE Extension — NTK-by-parts interpolation |
+| NTK-Aware Scaling | 2023-2025, widely adopted | 2023 | Dimension-wise rotary frequency adjustment for context extension |
+| Scaling RNN State | ACL 2025 (aclanthology.org/2025.acl-long.564) | 2025 | Efficient scaling of RNN/SSM state size for longer contexts |
+
+**What we adapted:** Four RoPE extension methods: YaRN (mixed interpolation + temperature), NTK-aware (base scaling), linear (frequency division), dynamic NTK (progressive base). SSM state extension via interpolation + zero-padding for longer SSM context windows.
+
+---
+
 ## Foundational Technologies Used Throughout Losion
 
 | Technology | Reference | Key Contribution to Losion |
