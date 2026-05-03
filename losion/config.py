@@ -238,6 +238,125 @@ class RouterConfig:
 
 
 @dataclass
+class AttnResConfig:
+    """Configuration for Attention Residuals (MoonshotAI 2026, v0.9).
+
+    AttnRes replaces fixed-weight residual connections with learned
+    attention-based aggregation across layers.
+
+    Attributes:
+        enabled: Whether to enable AttnRes.
+        mode: "full", "block", or "hybrid".
+        num_blocks: Number of blocks for Block AttnRes mode.
+        dropout: Dropout rate for attention weights.
+        use_gate: Whether to use gating after aggregation.
+        temperature: Temperature for attention softmax.
+        compression_dim: Compress layer representations (0 = no compression).
+        use_token_compression: Enable token-dimension AttnRes + Compression.
+        token_compression_type: "linear", "gated", or "ssm".
+        token_compression_d_state: Dimension of compressed token state.
+    """
+    enabled: bool = False
+    mode: str = "block"
+    num_blocks: int = 8
+    dropout: float = 0.0
+    use_gate: bool = True
+    temperature: float = 1.0
+    compression_dim: int = 0
+    use_token_compression: bool = False
+    token_compression_type: str = "gated"
+    token_compression_d_state: int = 256
+
+
+@dataclass
+class EvoformerConfig:
+    """Configuration for Evoformer feedback loops (v0.9).
+
+    5 levels of bidirectional feedback inspired by AlphaFold's Evoformer.
+
+    Attributes:
+        enabled: Whether to enable Evoformer feedback.
+        n_recycling_steps: Number of recycling iterations.
+        use_layer_recycling: Enable Level 1 — inter-layer feedback.
+        use_token_recycling: Enable Level 2 — bidirectional token update.
+        use_decoder_feedback: Enable Level 3 — decoder ↔ predict feedback.
+        use_prediction_recycling: Enable Level 4 — prediction → context.
+        use_router_coevolve: Enable Level 5 — router ↔ expert co-evolution.
+    """
+    enabled: bool = False
+    n_recycling_steps: int = 3
+    use_layer_recycling: bool = True
+    use_token_recycling: bool = True
+    use_decoder_feedback: bool = True
+    use_prediction_recycling: bool = True
+    use_router_coevolve: bool = True
+
+
+@dataclass
+class Child3WConfig:
+    """Configuration for Child-3W attention routing (v0.9).
+
+    MoE at the QKV level: multiple child attention parameter sets
+    with routing between them.
+
+    Attributes:
+        enabled: Whether to enable Child-3W routing.
+        num_children: Number of Child-3W sets.
+        top_k_children: Active children per token.
+        use_mla: Whether to use MLA compression.
+        mla_latent_dim: MLA latent dimension.
+        load_balance_weight: Auxiliary load balancing loss weight.
+    """
+    enabled: bool = False
+    num_children: int = 4
+    top_k_children: int = 2
+    use_mla: bool = False
+    mla_latent_dim: int = 0
+    load_balance_weight: float = 0.01
+
+
+@dataclass
+class AnchoredDecoderConfig:
+    """Configuration for Anchored Diffusion Decoder (v0.9).
+
+    Continuous vector prediction + lightweight anchored diffusion refinement.
+    Replaces softmax → token ID with predict → continuous vector → 2-3 step decode.
+
+    Attributes:
+        enabled: Whether to enable anchored decoder.
+        n_refine_steps: Number of refinement steps.
+        d_refine: Internal dimension for refinement.
+        use_evoformer_feedback: Whether to use Evoformer feedback loop.
+        n_feedback_iterations: Number of feedback iterations.
+        disambiguation_heads: Heads for disambiguation attention.
+    """
+    enabled: bool = False
+    n_refine_steps: int = 3
+    d_refine: int = 512
+    use_evoformer_feedback: bool = True
+    n_feedback_iterations: int = 2
+    disambiguation_heads: int = 8
+
+
+@dataclass
+class DualMemoryConfig:
+    """Configuration for Two-Level Memory System (v0.9).
+
+    Working memory (recent, detailed) + Long-term memory (compressed, persistent).
+
+    Attributes:
+        enabled: Whether to enable dual memory system.
+        working_memory_size: Number of entries in working memory.
+        long_term_memory_dim: Dimension of compressed long-term state.
+        consolidation_method: "attention", "gated", or "mean".
+    """
+    enabled: bool = False
+    working_memory_size: int = 512
+    long_term_memory_dim: int = 256
+    consolidation_method: str = "attention"
+
+
+@dataclass
 class OutputConfig:
     """Configuration for output head.
 
@@ -262,6 +381,10 @@ class OutputConfig:
     leap_mtp_schedule: str = "geometric"
     leap_mtp_num_leaps: int = 4
     leap_mtp_max_leap: int = 8
+    # v0.9 — Anchored Diffusion Decoder
+    use_anchored_decoder: bool = False
+    anchored_n_refine_steps: int = 3
+    anchored_d_refine: int = 512
 
 
 @dataclass
@@ -551,6 +674,12 @@ class LosionConfig:
     hardware: HardwareConfig = field(default_factory=HardwareConfig)
     quantization: QuantizationConfig = field(default_factory=QuantizationConfig)
     nas: NASConfig = field(default_factory=NASConfig)
+    # v0.9 additions
+    attn_res: AttnResConfig = field(default_factory=AttnResConfig)
+    evoformer: EvoformerConfig = field(default_factory=EvoformerConfig)
+    child_3w: Child3WConfig = field(default_factory=Child3WConfig)
+    anchored_decoder: AnchoredDecoderConfig = field(default_factory=AnchoredDecoderConfig)
+    dual_memory: DualMemoryConfig = field(default_factory=DualMemoryConfig)
 
     def __post_init__(self) -> None:
         """Validate configuration after initialization."""

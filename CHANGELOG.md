@@ -5,6 +5,100 @@ All notable changes to the Losion project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] — 2026-05-03 — "Architecture Document Realized"
+
+### Added — Attention Residuals (AttnRes, MoonshotAI 2026)
+
+- **AttnRes** (`core/attention/attn_res.py`): Learned attention-based aggregation replacing
+  standard fixed-weight residual connections. Three modes: Full AttnRes (O(L·d) memory,
+  attends to all previous layer outputs), Block AttnRes (O(N·d) memory with ~8 blocks,
+  captures most benefit at minimal overhead), and Hybrid mode (Block first half + Full
+  second half). Includes pseudo-query per layer/block, optional gating, and compression.
+  AttnResManager coordinates Full/Block/Hybrid modes across the model.
+  Results from Kimi Linear 48B: GPQA-Diamond +7.5, Math +3.6, HumanEval +3.1, MMLU +1.1.
+  Credits: MoonshotAI, "Attention Residuals" (2026),
+  https://github.com/MoonshotAI/Attention-Residuals
+
+- **Token AttnRes + Compression** (`core/attention/attn_res.py`): AttnRes applied in the
+  token (sequence) dimension with compression to O(d) fixed-size hidden state. Three
+  compression options: linear (simple), gated (selective), SSM (Mamba-style compressor
+  that works WITH AttnRes, not against it). This replaces Mamba's forced forgetting
+  (A < 1) with intelligent forgetting based on relevance — the key innovation from
+  the architecture document (Section 8-9).
+  Credits: Losion Architecture Document Sections 8-9, MoonshotAI AttnRes.
+
+### Added — Evoformer Universal Principle (5 Levels, AlphaFold-inspired)
+
+- **Evoformer** (`core/feedback/evoformer.py`): 5-level bidirectional feedback system
+  inspired by AlphaFold's Evoformer (Nobel Prize 2024). Core principle: replace one-way
+  information flow with iterative bidirectional dialogue.
+  Level 1 — Inter-Layer Recycling: Deep layers revise shallow layers via cross-attention.
+  Level 2 — Bidirectional Token Update: Later tokens revise earlier ones (NOT BERT —
+  iterative refinement after forward pass, preserving autoregressive reasoning).
+  Level 3 — Decoder ↔ Predict Feedback: Decoder output refines prediction vector,
+  prediction refines decoder input (2-3 iterations).
+  Level 4 — Prediction → Context Recycling: Predicted token N revises representations
+  of tokens 1..N-1 (AlphaFold-style recycling applied to LLMs).
+  Level 5 — Router ↔ Expert Co-Evolution: Routing decisions and expert specialization
+  co-evolve through shared state, preventing routing collapse and encouraging
+  emergent specialization.
+  EvoformerManager coordinates all 5 levels.
+  Credits: Jumper et al., "AlphaFold" (Nature, 2021) — Nobel Prize in Chemistry 2024;
+  Abramson et al., "AlphaFold 3" (Nature, 2024); Losion Architecture Document Section 16.
+
+### Added — Child-3W Routing (MoE at QKV Level)
+
+- **Child-3W** (`core/attention/child_3w.py`): MoE routing at the Wq/Wk/Wv level —
+  multiple independent Child-3W sets, each with its own QKV projections, with a router
+  selecting which children to activate per token. More granular than standard MoE:
+  standard MoE separates at FFN output level; Child-3W separates at QKV representation
+  level. Supports top-K routing with bias-based load balancing (DeepSeek-V3 style),
+  optional MLA compression, and auxiliary load balance loss. Multiple children can be
+  active simultaneously (generalist: blend all, specialist: one dominant, multi-domain:
+  weighted combination). Drop-in replacement for standard attention.
+  Credits: Losion Architecture Document Sections 5-6 (Router + Child-3W concept).
+
+### Added — Anchored Diffusion Decoder (Continuous Vector Pipeline)
+
+- **Anchored Decoder** (`core/output/anchored_decoder.py`): Correct implementation of
+  the architecture document's Section 15 — replaces softmax → token ID pipeline with:
+  predict continuous vector (NO softmax) → 2-3 step anchored diffusion → text. The
+  predicted vector serves as an "anchor" already in the right neighborhood, so only
+  2-3 refinement steps are needed (vs. 100-1000 for diffusion from noise). Three
+  refinement stages: DisambiguationBlock (resolve similar tokens via causal attention),
+  CoherenceBlock (ensure parallel token consistency), EvoformerFeedback (decoder output
+  refines prediction vector, 2-3 iterations). ContinuousOutputHead provides the
+  integration point replacing standard lm_head + softmax.
+  Credits: Losion Architecture Document Section 15; MDLM (2024); AlphaFold3 recycling.
+
+### Added — Two-Level Memory System
+
+- **Dual Memory** (`core/memory/dual_memory.py`): Working memory + long-term memory
+  system implementing the architecture document's Section 11.4 insight that AttnRes +
+  Compression naturally produces two-level memory. WorkingMemory: ring buffer with
+  direct access to recent token/layer outputs (high detail, limited capacity).
+  LongTermMemory: compressed hidden state with AttnRes-style selective consolidation
+  (attention-based, gated, or mean compression). DualMemorySystem coordinates both
+  levels with learned retrieval gating. Memory consolidation is analogous to human
+  sleep — select important info from working memory, compress to long-term state.
+  Credits: Losion Architecture Document Section 11.4; Baddeley's working memory model.
+
+### Changed — Config Updates
+
+- **LosionConfig** (`config.py`): Added AttnResConfig, EvoformerConfig, Child3WConfig,
+  AnchoredDecoderConfig, DualMemoryConfig sub-configurations. Added anchored decoder
+  fields in OutputConfig.
+- **LosionConfig** LosionConfig now includes 5 new v0.9 sub-configs alongside all
+  existing v0.3-v0.8 configs.
+
+### Changed — Module Exports
+
+- Updated `__init__.py` in attention, output, feedback, and memory modules to export
+  all v0.9 classes.
+- Updated main `__init__.py` to version 0.9.0 with comprehensive feature listing.
+
+---
+
 ## [0.8.0] — 2026-05-03 — "Next-Gen Training & Infinite Experts"
 
 ### Added — DAPO (Replaces GRPO)

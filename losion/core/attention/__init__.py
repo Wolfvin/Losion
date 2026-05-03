@@ -30,6 +30,18 @@ Context extension additions:
   ContextExtensionConfig — Configuration for RoPE/SSM context extension
   RoPEExtension          — Extends RoPE context window (YaRN, NTK, linear, dynamic NTK)
   SSMStateExtension      — Extends SSM context by scaling state dimensions
+
+v0.9 additions (Architecture Document Implementations):
+  AttnResConfig        — Configuration for Attention Residuals
+  AttnResMode          — Full/Block/Hybrid mode enum
+  FullAttnRes          — Full Attention Residuals (all previous layers)
+  BlockAttnRes         — Block Attention Residuals (efficient approximation)
+  AttnResManager       — Coordinates Full/Block/Hybrid modes
+  TokenAttnResCompression — Token-dimension AttnRes + Compression
+  Child3WConfig        — Configuration for Child-3W routing
+  Child3WSet           — Single Child-3W attention parameter set
+  Child3WRouter        — Router for Child-3W sets
+  Child3WAttention      — Full Child-3W attention with routing
 """
 
 from losion.core.attention.lightning_attention import (
@@ -62,6 +74,20 @@ from losion.core.attention.context_extension import (
     RoPEExtension,
     SSMStateExtension,
 )
+from losion.core.attention.attn_res import (
+    AttnResConfig,
+    AttnResMode,
+    FullAttnRes,
+    BlockAttnRes,
+    AttnResManager,
+    TokenAttnResCompression,
+)
+from losion.core.attention.child_3w import (
+    Child3WConfig as Child3WAttentionConfig,
+    Child3WSet,
+    Child3WRouter,
+    Child3WAttention,
+)
 
 __all__ = [
     "InterleavedRoPE",
@@ -83,4 +109,16 @@ __all__ = [
     "ContextExtensionConfig",
     "RoPEExtension",
     "SSMStateExtension",
+    # v0.9 AttnRes
+    "AttnResConfig",
+    "AttnResMode",
+    "FullAttnRes",
+    "BlockAttnRes",
+    "AttnResManager",
+    "TokenAttnResCompression",
+    # v0.9 Child-3W
+    "Child3WAttentionConfig",
+    "Child3WSet",
+    "Child3WRouter",
+    "Child3WAttention",
 ]

@@ -560,6 +560,67 @@ If you use Losion in your research, please cite the original repository:
 
 ---
 
+## v0.9 — "Architecture Document Realized" Improvements
+
+### 39. AttnRes — Attention Residuals (`losion/core/attention/attn_res.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| MoonshotAI | "Attention Residuals" (github.com/MoonshotAI/Attention-Residuals) | 2026 | Learned attention-based aggregation replacing fixed residual connections; GPQA-Diamond +7.5, Math +3.6, HumanEval +3.1, MMLU +1.1 on Kimi Linear 48B |
+| Losion Architecture Document | Sections 7-9 | 2026 | AttnRes + Compression in both token and layer dimensions; intelligent forgetting replacing Mamba's forced forgetting |
+
+**What we adapted:** Full/Block/Hybrid AttnRes modes. Block AttnRes partitions layers into ~8 blocks for O(N·d) memory. Token AttnRes + Compression applies the same principle in the token dimension with three compression options (linear, gated, SSM). AttnResManager coordinates modes. Optional gating for training stability.
+
+---
+
+### 40. Evoformer Universal Principle — 5-Level Feedback (`losion/core/feedback/evoformer.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Jumper et al. | "Highly accurate protein structure prediction with AlphaFold" (Nature) | 2021 | Evoformer: bidirectional MSA↔Pair updates; Nobel Prize in Chemistry 2024 |
+| Abramson et al. | "Accurate structure prediction of biomolecular interactions with AlphaFold 3" (Nature) | 2024 | Improved Evoformer with diffusion head and recycling |
+| Losion Architecture Document | Section 16 | 2026 | Generalized as universal principle for LLMs at 5 architecture levels |
+
+**What we adapted:** 5 levels of bidirectional feedback: (1) LayerRecyclingBlock — deep layers revise shallow via cross-attention, (2) BidirectionalTokenUpdate — later tokens revise earlier (NOT BERT: iterative refinement after forward pass), (3) DecoderPredictFeedback — decoder output refines prediction vector, (4) PredictionContextRecycling — predicted tokens revise context representations (AlphaFold-style), (5) RouterExpertCoevolve — routing decisions and expert specialization co-evolve through shared learned state. EvoformerManager coordinates all levels.
+
+---
+
+### 41. Child-3W Routing — MoE at QKV Level (`losion/core/attention/child_3w.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Losion Architecture Document | Sections 5-6 | 2026 | Router + Child-3W concept: multiple independent Wq/Wk/Wv sets with routing |
+| Mixtral / GPT-4 MoE | Standard MoE at FFN level | 2023-2024 | Inspiration for granularity — Child-3W is MORE granular (representation-level) |
+| DeepSeek-V3 | Auxiliary-loss-free bias-based routing | 2024 | Bias-based load balancing adapted for Child-3W router |
+
+**What we adapted:** Multiple Child3WSet modules, each with independent Wq/Wk/Wv projections. Child3WRouter selects top-K children per token with bias-based load balancing. Multiple children can be active simultaneously (generalist: blend all, specialist: one dominant, multi-domain: weighted combination). Optional MLA compression. Drop-in replacement for standard attention.
+
+---
+
+### 42. Anchored Diffusion Decoder (`losion/core/output/anchored_decoder.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Losion Architecture Document | Section 15 | 2026 | Predict continuous vector + 2-3 step anchored diffusion decoder |
+| MDLM | "Discrete Flow Matching" | 2024 | Diffusion for text, but from noise (our approach starts from meaningful vector) |
+| AlphaFold3 | Abramson et al. (Nature) | 2024 | Recycling feedback loop inspiration for decoder |
+
+**What we adapted:** ContinuousOutputHead replaces softmax → token ID with predict → continuous vector → anchored diffusion → logits. DisambiguationBlock resolves similar tokens via causal attention. CoherenceBlock ensures parallel token consistency. EvoformerFeedback loop: decoder output refines prediction vector (2-3 iterations). Only 2-3 refinement steps needed because the predicted vector is already meaningful (unlike standard diffusion from noise).
+
+---
+
+### 43. Two-Level Memory System (`losion/core/memory/dual_memory.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Losion Architecture Document | Section 11.4 | 2026 | Two-level memory emerging naturally from AttnRes + Compression |
+| Baddeley | Working Memory Model | 1974 | Working memory vs long-term memory in human cognition |
+| MoonshotAI | Attention Residuals | 2026 | Selective compression as memory consolidation |
+
+**What we adapted:** WorkingMemory: ring buffer with direct access to recent outputs (high detail, limited capacity). LongTermMemory: compressed hidden state with three consolidation methods (attention-based selective, gated, mean). DualMemorySystem coordinates both levels with learned retrieval gating (balances working vs long-term). Memory consolidation: working → long-term compression analogous to human sleep.
+
+---
+
 ## License Note
 
 Each referenced paper and technology is the intellectual property of its respective authors.
