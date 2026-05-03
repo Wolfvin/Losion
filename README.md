@@ -1,3 +1,28 @@
+---
+license: mit
+library_name: pytorch
+tags:
+  - hybrid-model
+  - attention
+  - mixture-of-experts
+  - state-space-model
+  - ssm
+  - mamba
+  - moe
+  - gated-attention
+  - moba
+  - rope
+  - mla
+  - speculative-decoding
+  - kv-cache
+  - causal-lm
+  - custom-code
+language:
+  - en
+  - id
+pipeline_tag: text-generation
+---
+
 <p align="center">
   <img src="docs/assets/losion-logo.png" alt="Losion" width="200"/>
 </p>
@@ -10,7 +35,7 @@
 
 <p align="center">
   <a href="https://github.com/losion/losion/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"/></a>
-  <a href="https://github.com/losion/losion/releases"><img src="https://img.shields.io/badge/version-1.0.0-brightgreen.svg" alt="Version 1.0.0"/></a>
+  <a href="https://github.com/losion/losion/releases"><img src="https://img.shields.io/badge/version-1.1.1-brightgreen.svg" alt="Version 1.1.1"/></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"/></a>
   <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.1%2B-red.svg" alt="PyTorch"/></a>
 </p>
