@@ -21,6 +21,13 @@ Credits:
 - ETR (Entropy Trend Reward): Reduces wasteful thinking tokens up to 40%
 - JEPA (Joint-Embedding Predictive Architecture): Future state prediction
   for principled auxiliary training signal
+- DAPO (Yu et al., arXiv 2503.14476, 2025): Decoupled Clip & Dynamic
+  Sampling Policy Optimization — improves over GRPO with asymmetric
+  clipping, dynamic sampling, token-level loss, and overlong filtering
+- RLVR (NeurIPS 2025, arXiv 2601.05607): Reinforcement Learning with
+  Verifiable Rewards — objective, programmable reward functions
+- L-MTP (arXiv 2505.17505, NeurIPS 2025): Leap Multi-Token Prediction
+  Beyond Adjacent — geometric leap schedules for wider temporal coverage
 
 Architecture:
 1. WSDLRScheduler — Warmup-Stable-Decay learning rate schedule
@@ -367,6 +374,11 @@ class PhaseRecipe:
         use_flow_matching: Whether flow matching refinement is active.
         use_taco: Whether TACO compute alignment is active.
         use_symbolic_moe: Whether Symbolic-MoE for macro routing is active.
+        use_dapo: Whether DAPO optimization is active (v0.8, replaces GRPO
+            when enabled).
+        use_rlvr: Whether RLVR verifiable rewards are active (v0.8).
+        use_leap_mtp: Whether L-MTP Leap Multi-Token Prediction is active
+            (v0.8).
     """
     phase: TrainingPhase = TrainingPhase.PHASE_1_INDIVIDUAL
     budget_fraction: float = 0.3
@@ -387,6 +399,9 @@ class PhaseRecipe:
     use_flow_matching: bool = False
     use_taco: bool = False
     use_symbolic_moe: bool = False
+    use_dapo: bool = False
+    use_rlvr: bool = False
+    use_leap_mtp: bool = False
 
 
 class LosionTrainingRecipe:
@@ -413,7 +428,9 @@ class LosionTrainingRecipe:
         - Data: Mixed difficulty
 
     Phase 3 (End-to-End RL, 60-90%):
-        Router unfrozen, GRPO optimization.
+        Router unfrozen, GRPO/DAPO optimization.
+        - GRPO (default) or DAPO (v0.8) policy optimization
+        - RLVR verifiable rewards when enabled (v0.8)
         - ETR Entropy Trend Reward for thinking tokens
         - Router bias updates (DeepSeek-V3 style)
         - Symbolic-MoE for macro routing
@@ -426,6 +443,7 @@ class LosionTrainingRecipe:
         - Generation-focused distillation
         - BitDistill quantization
         - Flow matching refinement
+        - DAPO/RLVR carried forward from Phase 3 (v0.8)
         - LR: WSD final decay
         - Data: Specialized, domain-specific
 
@@ -433,6 +451,9 @@ class LosionTrainingRecipe:
         total_steps: Total number of training steps.
         model_name: Model name identifier.
         peak_lr: Peak learning rate across all phases.
+        config: Optional LosionConfig for v0.8 technique detection (DAPO,
+            RLVR, L-MTP).  When provided, the recipe automatically enables
+            these techniques in the appropriate phases.
     """
 
     def __init__(
@@ -440,10 +461,12 @@ class LosionTrainingRecipe:
         total_steps: int = 100000,
         model_name: str = "losion-base",
         peak_lr: float = 3e-4,
+        config: Optional[Any] = None,
     ) -> None:
         self.total_steps = total_steps
         self.model_name = model_name
         self.peak_lr = peak_lr
+        self.config = config  # Optional LosionConfig for v0.8 technique detection
 
         # Build per-phase recipes
         self.phases: Dict[TrainingPhase, PhaseRecipe] = self._build_phases()
@@ -468,6 +491,31 @@ class LosionTrainingRecipe:
         # =====================================================================
         # Phase 1: Pre-Training Individual (0-30%)
         # =====================================================================
+        # Detect v0.8 techniques from LosionConfig
+        _use_dapo = False
+        _use_rlvr = False
+        _use_leap_mtp = False
+        if self.config is not None:
+            if hasattr(self.config, "dapo") and hasattr(self.config.dapo, "enabled"):
+                _use_dapo = self.config.dapo.enabled
+            if hasattr(self.config, "rlvr") and hasattr(self.config.rlvr, "enabled"):
+                _use_rlvr = self.config.rlvr.enabled
+            if hasattr(self.config, "output") and hasattr(self.config.output, "use_leap_mtp"):
+                _use_leap_mtp = self.config.output.use_leap_mtp
+
+        # =====================================================================
+        # Phase 1: Pre-Training Individual (0-30%)
+        # =====================================================================
+        phase1_loss_config: Dict[str, float] = {
+            "lm_loss": 1.0,
+            "jepa_loss": 0.1,       # SSM: JEPA for future state prediction
+            "expert_spec_loss": 0.05,  # MoE: Expert specialization
+            "load_balance_loss": 0.01,  # MoE: Load balancing
+            "gated_attn_warmup": 0.1,   # Attention: Gated Attention warmup
+        }
+        if _use_leap_mtp:
+            phase1_loss_config["leap_mtp_loss"] = 0.2  # L-MTP leap prediction loss
+
         phases[TrainingPhase.PHASE_1_INDIVIDUAL] = PhaseRecipe(
             phase=TrainingPhase.PHASE_1_INDIVIDUAL,
             budget_fraction=0.30,
@@ -481,13 +529,7 @@ class LosionTrainingRecipe:
                     "academic": 0.05, "reasoning": 0.1,
                 },
             },
-            loss_config={
-                "lm_loss": 1.0,
-                "jepa_loss": 0.1,       # SSM: JEPA for future state prediction
-                "expert_spec_loss": 0.05,  # MoE: Expert specialization
-                "load_balance_loss": 0.01,  # MoE: Load balancing
-                "gated_attn_warmup": 0.1,   # Attention: Gated Attention warmup
-            },
+            loss_config=phase1_loss_config,
             frozen_modules=["router", "attention.gated_attention"],
             active_modules=["ssm", "attention.base", "moe"],
             router_weights=(0.8, 0.1, 0.1),  # SSM dominant
@@ -501,6 +543,9 @@ class LosionTrainingRecipe:
             use_flow_matching=False,
             use_taco=False,
             use_symbolic_moe=False,
+            use_dapo=False,
+            use_rlvr=False,
+            use_leap_mtp=_use_leap_mtp,  # v0.8: L-MTP in Phase 1
         )
 
         # =====================================================================
@@ -539,11 +584,30 @@ class LosionTrainingRecipe:
             use_flow_matching=False,
             use_taco=True,      # TACO compute alignment starts
             use_symbolic_moe=False,
+            use_dapo=False,
+            use_rlvr=False,
+            use_leap_mtp=False,
         )
 
         # =====================================================================
         # Phase 3: End-to-End RL (60-90%)
         # =====================================================================
+        # v0.8: DAPO replaces GRPO when config.dapo.enabled;
+        # RLVR verifiable rewards supplement the reward signal.
+        phase3_loss_config: Dict[str, float] = {
+            "lm_loss": 0.5,
+            "etr_reward": 0.3,      # ETR for thinking token efficiency
+            "load_balance_loss": 0.01,
+            "router_entropy_loss": 0.02,  # Router exploration bonus
+        }
+        if _use_dapo:
+            phase3_loss_config["dapo_loss"] = 1.0    # DAPO policy optimization
+            phase3_loss_config["rlvr_reward"] = 0.5  # RLVR verifiable rewards
+            phase3_loss_config["etr_reward"] = 0.2   # ETR reduced when DAPO+RLVR active
+            phase3_loss_config["grpo_loss"] = 0.3    # GRPO as auxiliary
+        else:
+            phase3_loss_config["grpo_loss"] = 1.0    # GRPO policy optimization
+
         phases[TrainingPhase.PHASE_3_RL] = PhaseRecipe(
             phase=TrainingPhase.PHASE_3_RL,
             budget_fraction=0.30,
@@ -557,26 +621,23 @@ class LosionTrainingRecipe:
                     "academic": 0.2, "reasoning": 0.25,
                 },
             },
-            loss_config={
-                "lm_loss": 0.5,
-                "grpo_loss": 1.0,       # GRPO policy optimization
-                "etr_reward": 0.3,      # ETR for thinking token efficiency
-                "load_balance_loss": 0.01,
-                "router_entropy_loss": 0.02,  # Router exploration bonus
-            },
+            loss_config=phase3_loss_config,
             frozen_modules=[],
             active_modules=["ssm", "attention", "moe", "router"],
-            router_weights=(0.33, 0.33, 0.33),  # GRPO will adjust
+            router_weights=(0.33, 0.33, 0.33),  # GRPO/DAPO will adjust
             router_frozen=False,  # Router unfrozen
-            use_grpo=True,       # GRPO optimization active
+            use_grpo=True,        # GRPO optimization active (fallback)
             use_jepa=False,
-            use_etr=True,        # ETR reward for thinking tokens
+            use_etr=True,         # ETR reward for thinking tokens
             use_early_exit=False,
             use_distillation=False,
             use_bit_distill=False,
             use_flow_matching=False,
             use_taco=True,
-            use_symbolic_moe=True,  # Symbolic-MoE for macro routing
+            use_symbolic_moe=True,   # Symbolic-MoE for macro routing
+            use_dapo=_use_dapo,      # v0.8: DAPO replaces GRPO when enabled
+            use_rlvr=_use_rlvr,      # v0.8: RLVR verifiable rewards
+            use_leap_mtp=False,
         )
 
         # =====================================================================
@@ -603,6 +664,8 @@ class LosionTrainingRecipe:
                 "early_exit_loss": 0.1,   # Mixture of Depths
                 "grpo_loss": 0.3,
                 "etr_reward": 0.2,
+                "dapo_loss": 0.3 if _use_dapo else 0.0,
+                "rlvr_reward": 0.2 if _use_rlvr else 0.0,
             },
             frozen_modules=[],
             active_modules=["ssm", "attention", "moe", "router", "output"],
@@ -617,6 +680,9 @@ class LosionTrainingRecipe:
             use_flow_matching=True,  # Flow matching refinement
             use_taco=True,
             use_symbolic_moe=True,
+            use_dapo=_use_dapo,      # v0.8: DAPO carried into Phase 4
+            use_rlvr=_use_rlvr,      # v0.8: RLVR carried into Phase 4
+            use_leap_mtp=False,
         )
 
         return phases
@@ -721,6 +787,9 @@ class LosionTrainingRecipe:
                     "flow_matching": recipe.use_flow_matching,
                     "taco": recipe.use_taco,
                     "symbolic_moe": recipe.use_symbolic_moe,
+                    "dapo": recipe.use_dapo,
+                    "rlvr": recipe.use_rlvr,
+                    "leap_mtp": recipe.use_leap_mtp,
                 },
             })
         return summary
