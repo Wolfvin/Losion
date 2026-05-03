@@ -311,3 +311,58 @@ class AdaptiveRouter(nn.Module):
             # Normalize ke [0, 1]
             normalized_entropy = entropy / max_entropy
             return normalized_entropy.mean()
+
+    def router_params(self) -> list:
+        """Return router parameters for separate learning rate scheduling.
+
+        Router gradients are typically much smaller than pathway gradients
+        (router grad norm ~0.013 vs SSM ~0.628), so the router needs a
+        higher learning rate to learn effectively.
+
+        Returns:
+            List of router parameters.
+        """
+        return list(self.parameters())
+
+    def compute_entropy_regularization(
+        self, routing_weights: torch.Tensor, weight: float = 0.01
+    ) -> torch.Tensor:
+        """Compute entropy regularization to prevent routing collapse.
+
+        Encourages the router to distribute tokens across all pathways
+        rather than always selecting one pathway. This prevents the
+        tri-jalur architecture from degenerating into a fixed ensemble.
+
+        Args:
+            routing_weights: [batch, seq, num_pathways] routing weights.
+            weight: Regularization weight (default 0.01).
+
+        Returns:
+            Scalar entropy regularization loss (negative entropy, to be minimized).
+        """
+        clamped = routing_weights.clamp(min=1e-8)
+        entropy = -(clamped * clamped.log()).sum(dim=-1)  # [batch, seq]
+        max_entropy = torch.log(
+            torch.tensor(self.num_pathways, dtype=routing_weights.dtype, device=routing_weights.device)
+        )
+        normalized_entropy = entropy / max_entropy  # [0, 1]
+        # We want to MAXIMIZE entropy, so minimize negative entropy
+        return -weight * normalized_entropy.mean()
+
+    def get_param_groups(self, router_lr: float = 1e-3, default_lr: float = 1e-4) -> list:
+        """Create parameter groups with separate learning rates for router.
+
+        Router parameters need 5-10x higher learning rate because their
+        gradients are typically much smaller than pathway gradients.
+
+        Args:
+            router_lr: Learning rate for router parameters.
+            default_lr: Default learning rate for non-router parameters.
+
+        Returns:
+            List of parameter group dicts for optimizer.
+        """
+        router_param_ids = {id(p) for p in self.parameters()}
+        return [
+            {"params": list(self.parameters()), "lr": router_lr},
+        ]

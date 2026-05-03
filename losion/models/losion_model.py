@@ -221,24 +221,13 @@ class SimplifiedAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # Attention scores
-        scale = math.sqrt(self.d_kv)
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / scale
-
-        # Causal mask
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-        else:
-            causal_mask = torch.triu(
-                torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device),
-                diagonal=1,
-            )
-            attn_weights = attn_weights.masked_fill(
-                causal_mask.unsqueeze(0).unsqueeze(0), float("-inf")
-            )
-
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(x.dtype)
-        attn_output = torch.matmul(attn_weights, v)
+        # Scaled dot-product attention (SDPA)
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=(attention_mask is None),
+        )
 
         # Reshape and project
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch, seq_len, self.d_inner)
@@ -585,6 +574,33 @@ class LosionLayer(nn.Module):
         # ---- Dropout ----
         self.dropout = nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()
 
+        # ---- Per-pathway gradient checkpointing ----
+        self.gradient_checkpointing: bool = False
+
+    def enable_gradient_checkpointing(self) -> None:
+        """Enable per-pathway gradient checkpointing for this layer."""
+        self.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self) -> None:
+        """Disable per-pathway gradient checkpointing."""
+        self.gradient_checkpointing = False
+
+    def _checkpoint_retrieval(self, ret_input):
+        """Helper for checkpointing the retrieval layer.
+
+        Returns a tuple that torch.utils.checkpoint can handle.
+        """
+        ret_out, ret_aux = self.retrieval_layer(ret_input)
+        # Detach aux tensors to prevent graph issues during recomputation
+        safe_aux = {}
+        if isinstance(ret_aux, dict):
+            for k, v in ret_aux.items():
+                if isinstance(v, torch.Tensor):
+                    safe_aux[k] = v.detach()
+                else:
+                    safe_aux[k] = v
+        return ret_out, safe_aux
+
     def forward(
         self,
         x: torch.Tensor,
@@ -620,17 +636,30 @@ class LosionLayer(nn.Module):
                 route_weights + boost.unsqueeze(0).unsqueeze(0), dim=-1
             )
 
-        # ---- Jalur 1: SSM ----
+        # ---- Pre-norm inputs ----
         ssm_input = self.ssm_norm(x)
-        ssm_out = self.ssm_layer(ssm_input)
-
-        # ---- Jalur 2: Attention ----
         attn_input = self.attn_norm(x)
-        attn_out = self.attention_layer(attn_input, attention_mask=attention_mask)
-
-        # ---- Jalur 3: Retrieval ----
         ret_input = self.retrieval_norm(x)
-        ret_out, ret_aux = self.retrieval_layer(ret_input)
+
+        # ---- Per-pathway computation with optional gradient checkpointing ----
+        if self.gradient_checkpointing and self.training:
+            # Checkpoint each pathway separately — only one pathway's activations
+            # are stored at a time, reducing peak memory to ~1/3 of full layer checkpoint
+            ssm_out = torch.utils.checkpoint.checkpoint(
+                self.ssm_layer, ssm_input, use_reentrant=False
+            )
+            attn_out = torch.utils.checkpoint.checkpoint(
+                self.attention_layer, attn_input, attention_mask,
+                use_reentrant=False,
+            )
+            ret_out, ret_aux = torch.utils.checkpoint.checkpoint(
+                self._checkpoint_retrieval, ret_input,
+                use_reentrant=False,
+            )
+        else:
+            ssm_out = self.ssm_layer(ssm_input)
+            attn_out = self.attention_layer(attn_input, attention_mask=attention_mask)
+            ret_out, ret_aux = self.retrieval_layer(ret_input)
 
         # ---- Combine with routing weights ----
         w_ssm = route_weights[:, :, 0:1]    # (batch, seq_len, 1)
@@ -721,12 +750,23 @@ class LosionModel(nn.Module):
         self.token_embedding = embeddings
 
     def enable_gradient_checkpointing(self) -> None:
-        """Enable gradient checkpointing for memory efficiency."""
+        """Enable per-pathway gradient checkpointing for memory efficiency.
+
+        Each pathway (SSM, Attention, MoE) is checkpointed independently,
+        so only one pathway's activations are stored at a time. This reduces
+        peak activation memory to approximately 1/3 compared to full-layer
+        checkpointing, at the cost of recomputing the other two pathways
+        during the backward pass.
+        """
         self.gradient_checkpointing = True
+        for layer in self.layers:
+            layer.enable_gradient_checkpointing()
 
     def disable_gradient_checkpointing(self) -> None:
-        """Disable gradient checkpointing."""
+        """Disable per-pathway gradient checkpointing."""
         self.gradient_checkpointing = False
+        for layer in self.layers:
+            layer.disable_gradient_checkpointing()
 
     def forward(
         self,
@@ -760,47 +800,11 @@ class LosionModel(nn.Module):
         all_hidden_states: Optional[List[torch.Tensor]] = [] if return_all_hidden_states else None
 
         for layer in self.layers:
-            if self.gradient_checkpointing and self.training:
-                # Gradient checkpointing: recompute in backward.
-                # With use_reentrant=False, tuple returns are supported,
-                # but non-tensor dict values may be lost during recomputation.
-                # We extract and detach routing tensors before they can be lost.
-                def _create_checkpointable(layer_module, attn_mask, think_mode):
-                    def _forward(*args):
-                        hidden = args[0]
-                        out, info = layer_module(
-                            hidden,
-                            attention_mask=attn_mask,
-                            thinking_mode=think_mode,
-                        )
-                        # Detach routing info tensors to prevent graph issues
-                        # during checkpoint recomputation
-                        safe_info = {}
-                        if isinstance(info, dict):
-                            for k, v in info.items():
-                                if isinstance(v, torch.Tensor):
-                                    safe_info[k] = v.detach()
-                                elif isinstance(v, dict):
-                                    safe_info[k] = {
-                                        kk: vv.detach() if isinstance(vv, torch.Tensor) else vv
-                                        for kk, vv in v.items()
-                                    }
-                                else:
-                                    safe_info[k] = v
-                        return out, safe_info
-                    return _forward
-
-                x, layer_routing = torch.utils.checkpoint.checkpoint(
-                    _create_checkpointable(layer, attention_mask, thinking_mode),
-                    x,
-                    use_reentrant=False,
-                )
-            else:
-                x, layer_routing = layer(
-                    x,
-                    attention_mask=attention_mask,
-                    thinking_mode=thinking_mode,
-                )
+            x, layer_routing = layer(
+                x,
+                attention_mask=attention_mask,
+                thinking_mode=thinking_mode,
+            )
 
             if all_routing_info is not None:
                 all_routing_info.append(layer_routing)

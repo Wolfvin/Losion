@@ -36,20 +36,24 @@ def ssd_chunk_scan(
     initial_state: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Algoritma SSD Chunk Scan — inti komputasi Mamba-2.
+    Algoritma SSD Chunk Scan — Parallel intra-chunk + sequential inter-chunk.
 
-    Menghitung recurrence SSM secara paralel menggunakan pendekatan chunk:
+    Menghitung recurrence SSM menggunakan pendekatan chunk:
     1. Bagi sequence menjadi chunk-chunk berukuran chunk_size
-    2. Hitung state intra-chunk secara paralel via matmul
+    2. Hitung state intra-chunk secara paralel via cumprod/cumsum
     3. Propagasi state inter-chunk via sequential scan
     4. Hitung output per chunk
+
+    Mengurangi Python loop dari O(seq_len) ke O(seq_len / chunk_size).
+    Untuk seq_len=4096, chunk_size=256: 16 iterasi vs 4096.
 
     SSM recurrence:
         h_t = exp(dt_t * A_t) * h_{t-1} + dt_t * B_t * x_t
         y_t = C_t^T @ h_t + D * x_t
 
-    Untuk kompatibilitas dan stabilitas, menggunakan sequential scan
-    yang paralel across batch dimension.
+    Solusi closed-form intra-chunk:
+        h_t = cum_dA_t * (h_0 + cumsum_{k=0}^{t}(x_k * dB_k / cum_dA_k))
+    dimana cum_dA_t = prod_{k=0}^{t} dA_k (cumulative product).
 
     Argumen:
         x_seq: Input sequence, bentuk (batch, seq_len, d_inner).
@@ -79,35 +83,67 @@ def ssd_chunk_scan(
         h = initial_state.clone()
 
     # ---- Discretisasi ----
-    # dA = exp(dt * A) — transition diskret per (batch, seq_len, d_state)
-    # dB = dt * B — input diskret per (batch, seq_len, d_state)
     dA = torch.exp(dt.unsqueeze(-1) * A)  # (batch, seq_len, d_state)
     dB = dt.unsqueeze(-1) * B  # (batch, seq_len, d_state)
 
-    # ---- Sequential SSM scan ----
-    # Untuk setiap token:
-    #   h_t = dA_t * h_{t-1} + dB_t * x_t   (outer product untuk state update)
-    #   y_t = C_t^T @ h_t                     (dot product untuk output)
+    # ---- Pad sequence ke kelipatan chunk_size ----
+    pad_len = (chunk_size - seq_len % chunk_size) % chunk_size
+    if pad_len > 0:
+        x_pad = F.pad(x_seq, (0, 0, 0, pad_len))
+        dA_pad = F.pad(dA, (0, 0, 0, pad_len))
+        dB_pad = F.pad(dB, (0, 0, 0, pad_len))
+        C_pad = F.pad(C, (0, 0, 0, pad_len))
+    else:
+        x_pad = x_seq
+        dA_pad = dA
+        dB_pad = dB
+        C_pad = C
 
-    outputs = []
-    for t in range(seq_len):
-        # State update: h = dA_t * h + x_t (outer) dB_t
-        # h: (batch, d_inner, d_state)
-        # dA_t: (batch, d_state) — multiply per column
-        # x_t: (batch, d_inner), dB_t: (batch, d_state)
-        h = h * dA[:, t, :].unsqueeze(1)  # (batch, d_inner, d_state) * (batch, 1, d_state)
-        # Outer product: x_t (d_inner) x dB_t (d_state)
-        h = h + x_seq[:, t, :].unsqueeze(-1) * dB[:, t, :].unsqueeze(1)
-        # h: (batch, d_inner, d_state)
+    padded_len = x_pad.shape[1]
+    n_chunks = padded_len // chunk_size
 
-        # Output: y_t = sum_j(C_t_j * h[:, :, j])
-        y_t = torch.sum(
-            h * C[:, t, :].unsqueeze(1), dim=-1
-        )  # (batch, d_inner)
-        outputs.append(y_t)
+    # ---- Reshape menjadi chunks: (batch, n_chunks, chunk_size, ...) ----
+    x_chunks = x_pad.reshape(batch, n_chunks, chunk_size, d_inner)
+    dA_chunks = dA_pad.reshape(batch, n_chunks, chunk_size, d_state)
+    dB_chunks = dB_pad.reshape(batch, n_chunks, chunk_size, d_state)
+    C_chunks = C_pad.reshape(batch, n_chunks, chunk_size, d_state)
 
-    # Stack output: (batch, seq_len, d_inner)
-    y = torch.stack(outputs, dim=1)
+    # ---- Proses chunks: O(n_chunks) iterasi Python ----
+    all_outputs = []
+
+    for c in range(n_chunks):
+        x_c = x_chunks[:, c]  # (batch, chunk_size, d_inner)
+        dA_c = dA_chunks[:, c]  # (batch, chunk_size, d_state)
+        dB_c = dB_chunks[:, c]  # (batch, chunk_size, d_state)
+        C_c = C_chunks[:, c]  # (batch, chunk_size, d_state)
+
+        # --- Intra-chunk parallel scan via cumprod/cumsum ---
+        # Cumulative product of dA (transition factors)
+        cum_dA = torch.cumprod(dA_c, dim=1)  # (batch, chunk_size, d_state)
+
+        # Input contributions: x * dB (outer product)
+        x_dB = x_c.unsqueeze(-1) * dB_c.unsqueeze(2)  # (batch, chunk_size, d_inner, d_state)
+
+        # Scale by inverse cumulative dA for prefix sum decomposition
+        inv_cum_dA = 1.0 / (cum_dA.unsqueeze(2) + 1e-12)  # (batch, chunk_size, 1, d_state)
+        scaled_contrib = x_dB * inv_cum_dA  # (batch, chunk_size, d_inner, d_state)
+
+        # Cumulative sum of scaled contributions
+        cum_contrib = torch.cumsum(scaled_contrib, dim=1)  # (batch, chunk_size, d_inner, d_state)
+
+        # h_t = cum_dA_t * (h_0 + cum_contrib_t)
+        h_0 = h.unsqueeze(1)  # (batch, 1, d_inner, d_state)
+        h_chunk = cum_dA.unsqueeze(2) * (h_0 + cum_contrib)  # (batch, chunk_size, d_inner, d_state)
+
+        # Output: y_t = C_t @ h_t (contract over d_state)
+        y_chunk = torch.sum(h_chunk * C_c.unsqueeze(2), dim=-1)  # (batch, chunk_size, d_inner)
+        all_outputs.append(y_chunk)
+
+        # Update h untuk chunk berikutnya
+        h = h_chunk[:, -1, :, :]  # (batch, d_inner, d_state)
+
+    # Concatenate outputs and trim padding
+    y = torch.cat(all_outputs, dim=1)[:, :seq_len, :]
     final_state = h
 
     return y, final_state

@@ -174,15 +174,13 @@ class _FallbackAttention(nn.Module):
         q = self.q_proj(x).view(B, S, self.n_heads, self.d_kv).transpose(1, 2)
         k = self.k_proj(x).view(B, S, self.n_heads, self.d_kv).transpose(1, 2)
         v = self.v_proj(x).view(B, S, self.n_heads, self.d_kv).transpose(1, 2)
-        scale = math.sqrt(self.d_kv)
-        attn = torch.matmul(q, k.transpose(-2, -1)) / scale
-        if attention_mask is not None:
-            attn = attn + attention_mask
-        else:
-            mask = torch.triu(torch.ones(S, S, device=x.device, dtype=torch.bool), 1)
-            attn = attn.masked_fill(mask, float("-inf"))
-        attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(x.dtype)
-        out = torch.matmul(attn, v).transpose(1, 2).contiguous().view(B, S, D)
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=(attention_mask is None),
+        )
+        out = attn_output.transpose(1, 2).contiguous().view(B, S, D)
         return self.out_proj(out)
 
 
@@ -523,6 +521,9 @@ class LosionLayerV2(nn.Module):
         # Dropout
         self.dropout = nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()
 
+        # Early exit / conditional routing threshold
+        self.routing_threshold: float = 0.05
+
     def forward(
         self,
         x: torch.Tensor,
@@ -575,38 +576,57 @@ class LosionLayerV2(nn.Module):
         if route_weights.dim() == 2:
             route_weights = route_weights.unsqueeze(1).expand(-1, seq_len, -1)
 
-        # ===================================================================
-        # Jalur 1: SSM — Unified interface adapter
-        # v0.9.1: Handles `initial_state` vs `state` kwarg mismatch,
-        # and 3-tuple (output, state, aux_loss) vs 2-tuple (output, state)
-        # ===================================================================
-        ssm_input = self.ssm_norm(x)
-        ssm_out, ssm_state_new, ssm_aux_loss = self._forward_ssm(
-            ssm_input, ssm_state
-        )
-
-        # ===================================================================
-        # Jalur 2: Attention — Unified interface adapter
-        # v0.9.1: Handles `position_offset` vs `position_ids`, and
-        # `past_key_value` vs `past_kv` kwarg mismatches
-        # ===================================================================
-        attn_input = self.attn_norm(x)
-        attn_out = self._forward_attention(
-            attn_input, attention_mask, past_kv, position_ids
-        )
-
-        # ===================================================================
-        # Jalur 3: MoE/Retrieval — Unified interface adapter
-        # v0.9.1: Handles 3-tuple returns (output, routing_info/aux_loss, extra)
-        # and normalizes to (output, aux_info) for consistent downstream use
-        # ===================================================================
-        ret_input = self.retrieval_norm(x)
-        ret_out, ret_aux = self._forward_moe(ret_input)
-
-        # Combine with routing weights
+        # ---- Conditional routing: skip low-weight pathways ----
+        # When a pathway's mean weight is below threshold, skip its computation
+        # to save compute during inference. During training, always compute all
+        # pathways to maintain gradient flow.
         w_ssm = route_weights[:, :, 0:1]
         w_attn = route_weights[:, :, 1:2]
         w_ret = route_weights[:, :, 2:3]
+
+        skip_ssm = (not self.training) and (w_ssm.mean() < self.routing_threshold)
+        skip_attn = (not self.training) and (w_attn.mean() < self.routing_threshold)
+        skip_ret = (not self.training) and (w_ret.mean() < self.routing_threshold)
+
+        # ===================================================================
+        # Jalur 1: SSM — skip if weight below threshold (inference only)
+        # v0.9.1: Handles `initial_state` vs `state` kwarg mismatch,
+        # and 3-tuple (output, state, aux_loss) vs 2-tuple (output, state)
+        # ===================================================================
+        if skip_ssm:
+            ssm_out = torch.zeros_like(x)
+            ssm_state_new = ssm_state
+            ssm_aux_loss = None
+        else:
+            ssm_input = self.ssm_norm(x)
+            ssm_out, ssm_state_new, ssm_aux_loss = self._forward_ssm(
+                ssm_input, ssm_state
+            )
+
+        # ===================================================================
+        # Jalur 2: Attention — skip if weight below threshold (inference only)
+        # v0.9.1: Handles `position_offset` vs `position_ids`, and
+        # `past_key_value` vs `past_kv` kwarg mismatches
+        # ===================================================================
+        if skip_attn:
+            attn_out = torch.zeros_like(x)
+        else:
+            attn_input = self.attn_norm(x)
+            attn_out = self._forward_attention(
+                attn_input, attention_mask, past_kv, position_ids
+            )
+
+        # ===================================================================
+        # Jalur 3: MoE/Retrieval — skip if weight below threshold (inference only)
+        # v0.9.1: Handles 3-tuple returns (output, routing_info/aux_loss, extra)
+        # and normalizes to (output, aux_info) for consistent downstream use
+        # ===================================================================
+        if skip_ret:
+            ret_out = torch.zeros_like(x)
+            ret_aux = {}
+        else:
+            ret_input = self.retrieval_norm(x)
+            ret_out, ret_aux = self._forward_moe(ret_input)
 
         # Handle dimension mismatch via learned projection
         ssm_out = self._align_dim(ssm_out, 'ssm_proj')

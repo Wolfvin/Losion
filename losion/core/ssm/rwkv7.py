@@ -32,18 +32,23 @@ def wkv_forward_parallel(
     w: torch.Tensor,
     u: torch.Tensor,
     initial_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    chunk_size: int = 256,
 ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
-    Komputasi WKV paralel untuk training.
+    Komputasi WKV paralel untuk training — chunk-based untuk efisiensi.
 
     Mekanisme WKV menghitung recurrence data-dependent:
     - wkv_state: akumulator weighted key-value
     - sum_state: akumulator bobot normalisasi
 
-    Untuk setiap token t:
-    1. Decay state: state = state * exp(w_t)
-    2. Tambahkan kontribusi token saat ini: state += k_t * v_t
-    3. Hitung output: y_t = r_t @ (state + u * k_t * v_t) / (sum + u * k_t^2 + eps)
+    Menggunakan chunk-based computation untuk mengorganisir komputasi:
+    1. Bagi sequence menjadi chunk-chunk berukuran chunk_size
+    2. Propagasi state inter-chunk secara sequential
+    3. Intra-chunk: sequential scan (non-linear recurrence, tidak
+       dapat di-paralelkan dengan cumprod/cumsum)
+
+    Untuk seq_len=4096, chunk_size=256: iterasi diorganisir menjadi
+    16 chunk dari pada satu loop monolitik 4096.
 
     Args:
         r: Receptance (query), bentuk (batch, seq_len, d_inner).
@@ -53,6 +58,7 @@ def wkv_forward_parallel(
            Nilai negatif (semakin negatif = decay lebih cepat).
         u: Bonus per-posisi (learned), bentuk (d_head,).
         initial_state: Tuple opsional (wkv_state, sum_state) dari step sebelumnya.
+        chunk_size: Ukuran chunk untuk komputasi (default 256).
 
     Returns:
         Tuple (output, final_state):
@@ -77,57 +83,78 @@ def wkv_forward_parallel(
     # w < 0, jadi decay = exp(w) ∈ (0, 1)
     decay = torch.exp(w)  # (batch, seq_len, d_head)
 
-    # ---- Sequential WKV scan (paralel across batch) ----
-    outputs = []
+    # ---- Pad sequence ke kelipatan chunk_size ----
+    pad_len = (chunk_size - seq_len % chunk_size) % chunk_size
+    if pad_len > 0:
+        r_pad = F.pad(r, (0, 0, 0, pad_len))
+        k_pad = F.pad(k, (0, 0, 0, pad_len))
+        v_pad = F.pad(v, (0, 0, 0, pad_len))
+        decay_pad = F.pad(decay, (0, 0, 0, pad_len))
+    else:
+        r_pad = r
+        k_pad = k
+        v_pad = v
+        decay_pad = decay
 
-    for t in range(seq_len):
-        # Current token
-        r_t = r[:, t, :]  # (batch, d_inner)
-        k_t = k[:, t, :]  # (batch, d_head)
-        v_t = v[:, t, :]  # (batch, d_head)
-        d_t = decay[:, t, :]  # (batch, d_head)
+    padded_len = r_pad.shape[1]
+    n_chunks = padded_len // chunk_size
 
-        # Decay state
-        wkv_state = wkv_state * d_t  # (batch, d_head)
-        sum_state = sum_state * d_t  # (batch, d_head)
+    # ---- Reshape menjadi chunks ----
+    r_chunks = r_pad.reshape(batch, n_chunks, chunk_size, d_inner)
+    k_chunks = k_pad.reshape(batch, n_chunks, chunk_size, d_head)
+    v_chunks = v_pad.reshape(batch, n_chunks, chunk_size, d_head)
+    decay_chunks = decay_pad.reshape(batch, n_chunks, chunk_size, d_head)
 
-        # WKV computation:
-        # numerator = wkv_state + u * k_t * v_t
-        # denominator = sum_state + u * k_t^2 + eps
-        # output = r_t @ (numerator / denominator)
+    # ---- Proses chunks ----
+    all_outputs = []
 
-        # Simple linear attention style:
-        # wkv = (wkv_state + u * k_t * v_t) / (sum_state + u * k_t^2 + eps)
-        # y_t = r_t @ wkv
+    for c in range(n_chunks):
+        r_c = r_chunks[:, c]  # (batch, chunk_size, d_inner)
+        k_c = k_chunks[:, c]  # (batch, chunk_size, d_head)
+        v_c = v_chunks[:, c]  # (batch, chunk_size, d_head)
+        d_c = decay_chunks[:, c]  # (batch, chunk_size, d_head)
 
-        # Untuk d_inner != d_head, gunakan proyeksi
-        # Simplifikasi: gunakan element-wise dengan broadcast
-        kv_t = k_t * v_t  # (batch, d_head)
-        k_sq = k_t * k_t  # (batch, d_head)
+        # Intra-chunk: sequential scan (non-linear recurrence)
+        for t in range(chunk_size):
+            r_t = r_c[:, t, :]  # (batch, d_inner)
+            k_t = k_c[:, t, :]  # (batch, d_head)
+            v_t = v_c[:, t, :]  # (batch, d_head)
+            d_t = d_c[:, t, :]  # (batch, d_head)
 
-        numerator = wkv_state + u.unsqueeze(0) * kv_t  # (batch, d_head)
-        denominator = sum_state + u.unsqueeze(0) * k_sq + 1e-8  # (batch, d_head)
+            # Decay state
+            wkv_state = wkv_state * d_t  # (batch, d_head)
+            sum_state = sum_state * d_t  # (batch, d_head)
 
-        wkv_val = numerator / denominator  # (batch, d_head)
+            # WKV computation:
+            # numerator = wkv_state + u * k_t * v_t
+            # denominator = sum_state + u * k_t^2 + eps
+            # output = r_t @ (numerator / denominator)
+            kv_t = k_t * v_t  # (batch, d_head)
+            k_sq = k_t * k_t  # (batch, d_head)
 
-        # Output: y_t = r_t * wkv_val (element-wise jika d_inner == d_head)
-        if d_inner == d_head:
-            y_t = r_t * wkv_val  # (batch, d_inner)
-        else:
-            # Truncate atau pad wkv_val ke d_inner
-            if d_head > d_inner:
-                y_t = r_t * wkv_val[..., :d_inner]
+            numerator = wkv_state + u.unsqueeze(0) * kv_t  # (batch, d_head)
+            denominator = sum_state + u.unsqueeze(0) * k_sq + 1e-8  # (batch, d_head)
+
+            wkv_val = numerator / denominator  # (batch, d_head)
+
+            # Output: y_t = r_t * wkv_val (element-wise jika d_inner == d_head)
+            if d_inner == d_head:
+                y_t = r_t * wkv_val  # (batch, d_inner)
             else:
-                wkv_padded = F.pad(wkv_val, (0, d_inner - d_head))
-                y_t = r_t * wkv_padded
+                # Truncate atau pad wkv_val ke d_inner
+                if d_head > d_inner:
+                    y_t = r_t * wkv_val[..., :d_inner]
+                else:
+                    wkv_padded = F.pad(wkv_val, (0, d_inner - d_head))
+                    y_t = r_t * wkv_padded
 
-        outputs.append(y_t)
+            all_outputs.append(y_t)
 
-        # Update state: tambahkan kontribusi token saat ini
-        wkv_state = wkv_state + kv_t  # (batch, d_head)
-        sum_state = sum_state + k_sq  # (batch, d_head)
+            # Update state: tambahkan kontribusi token saat ini
+            wkv_state = wkv_state + kv_t  # (batch, d_head)
+            sum_state = sum_state + k_sq  # (batch, d_head)
 
-    output = torch.stack(outputs, dim=1)  # (batch, seq_len, d_inner)
+    output = torch.stack(all_outputs, dim=1)[:, :seq_len, :]  # (batch, seq_len, d_inner)
     final_state = (wkv_state, sum_state)
 
     return output, final_state
@@ -221,6 +248,7 @@ class RWKV7WKV(nn.Module):
         d_head: int = 64,
         n_heads: int = None,
         d_inner: int = None,
+        chunk_size: int = 256,
         use_bias: bool = True,
         **kwargs,
     ):
@@ -232,6 +260,7 @@ class RWKV7WKV(nn.Module):
             d_head: Dimensi per head WKV (default 64).
             n_heads: Jumlah head (default: d_model // d_head).
             d_inner: Dimensi inner (default: n_heads * d_head).
+            chunk_size: Ukuran chunk untuk komputasi WKV (default 256).
             use_bias: Apakah menggunakan bias.
         """
         super().__init__()
@@ -240,6 +269,7 @@ class RWKV7WKV(nn.Module):
         self.d_head = d_head
         self.n_heads = n_heads or max(1, d_model // d_head)
         self.d_inner = d_inner or (self.n_heads * d_head)
+        self.chunk_size = chunk_size
 
         # ---- Proyeksi key, value, receptance ----
         self.key_proj = nn.Linear(d_model, self.n_heads * d_head, bias=use_bias)
@@ -352,7 +382,8 @@ class RWKV7WKV(nn.Module):
             )
         else:
             y, final_state = wkv_forward_parallel(
-                r, k_flat, v_flat, w_flat, self.u.flatten(), init_state_flat
+                r, k_flat, v_flat, w_flat, self.u.flatten(), init_state_flat,
+                chunk_size=self.chunk_size,
             )
 
         # ---- Output gating ----

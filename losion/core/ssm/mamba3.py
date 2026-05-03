@@ -204,22 +204,28 @@ def mamba3_ssd_scan(
     dt_clamp_max: float = 0.5,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Algoritma SSD Scan Mamba-3 — inti komputasi dengan inference-first discretization.
+    Algoritma SSD Scan Mamba-3 — Parallel intra-chunk + sequential inter-chunk.
+
+    Menghitung recurrence SSM dengan inference-first discretization,
+    menggunakan parallel prefix operations (cumprod, cumsum) dalam
+    setiap chunk dan sequential propagation antar chunk.
+
+    Mengurangi Python loop dari O(seq_len) ke O(seq_len / chunk_size).
+    Untuk seq_len=4096, chunk_size=256: 16 iterasi vs 4096.
 
     Perbedaan dari Mamba-2 SSD scan:
     1. Clamped exponential: exp(dt * A) di-clamp untuk mencegah overflow/underflow
-    2. Residual scaling: dt di-scale dengan faktor stabilisasi sebelum digunakan
-       sebagai koefisien input (dB = stabilized_dt * B)
+    2. Residual scaling: dt di-scale dengan faktor stabilisasi (dB = softplus(dt) * B)
     3. State lebih kecil: d_state=32 vs 64, mengurangi memori dan komputasi
-
-    SSM recurrence (sama dengan Mamba-2):
-        h_t = exp(dt_t * A_t) * h_{t-1} + dt_t * B_t * x_t
-        y_t = C_t^T @ h_t + D * x_t
 
     Stabilitas inference-first:
         - dt di-clamp ke [0, dt_clamp_max] sebelum exponential
         - dA = exp(clamp(dt * A, max=0)) — mencegah exploding states
         - dB = softplus(dt) * B — menghindari multiplying two small numbers
+
+    Solusi closed-form intra-chunk:
+        h_t = cum_dA_t * (h_0 + cumsum_{k=0}^{t}(x_k * dB_k / cum_dA_k))
+    dimana cum_dA_t = prod_{k=0}^{t} dA_k (cumulative product).
 
     Args:
         x_seq: Input sequence, bentuk (batch, seq_len, d_inner).
@@ -227,8 +233,7 @@ def mamba3_ssd_scan(
         B: Input matrix, bentuk (batch, seq_len, d_state).
         C: Output matrix, bentuk (batch, seq_len, d_state).
         dt: Step size per token, bentuk (batch, seq_len).
-        chunk_size: Ukuran chunk untuk komputasi paralel (tidak digunakan
-            dalam implementasi sequential saat ini, disimpan untuk kompatibilitas).
+        chunk_size: Ukuran chunk untuk komputasi paralel.
         initial_state: State awal opsional, bentuk (batch, d_inner, d_state).
         dt_clamp_max: Clamp maksimum untuk dt (stabilitas inference).
 
@@ -250,31 +255,72 @@ def mamba3_ssd_scan(
         h = initial_state.clone()
 
     # ---- Inference-first discretization ----
-    # Clamp dt untuk stabilitas pada sequence panjang
     dt_clamped = dt.clamp(min=0.0, max=dt_clamp_max)  # (batch, seq_len)
 
     # dA = exp(clamp(dt * A, max=0)) — clamped exponential
-    # A bernilai negatif, jadi dt*A < 0, clamp max=0 memastikan dA <= 1
     dA_raw = dt_clamped.unsqueeze(-1) * A  # (batch, seq_len, d_state)
     dA = torch.exp(dA_raw.clamp(max=0.0))  # (batch, seq_len, d_state) — selalu <= 1
 
-    # dB = softplus_stabilized(dt) * B — menghindari multiplying two small numbers
-    # Ini lebih stabil daripada dB = dt * B pada dt yang sangat kecil
+    # dB = softplus(dt) * B — stabilized input scaling
     dt_stabilized = F.softplus(dt_clamped)  # (batch, seq_len)
     dB = dt_stabilized.unsqueeze(-1) * B  # (batch, seq_len, d_state)
 
-    # ---- Sequential SSM scan ----
-    outputs = []
-    for t in range(seq_len):
-        # State update: h = dA_t * h + x_t (outer) dB_t
-        h = h * dA[:, t, :].unsqueeze(1)  # (batch, d_inner, d_state)
-        h = h + x_seq[:, t, :].unsqueeze(-1) * dB[:, t, :].unsqueeze(1)
+    # ---- Pad sequence ke kelipatan chunk_size ----
+    pad_len = (chunk_size - seq_len % chunk_size) % chunk_size
+    if pad_len > 0:
+        x_pad = F.pad(x_seq, (0, 0, 0, pad_len))
+        dA_pad = F.pad(dA, (0, 0, 0, pad_len))
+        dB_pad = F.pad(dB, (0, 0, 0, pad_len))
+        C_pad = F.pad(C, (0, 0, 0, pad_len))
+    else:
+        x_pad = x_seq
+        dA_pad = dA
+        dB_pad = dB
+        C_pad = C
 
-        # Output: y_t = C_t^T @ h_t
-        y_t = torch.sum(h * C[:, t, :].unsqueeze(1), dim=-1)  # (batch, d_inner)
-        outputs.append(y_t)
+    padded_len = x_pad.shape[1]
+    n_chunks = padded_len // chunk_size
 
-    y = torch.stack(outputs, dim=1)  # (batch, seq_len, d_inner)
+    # ---- Reshape menjadi chunks ----
+    x_chunks = x_pad.reshape(batch, n_chunks, chunk_size, d_inner)
+    dA_chunks = dA_pad.reshape(batch, n_chunks, chunk_size, d_state)
+    dB_chunks = dB_pad.reshape(batch, n_chunks, chunk_size, d_state)
+    C_chunks = C_pad.reshape(batch, n_chunks, chunk_size, d_state)
+
+    # ---- Proses chunks: O(n_chunks) iterasi Python ----
+    all_outputs = []
+
+    for c in range(n_chunks):
+        x_c = x_chunks[:, c]  # (batch, chunk_size, d_inner)
+        dA_c = dA_chunks[:, c]  # (batch, chunk_size, d_state)
+        dB_c = dB_chunks[:, c]  # (batch, chunk_size, d_state)
+        C_c = C_chunks[:, c]  # (batch, chunk_size, d_state)
+
+        # --- Intra-chunk parallel scan via cumprod/cumsum ---
+        cum_dA = torch.cumprod(dA_c, dim=1)  # (batch, chunk_size, d_state)
+
+        # Input contributions: x * dB (outer product)
+        x_dB = x_c.unsqueeze(-1) * dB_c.unsqueeze(2)  # (batch, chunk_size, d_inner, d_state)
+
+        # Scale by inverse cumulative dA
+        inv_cum_dA = 1.0 / (cum_dA.unsqueeze(2) + 1e-12)  # (batch, chunk_size, 1, d_state)
+        scaled_contrib = x_dB * inv_cum_dA  # (batch, chunk_size, d_inner, d_state)
+
+        # Cumulative sum of scaled contributions
+        cum_contrib = torch.cumsum(scaled_contrib, dim=1)  # (batch, chunk_size, d_inner, d_state)
+
+        # h_t = cum_dA_t * (h_0 + cum_contrib_t)
+        h_0 = h.unsqueeze(1)  # (batch, 1, d_inner, d_state)
+        h_chunk = cum_dA.unsqueeze(2) * (h_0 + cum_contrib)  # (batch, chunk_size, d_inner, d_state)
+
+        # Output: y_t = C_t @ h_t (contract over d_state)
+        y_chunk = torch.sum(h_chunk * C_c.unsqueeze(2), dim=-1)  # (batch, chunk_size, d_inner)
+        all_outputs.append(y_chunk)
+
+        # Update h untuk chunk berikutnya
+        h = h_chunk[:, -1, :, :]  # (batch, d_inner, d_state)
+
+    y = torch.cat(all_outputs, dim=1)[:, :seq_len, :]
     final_state = h
 
     return y, final_state
@@ -506,41 +552,90 @@ class Mamba3SSD(nn.Module):
         # A_log: (d_inner, d_state) → negatif setelah exp
         A = -torch.exp(self.A_log.float()).to(dtype=x_conv.dtype)  # (d_inner, d_state)
 
-        # ---- Step 6: SSD Scan dengan inference-first discretization ----
+        # ---- Step 6: SSD Scan — chunk-parallel per-channel ----
         # Fix: Use per-channel dt and per-inner-dim A for proper gradient flow.
         # Previously, averaging dt over channels and A over d_inner destroyed
         # channel-specific information, causing zero gradients for dt_proj/dt_bias.
-        # Now we use a per-channel scan that preserves gradient flow.
-        
+        # Now we use a per-channel chunk-parallel scan that preserves gradient
+        # flow while reducing Python loop iterations from O(seq_len) to
+        # O(seq_len / chunk_size).
+
         # Clamp dt for stability
         dt_clamped = dt_full.clamp(min=0.0, max=self.dt_clamp_max)  # (batch, seq_len, d_inner)
-        
+
         # Per-channel discretization
         # dA = exp(clamp(dt * A, max=0)) per (batch, seq_len, d_inner, d_state)
         dA_raw = dt_clamped.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0)  # (batch, seq_len, d_inner, d_state)
         dA = torch.exp(dA_raw.clamp(max=0.0))  # (batch, seq_len, d_inner, d_state)
-        
+
         # dB = softplus(dt) * B — stabilized input scaling
         dt_stabilized = F.softplus(dt_clamped)  # (batch, seq_len, d_inner)
-        
-        # Sequential scan with per-channel states
+        dB = dt_stabilized.unsqueeze(-1) * B.unsqueeze(2)  # (batch, seq_len, d_inner, d_state)
+
+        # Initialize state
         h = torch.zeros(
             batch, self.d_inner, self.d_state,
             dtype=x_conv.dtype, device=x_conv.device,
         ) if initial_state is None else initial_state.clone()
-        
-        outputs = []
-        for t in range(seq_len):
-            h = h * dA[:, t, :, :]  # (batch, d_inner, d_state)
-            # B is (batch, d_state), x is (batch, d_inner)
-            dB_t = dt_stabilized[:, t, :].unsqueeze(-1) * B[:, t, :].unsqueeze(1)  # (batch, d_inner, d_state)
-            h = h + x_conv[:, t, :].unsqueeze(-1) * dB_t  # (batch, d_inner, d_state)
-            
-            # Output: y_t = C_t @ h_t per channel
-            y_t = torch.sum(h * C[:, t, :].unsqueeze(1), dim=-1)  # (batch, d_inner)
-            outputs.append(y_t)
-        
-        y = torch.stack(outputs, dim=1)  # (batch, seq_len, d_inner)
+
+        # Pad sequence to multiple of chunk_size
+        chunk_size = self.chunk_size
+        pad_len = (chunk_size - seq_len % chunk_size) % chunk_size
+        if pad_len > 0:
+            x_pad = F.pad(x_conv, (0, 0, 0, pad_len))
+            dA_pad = F.pad(dA, (0, 0, 0, pad_len))
+            dB_pad = F.pad(dB, (0, 0, 0, pad_len))
+            C_pad = F.pad(C, (0, 0, 0, pad_len))
+        else:
+            x_pad = x_conv
+            dA_pad = dA
+            dB_pad = dB
+            C_pad = C
+
+        padded_len = x_pad.shape[1]
+        n_chunks = padded_len // chunk_size
+
+        # Reshape into chunks
+        x_chunks = x_pad.reshape(batch, n_chunks, chunk_size, self.d_inner)
+        dA_chunks = dA_pad.reshape(batch, n_chunks, chunk_size, self.d_inner, self.d_state)
+        dB_chunks = dB_pad.reshape(batch, n_chunks, chunk_size, self.d_inner, self.d_state)
+        C_chunks = C_pad.reshape(batch, n_chunks, chunk_size, self.d_state)
+
+        # Process chunks: O(n_chunks) Python iterations
+        all_outputs = []
+
+        for c in range(n_chunks):
+            x_c = x_chunks[:, c]  # (batch, chunk_size, d_inner)
+            dA_c = dA_chunks[:, c]  # (batch, chunk_size, d_inner, d_state)
+            dB_c = dB_chunks[:, c]  # (batch, chunk_size, d_inner, d_state)
+            C_c = C_chunks[:, c]  # (batch, chunk_size, d_state)
+
+            # --- Intra-chunk parallel scan via cumprod/cumsum ---
+            # Per-channel cumprod: each (d_inner, d_state) element evolves independently
+            cum_dA = torch.cumprod(dA_c, dim=1)  # (batch, chunk_size, d_inner, d_state)
+
+            # Input contributions: x * dB
+            x_dB = x_c.unsqueeze(-1) * dB_c  # (batch, chunk_size, d_inner, d_state)
+
+            # Scale by inverse cumulative dA
+            inv_cum_dA = 1.0 / (cum_dA + 1e-12)  # (batch, chunk_size, d_inner, d_state)
+            scaled_contrib = x_dB * inv_cum_dA  # (batch, chunk_size, d_inner, d_state)
+
+            # Cumulative sum of scaled contributions
+            cum_contrib = torch.cumsum(scaled_contrib, dim=1)  # (batch, chunk_size, d_inner, d_state)
+
+            # h_t = cum_dA_t * (h_0 + cum_contrib_t)
+            h_0 = h.unsqueeze(1)  # (batch, 1, d_inner, d_state)
+            h_chunk = cum_dA * (h_0 + cum_contrib)  # (batch, chunk_size, d_inner, d_state)
+
+            # Output: y_t = C_t @ h_t (contract over d_state)
+            y_chunk = torch.sum(h_chunk * C_c.unsqueeze(2), dim=-1)  # (batch, chunk_size, d_inner)
+            all_outputs.append(y_chunk)
+
+            # Update h for next chunk
+            h = h_chunk[:, -1, :, :]  # (batch, d_inner, d_state)
+
+        y = torch.cat(all_outputs, dim=1)[:, :seq_len, :]
         final_state = h
 
         # ---- Step 7: Skip connection D ----

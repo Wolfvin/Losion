@@ -289,20 +289,20 @@ class GatedAttentionHead(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        # ---- Scaled dot-product attention ----
-        scale = math.sqrt(self.d_kv)
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / scale  # (batch, seq_len, full_len)
+        # ---- Scaled dot-product attention (SDPA) ----
+        # Reshape to (batch, 1, seq_len/full_len, d_kv) for SDPA
+        q_sdpa = q.unsqueeze(1)
+        k_sdpa = k.unsqueeze(1)
+        v_sdpa = v.unsqueeze(1)
 
-        # Causal mask
-        causal_mask = torch.triu(
-            torch.ones(seq_len, full_len, dtype=torch.bool, device=x.device),
-            diagonal=full_len - seq_len + 1,
+        attn_output = F.scaled_dot_product_attention(
+            q_sdpa, k_sdpa, v_sdpa,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
         )
-        attn_weights = attn_weights.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
 
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
-
-        attn_output = torch.matmul(attn_weights, v)  # (batch, seq_len, d_kv)
+        attn_output = attn_output.squeeze(1)  # (batch, seq_len, d_kv)
 
         # ---- Sigmoid gate ----
         gate = torch.sigmoid(self.W_g(attn_output))  # (batch, seq_len, d_kv)
@@ -462,34 +462,20 @@ class GatedMultiHeadAttention(nn.Module):
         Returns:
             Attention output ``(batch, n_heads, seq_len, d_kv)``.
         """
-        batch, n_heads, seq_len, d_kv = q.shape
-        full_len = k.shape[2]
-
         # Optional QK normalisation
         if self.use_qk_norm:
             q = self.q_norm(q.transpose(1, 2)).transpose(1, 2)
             k = self.k_norm(k.transpose(1, 2)).transpose(1, 2)
 
-        # Scaled dot-product
-        scale = math.sqrt(d_kv)
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / scale
+        # Scaled dot-product attention (SDPA)
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attention_mask,
+            dropout_p=self.attn_dropout.p if self.training else 0.0,
+            is_causal=(attention_mask is None),
+        )
 
-        # Causal mask
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-        else:
-            causal_mask = torch.triu(
-                torch.ones(seq_len, full_len, dtype=torch.bool, device=q.device),
-                diagonal=full_len - seq_len + 1,
-            )
-            attn_weights = attn_weights.masked_fill(
-                causal_mask.unsqueeze(0).unsqueeze(0), float("-inf")
-            )
-
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
-        attn_weights = self.attn_dropout(attn_weights)
-
-        return torch.matmul(attn_weights, v)  # (batch, n_heads, seq_len, d_kv)
+        return attn_output  # (batch, n_heads, seq_len, d_kv)
 
     # ------------------------------------------------------------------
     # Forward (training / prefill)

@@ -97,6 +97,7 @@ class ParallelismConfig:
     compile_model: bool = False
     overlap_comm: bool = True
     use_cpu_offload: bool = False
+    use_fsdp2: bool = True  # Use FSDP2 composable API if available
 
     def __post_init__(self) -> None:
         """Validate parallelism configuration."""
@@ -227,6 +228,45 @@ class LosionFSDPWrapper:
         )
 
         return fsdp_model
+
+    def wrap_fsdp2(
+        self,
+        model: nn.Module,
+    ) -> nn.Module:
+        """Wrap a LosionModel with FSDP2 (composable API).
+
+        FSDP2 uses fully_shard() instead of FullyShardedDataParallel class,
+        providing better memory efficiency and simpler API. Per-layer sharding
+        ensures only one layer's parameters are unsharded at a time.
+
+        Requires PyTorch >= 2.4. Falls back to FSDP1 if unavailable.
+
+        Args:
+            model: LosionModel to wrap.
+
+        Returns:
+            FSDP2-sharded model (or FSDP1/DDP fallback).
+        """
+        try:
+            from torch.distributed._composable.fsdp import fully_shard
+
+            # Shard each LosionLayer individually for maximum memory efficiency
+            if hasattr(model, 'layers'):
+                for layer in model.layers:
+                    fully_shard(layer)
+
+            # Shard the top-level model
+            fully_shard(model)
+
+            logger.info("Model wrapped with FSDP2 (composable API)")
+            return model
+
+        except (ImportError, AttributeError) as e:
+            logger.warning(
+                f"FSDP2 not available (PyTorch >= 2.4 required): {e}. "
+                "Falling back to FSDP1."
+            )
+            return self.wrap(model)
 
     def _wrap_ddp(self, model: nn.Module) -> nn.Module:
         """Fallback: wrap model with DistributedDataParallel.
@@ -652,6 +692,8 @@ class LosionDistributedTrainer:
         """
         if self.mode == ParallelismMode.FSDP or self.mode == ParallelismMode.HYBRID:
             wrapper = LosionFSDPWrapper(self.config)
+            if self.config.use_fsdp2:
+                return wrapper.wrap_fsdp2(self.model)
             return wrapper.wrap(self.model)
         elif self.mode == ParallelismMode.DDP:
             if torch.distributed.is_initialized() and torch.cuda.is_available():

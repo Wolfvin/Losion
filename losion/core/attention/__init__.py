@@ -99,6 +99,104 @@ from losion.core.attention.mosa import (
     SparseAttentionExpert,
 )
 
+# ============================================================================
+# Unified Attention Interface — SDPA with Flash Attention auto-detection
+# ============================================================================
+
+
+def _detect_flash_attention() -> bool:
+    """Detect if Flash Attention is available.
+    
+    Checks for:
+    1. flash_attn package (NVIDIA)
+    2. flash_attn_rocm package (AMD)
+    3. PyTorch SDPA with Flash Attention backend
+    
+    Returns:
+        True if Flash Attention is available.
+    """
+    # Check flash_attn package
+    try:
+        from flash_attn import flash_attn_func
+        return True
+    except ImportError:
+        pass
+    
+    # Check flash_attn_rocm (AMD)
+    try:
+        from flash_attn_rocm import flash_attn_func
+        return True
+    except ImportError:
+        pass
+    
+    # Check PyTorch SDPA Flash backend
+    try:
+        import torch
+        if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
+            # Check if Flash backend is available
+            with torch.device('cuda' if torch.cuda.is_available() else 'cpu'):
+                return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
+    except Exception:
+        pass
+    
+    return False
+
+
+# Module-level flag (computed once at import time)
+HAS_FLASH_ATTENTION: bool = _detect_flash_attention()
+
+
+def attention_forward(
+    q: "torch.Tensor",
+    k: "torch.Tensor",
+    v: "torch.Tensor",
+    attn_mask: "Optional[torch.Tensor]" = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = True,
+) -> "torch.Tensor":
+    """Unified attention forward with automatic Flash Attention selection.
+    
+    Automatically selects the best attention implementation:
+    1. Flash Attention 2 (if flash_attn installed) — fastest, O(n) memory
+    2. PyTorch SDPA — automatic kernel selection, O(n) memory with Flash backend
+    3. Math fallback — standard attention, O(n^2) memory
+    
+    Args:
+        q: Query tensor (batch, n_heads, seq_len, d_kv).
+        k: Key tensor (batch, n_heads, full_len, d_kv).
+        v: Value tensor (batch, n_heads, full_len, d_kv).
+        attn_mask: Optional attention mask (additive).
+        dropout_p: Dropout probability.
+        is_causal: Whether to use causal masking.
+    
+    Returns:
+        Attention output tensor (batch, n_heads, seq_len, d_kv).
+    """
+    import torch
+    import torch.nn.functional as F
+    
+    # Try flash_attn package first (most optimized)
+    if HAS_FLASH_ATTENTION and attn_mask is None and dropout_p == 0.0:
+        try:
+            from flash_attn import flash_attn_func
+            # flash_attn_func expects (batch, seq_len, n_heads, d_kv)
+            q_fa = q.transpose(1, 2)
+            k_fa = k.transpose(1, 2)
+            v_fa = v.transpose(1, 2)
+            output = flash_attn_func(q_fa, k_fa, v_fa, causal=is_causal)
+            return output.transpose(1, 2)
+        except Exception:
+            pass  # Fall through to SDPA
+    
+    # Use PyTorch SDPA (handles Flash, memory-efficient, and math backends)
+    return F.scaled_dot_product_attention(
+        q, k, v,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+    )
+
+
 __all__ = [
     "InterleavedRoPE",
     "MLA",
@@ -138,4 +236,8 @@ __all__ = [
     "MoSAConfig",
     "MoSAAttention",
     "SparseAttentionExpert",
+    # Flash Attention Detection
+    "HAS_FLASH_ATTENTION",
+    "_detect_flash_attention",
+    "attention_forward",
 ]

@@ -878,9 +878,30 @@ class LosionGenerator:
         self,
         model: Any,
         device: str = "cpu",
+        compile_model: bool = True,
     ) -> None:
         self.model = model
         self.device = device
+        if compile_model:
+            try:
+                self.model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
+            except Exception:
+                pass  # torch.compile not available, use uncompiled model
+
+    def compile_model(self, mode: str = "reduce-overhead") -> None:
+        """Compile the model with torch.compile for faster inference.
+
+        Works with both CUDA and ROCm. Provides 10-30% speedup by fusing
+        small operators and eliminating Python overhead.
+
+        Args:
+            mode: Compilation mode. Options: "default", "reduce-overhead", "max-autotune"
+        """
+        try:
+            self.model = torch.compile(self.model, mode=mode, fullgraph=False)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"torch.compile failed: {e}")
 
     @torch.no_grad()
     def generate(

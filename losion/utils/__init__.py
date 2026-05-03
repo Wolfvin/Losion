@@ -28,6 +28,7 @@ from losion.utils.hardware import (
     get_gpu_info,
     recommend_settings,
 )
+from losion.utils.fp8 import check_fp8_support, convert_to_fp8_training, get_optimal_precision
 from losion.utils.logging import setup_logging
 from losion.utils.upcycling import HyLoUpcycler, UpcyclingConfig
 
@@ -44,4 +45,8 @@ __all__ = [
     # HyLo Upcycling
     "HyLoUpcycler",
     "UpcyclingConfig",
+    # FP8
+    "convert_to_fp8_training",
+    "check_fp8_support",
+    "get_optimal_precision",
 ]
