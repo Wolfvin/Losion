@@ -621,6 +621,141 @@ If you use Losion in your research, please cite the original repository:
 
 ---
 
+## v1.4.0 — "Kernel Optimization Release" Improvements
+
+### K1. SDPA + Flash Attention Auto-Detection (`losion/core/kernel/sdpa_compat.py`, `losion/core/kernel/flash_attn.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Dao, T. | "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning" (arXiv:2307.08691) | 2023 | O(n) memory attention with tiling and parallelism |
+| Dao, T. et al. | "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low Precision" (arXiv:2407.08608) | 2024 | Warp-specialized async attention on Hopper H100+ |
+| FlashAttention-4 | (arXiv:2603.05451) | 2026 | Blackwell B200 kernel pipelining, 2.7x over Triton |
+| PyTorch | F.scaled_dot_product_attention | 2023+ | Auto-selects Flash/Memory-Efficient/Math backend |
+
+**What we adapted:** Unified `sdpa_attention()` function that automatically selects the best backend (FA3 > FA2 > SDPA > math). Handles format conversions between (B,H,S,D) and (B,S,H,D) layouts. Block-sparse attention for MoBA. Sliding window attention. Linear attention for DeltaNet/Lightning Attention.
+
+---
+
+### K2. Parallel SSM Scan Kernels (`losion/core/kernel/ssm_kernels.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Gu, A. & Dao, T. | "Mamba-2: A Generalized State Space Model" (arXiv:2405.21075) | 2024 | SSD with structured state space duality |
+| PyTorch Blog | "Accelerating Mamba2 with Kernel Fusion" | 2026 | Fused Triton kernel for Mamba-2 SSD scan |
+| Mamba-3 | (arXiv:2603.15569) | 2026 | Exponential-trapezoidal discretization, 2x inference |
+| Blelloch, G. | "Prefix Sums and Their Applications" | 1990 | Parallel associative scan algorithm |
+
+**What we adapted:** Parallel associative scan with O(log n) binary tree reduction. Chunk-parallel scan (O(n_chunks) vs O(seq_len)). Triton fused SSM kernel for single-kernel-launch computation. RWKV-7 parallel WKV scan. Multi-mode SSM scan for LiquidSSM/PoST Decay. `compiled_sequential_scan()` wrapper for torch.compile optimization.
+
+---
+
+### K3. torch.compile Custom FX Passes (`losion/core/kernel/compile_utils.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| PyTorch Blog | "Ways to use torch.compile" (blog.ezyang.com) | 2024 | Custom FX graph optimization passes |
+| PyTorch | Performance Tuning Guide | 2024+ | Compilation strategies and best practices |
+
+**What we adapted:** `compile_losion_model()` with optimal settings (mode, fullgraph, backend). `compile_pathway()` for selective per-pathway compilation. `FusedPathwayNorms` fusing 3 RMSNorm calls. `FusedRoutingBlend` fusing routing + weighted sum. Custom FX pass for norm fusion and blend optimization. Selective compilation strategy (SSM: HIGH benefit, MoE: LOW benefit).
+
+---
+
+### K4. Native FP8 Training (`losion/core/kernel/fp8_native.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| DeepSeek-AI | "DeepSeek-V3 Technical Report" (arXiv:2412.19437) | 2024 | Fine-grained FP8: tile-wise (1x128) + block-wise (128x128) scaling |
+| NVIDIA | Transformer Engine (github.com/NVIDIA/TransformerEngine) | 2024+ | Native FP8 GEMM, fused LayerNorm, dynamic scaling |
+| torchao | github.com/pytorch/torchao | 2024+ | PyTorch-native FP8 training via float8 conversion |
+| PyTorch Blog | "Supercharging Training using float8 and FSDP2" | 2025 | FSDP2 + FP8 combined pipeline, 50% throughput improvement |
+
+**What we adapted:** Three FP8 backends: torchao (simple), Transformer Engine (maximum performance), DeepSeek-V3 fine-grained (best accuracy). `convert_model_to_fp8()` with automatic backend selection. `DeepSeekFP8Scaler` with tile-wise activation and block-wise weight quantization. `setup_fp8_fsdp2_training()` for combined FP8 + FSDP2 pipeline.
+
+---
+
+### K5. Speculative Decoding with SSM-as-Drafter (`losion/core/kernel/speculative.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| SpecForge | (arXiv:2603.18567) | 2026 | Flexible speculative decoding framework |
+| SwiftSpec | (dl.acm.org/doi/10.1145/3779212.3790246) | 2026 | Disaggregated speculative decoding |
+
+**What we adapted:** `SSMDraftModel` extracts SSM pathway as fast drafter (unique to Losion's tri-pathway architecture — no extra model needed). `SpeculativeDecoder` verifies draft tokens with full model. Stochastic acceptance with probability ratio. Expected 2-3x inference latency reduction with zero quality loss.
+
+---
+
+### K6. Early Exit / Dynamic Depth (`losion/core/kernel/early_exit.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Early Exit Survey | (arXiv:2501.07670) | 2025 | Comprehensive survey of early exit in NLP |
+| Jointly-Learned Exit | (openreview.net/forum?id=jX2DT7qDam) | 2024 | Jointly learned exit and inference modules |
+
+**What we adapted:** Two-level early exit: pathway-level (skip pathways with weight < threshold) and layer-level (skip entire layers based on router entropy). `PathwayEarlyExit` with adaptive threshold based on routing entropy. `LayerEarlyExit` with exit classifier heads. `DynamicDepthController` for managing dynamic depth during inference.
+
+---
+
+### K7. PagedAttention + E8 Lattice VQ (`losion/core/kernel/paged_kv.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Kwon et al. | "Efficient Memory Management for LLM Serving with PagedAttention" (SOSP 2023) | 2023 | Virtual memory for KV cache with page tables |
+| PagedEviction | (arXiv:2509.04377) | 2025 | Structured block-wise KV cache pruning |
+| E8 Lattice VQ | vLLM Issue #39241 | 2026 | E8 lattice vector quantization for 10-33x KV compression |
+| PyTorch Blog | INT4 Decoding GQA CUDA Optimizations | 2025+ | INT4 KV cache with on-the-fly dequantization |
+
+**What we adapted:** `PagedKVCacheManager` with <4% memory waste. `E8LatticeQuantizer` for 10-33x KV compression. `INT4KVCacheQuantizer` for 4x compression. `KVEvictionManager` for structured block-wise KV cache pruning.
+
+---
+
+### K8. Parallel Pathway Execution (`losion/core/kernel/parallel_pathway.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Nemotron 3 | (arXiv:2604.12374) | 2026 | Parallel Mamba-2 + Attention + MoE within same layer |
+| CUDA Streams | NVIDIA CUDA Runtime API | 2024+ | Concurrent kernel execution on different SM clusters |
+
+**What we adapted:** `ParallelPathwayExecutor` using CUDA streams for concurrent SSM/Attention/MoE execution. `FusedPathwayModule` for parallel pathway module. Optional gradient checkpointing with per-pathway checkpointing.
+
+---
+
+### K9. Expert Prefetch + MoE Communication Overlap (`losion/core/kernel/expert_prefetch.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| KTransformers | (dl.acm.org/doi/10.1145/3731569.3764843, SOSP 2025) | 2025 | CPU/GPU hybrid MoE inference with smart prefetch |
+| Occult | ICML 2025 | 2025 | Optimizing collaborative communication across experts |
+| FlashMoE | (arXiv:2506.04667) | 2025 | Fused distributed MoE in a single kernel |
+
+**What we adapted:** `ExpertPrefetcher` that uses routing predictions to prefetch expert parameters before they're needed. Background thread for CPU→GPU prefetching. LRU eviction for GPU memory management. `MoECommunicationOverlap` that pipelines MoE all-to-all communication with SSM/Attention computation.
+
+---
+
+### K10. FSDP2 + Tensor Parallelism + Router Optimization (`losion/core/kernel/fsdp_utils.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| PyTorch FSDP2 | pytorch.org/docs/stable/fsdp.html | 2024+ | Composable fully_shard() API for FSDP2 |
+| PyTorch TP | pytorch.org/docs/stable/distributed.tensor.parallel | 2024+ | Native PyTorch Tensor Parallelism |
+| FSDP2+FP8 | pytorch.org/blog/training-using-float8-fsdp2 | 2025 | Combined FP8 + FSDP2 training |
+| SimpleFSDP | (ResearchGate 385510534) | 2025 | Compiler-based FSDP with torch.compile |
+
+**What we adapted:** `wrap_model_fsdp2()` with per-pathway sharding and mixed precision. `apply_tensor_parallelism()` using native PyTorch TP with ColwiseParallel/RowwiseParallel. `get_router_param_groups()` for 10x higher router LR. `compute_entropy_regularization()` to prevent routing collapse. `compute_load_balancing_loss()` for balanced pathway utilization.
+
+---
+
+### K11. Custom Triton Kernels (`losion/core/kernel/triton_kernels.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| OpenAI Triton | openai.com/research/triton | 2023+ | Python-level GPU programming DSL |
+| Warp Specialization | PyTorch Blog 2025 | 2025 | Warp specialization in Triton for concurrent memory/compute |
+| FlashMoE | (arXiv:2506.04667) | 2025 | Fused MoE dispatch and combine kernels |
+
+**What we adapted:** `fused_tri_pathway_blend()` for single-operation routing + weighted sum. `fused_norm_gate()` for fused RMSNorm + sigmoid gating. `moe_dispatch()` and `moe_combine()` for efficient expert routing with top-k selection.
+
+---
+
 ## License Note
 
 Each referenced paper and technology is the intellectual property of its respective authors.

@@ -149,13 +149,21 @@ class LayerRecyclingBlock(nn.Module):
         k_mean = k.mean(dim=1, keepdim=True)
         v_mean = v.mean(dim=1, keepdim=True)
 
-        scores = torch.matmul(q, k_mean.transpose(-2, -1)) / self.scale
-        attn = F.softmax(scores, dim=-1)
-
-        if self.dropout is not None:
-            attn = self.dropout(attn)
-
-        revision = torch.matmul(attn, v_mean)
+        # ---- SDPA attention (O(n) memory with Flash Attention) ----
+        # Uses F.scaled_dot_product_attention for automatic kernel selection.
+        # References: FlashAttention-2 (arXiv:2307.08691), FlashAttention-3 (arXiv:2407.08608)
+        try:
+            revision = F.scaled_dot_product_attention(
+                q.unsqueeze(1), k_mean.unsqueeze(1), v_mean.unsqueeze(1),
+                is_causal=False,
+            ).squeeze(1)
+        except Exception:
+            # Fallback for non-standard shapes
+            scores = torch.matmul(q, k_mean.transpose(-2, -1)) / self.scale
+            attn = F.softmax(scores, dim=-1)
+            if self.dropout is not None:
+                attn = self.dropout(attn)
+            revision = torch.matmul(attn, v_mean)
         revision = self.revision_proj(revision)
 
         gate = self.revision_gate(torch.cat([shallow_repr, revision], dim=-1))

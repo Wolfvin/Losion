@@ -261,29 +261,45 @@ class SharedAttentionPool(nn.Module):
         k_t = k.transpose(1, 2)
         v_t = v.transpose(1, 2)
 
-        # Attention scores
-        scale = math.sqrt(d_head)
-        attn_weights = torch.matmul(q_t, k_t.transpose(-2, -1)) / scale
+        # ---- Scaled dot-product attention (SDPA) ----
+        # Uses F.scaled_dot_product_attention which automatically selects:
+        # Flash Attention 2/3 > Memory-efficient attention > Math fallback
+        # This provides O(n) memory instead of O(n^2) and 2-4x speedup.
+        #
+        # References:
+        #   - FlashAttention-2: Dao (arXiv:2307.08691)
+        #   - FlashAttention-3: Dao et al. (arXiv:2407.08608)
+        #   - PyTorch SDPA: F.scaled_dot_product_attention
+        #   - Losion Kernel: losion.core.kernel.sdpa_compat
 
-        # Causal mask (default)
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-        else:
-            causal_mask = torch.triu(
-                torch.ones(seq_len, full_len, dtype=torch.bool, device=q.device),
-                diagonal=full_len - seq_len + 1,
-            )
-            attn_weights = attn_weights.masked_fill(
-                causal_mask.unsqueeze(0).unsqueeze(0), float("-inf")
-            )
+        is_causal = (attention_mask is None)
+        dropout_p = dropout if (dropout > 0.0 and self.training) else 0.0
 
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
-
-        if dropout > 0.0 and self.training:
-            attn_weights = F.dropout(attn_weights, p=dropout)
-
-        # Weighted sum
-        output = torch.matmul(attn_weights, v_t)  # (batch, n_heads, seq_len, d_head)
+        try:
+            output = F.scaled_dot_product_attention(
+                q_t, k_t, v_t,
+                attn_mask=attention_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+            )  # (batch, n_heads, seq_len, d_head)
+        except Exception:
+            # Fallback for cases where SDPA doesn't support the input
+            scale = math.sqrt(d_head)
+            attn_weights = torch.matmul(q_t, k_t.transpose(-2, -1)) / scale
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask
+            else:
+                causal_mask = torch.triu(
+                    torch.ones(seq_len, full_len, dtype=torch.bool, device=q.device),
+                    diagonal=full_len - seq_len + 1,
+                )
+                attn_weights = attn_weights.masked_fill(
+                    causal_mask.unsqueeze(0).unsqueeze(0), float("-inf")
+                )
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+            if dropout > 0.0 and self.training:
+                attn_weights = F.dropout(attn_weights, p=dropout)
+            output = torch.matmul(attn_weights, v_t)
 
         # Transpose kembali
         output = output.transpose(1, 2)  # (batch, seq_len, n_heads, d_head)
@@ -454,26 +470,36 @@ class SharedAttentionLayer(nn.Module):
         k_t = k_full.transpose(1, 2)
         v_t = v_full.transpose(1, 2)
 
-        scale = math.sqrt(self.d_head)
-        attn_weights = torch.matmul(q_t, k_t.transpose(-2, -1)) / scale
+        # ---- SDPA attention (O(n) memory with Flash Attention) ----
+        is_causal = (attention_mask is None)
+        dropout_p = self.attn_dropout.p if self.training else 0.0
 
-        # Causal mask
-        full_len = k_full.shape[1]
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-        else:
-            causal_mask = torch.triu(
-                torch.ones(seq_len, full_len, dtype=torch.bool, device=x.device),
-                diagonal=full_len - seq_len + 1,
+        try:
+            output = F.scaled_dot_product_attention(
+                q_t, k_t, v_t,
+                attn_mask=attention_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
             )
-            attn_weights = attn_weights.masked_fill(
-                causal_mask.unsqueeze(0).unsqueeze(0), float("-inf")
-            )
+        except Exception:
+            # Fallback
+            scale = math.sqrt(self.d_head)
+            attn_weights = torch.matmul(q_t, k_t.transpose(-2, -1)) / scale
+            full_len = k_full.shape[1]
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask
+            else:
+                causal_mask = torch.triu(
+                    torch.ones(seq_len, full_len, dtype=torch.bool, device=x.device),
+                    diagonal=full_len - seq_len + 1,
+                )
+                attn_weights = attn_weights.masked_fill(
+                    causal_mask.unsqueeze(0).unsqueeze(0), float("-inf")
+                )
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+            attn_weights = self.attn_dropout(attn_weights)
+            output = torch.matmul(attn_weights, v_t)
 
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
-        attn_weights = self.attn_dropout(attn_weights)
-
-        output = torch.matmul(attn_weights, v_t)
         output = output.transpose(1, 2).contiguous().view(batch, seq_len, self.d_inner)
         output = self.out_proj(output)
 
