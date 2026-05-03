@@ -501,6 +501,36 @@ original authors for their contributions to the open research community.
 
 ---
 
+### 36. Structured Sparse SSM Transitions (`losion/core/ssm/structured_sparse.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| NeurIPS 2025 (poster 118046) | "Structured Sparse Transition Matrices to Enable State Tracking in SSMs" | 2025 | Provably optimal state size for FSA state tracking via structured sparse parametrization |
+
+**What we adapted:** Replaces fully diagonal SSM transition matrices with structured sparse matrices that have off-diagonal elements within blocks. Three sparsity patterns: block-diagonal, banded, and butterfly. Uses first-order Taylor approximation for efficient O(S×B) computation. Drop-in replacement for Mamba2SSD. When block_size=1, falls back to standard diagonal (backward compatible).
+
+---
+
+### 37. MoHGE — Mixture of Heterogeneous Grouped Experts (`losion/core/retrieval/mohge.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| arXiv 2604.23108 | "Mixture of Heterogeneous Grouped Experts for Language Modeling" | 2026 | Experts differ in size and capacity, achieving precise capacity match based on task difficulty |
+
+**What we adapted:** Experts organized into groups with similar sizes. Within each group, experts share a common up_proj for parameter efficiency. Capacity-aware router biases logits by sqrt(d_ff/d_ff_max) so larger experts attract harder tokens. Two auxiliary losses: per-expert load balance + per-group capacity regularizer. Optional shared expert (DeepSeek-V3 style).
+
+---
+
+### 38. QuantSpec — Self-Speculative Decoding with Hierarchical Quantization (`losion/inference/quantspec.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| ICML 2025 (poster 46326) | "QuantSpec: Self-Speculative Decoding with Hierarchical Quantization" | 2025 | Uses quantized versions of the same model as draft models for >90% acceptance rates |
+
+**What we adapted:** QuantizedDraftModel creates on-the-fly quantized versions of the target model with per-channel symmetric quantization. Pathway-aware quantization: SSM pathway quantized more aggressively (less sensitive to quantization error). QuantSpecDecoder orchestrates draft-verify pipeline with adaptive level selection and draft length. Supports multiple quantization backends (bitsandbytes, custom).
+
+---
+
 ## Foundational Technologies Used Throughout Losion
 
 | Technology | Reference | Key Contribution to Losion |
