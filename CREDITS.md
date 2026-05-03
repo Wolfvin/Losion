@@ -161,121 +161,152 @@ original authors for their contributions to the open research community.
 
 ---
 
-## v0.6 — "Mythos & Mamba" Improvements (8 New Components)
+## Agent Layer — Losion v0.5.0+ (Based on 40+ Research Papers)
 
-### 13. Recurrent-Depth Transformer + LTI-Stable + ACT (`losion/core/recurrent/rdt.py`)
-
-| Reference | Paper | Year | Key Contribution |
-|-----------|-------|------|-----------------|
-| Dehghani, M. et al. | "Universal Transformers" (arXiv:1807.03819) | 2019 | Original looped transformer concept — same weights applied iteratively for adaptive compute depth |
-| Kye Gomez | "OpenMythos" (github.com/kyegomez/OpenMythos) | 2026 | Open-source reconstruction of Claude Mythos architecture — Recurrent-Depth Transformer hypothesis with MoE + MLA/GQA + LTI stability |
-| Bae, S. et al. | "Relaxed Recursive Transformers" (arXiv:2410.20672) | 2024 | LoRA per loop iteration — allows per-iteration behavioral adaptation while preserving weight-sharing compactness |
-| Saunshi, N. et al. | "Reasoning with Latent Thoughts" (arXiv:2502.17416) | 2025 | Proves looped models simulate chain-of-thought reasoning in latent space |
-| Sachan, M. et al. | "COCONUT: Continuous Latent Reasoning" (arXiv:2412.06769) | 2024 | Training LLMs to reason in continuous latent space without explicit tokens |
-| Goyal, S. et al. | "Loop, Think, & Generalize" (arXiv:2604.07822) | 2026 | Implicit reasoning capabilities of recurrent-depth transformers |
-| Zhang, J. et al. | "Parcae: Scaling Laws for Looped Language Models" (arXiv:2604.12946) | 2026 | Scaling laws specific to looped architectures |
-| Graves, A. | "Adaptive Computation Time for Recurrent Neural Networks" (arXiv:1603.08983) | 2016 | Adaptive Computation Time (ACT) — learned halting criterion for variable compute depth |
-| Hyperloop Transformers | arXiv:2604.21254 | 2026 | Advanced looped transformer variant |
-| The Recurrent Transformer | arXiv:2604.21215 | 2026 | Greater effective depth and efficient decoding in looped models |
-
-**What we adapted:** Recurrent-Depth Transformer with LTI-stable injection (spectral radius constraint ρ(A) < 1 for training stability), Adaptive Computation Time for variable-depth halting, loop-index positional embeddings for iteration differentiation, and depth-wise LoRA for per-iteration adaptation. The full RecurrentDepthBlock orchestrates: Prelude → [Looped Block with LTI stability + ACT + DepthLoRA] → Coda.
-
----
-
-### 14. MoBA — Mixture of Block Attention (`losion/core/attention/moba.py`)
+### A1. Signal Extraction — Tool Use & Confidence Routing (`losion/agent/signals.py`)
 
 | Reference | Paper | Year | Key Contribution |
 |-----------|-------|------|-----------------|
-| Moonshot AI | "MoBA: Mixture of Block Attention" (NeurIPS 2025) | 2025 | MoE routing applied directly to attention blocks — routes attention computation sparsely to relevant blocks instead of full O(n²) attention |
-| NeurIPS 2025 | https://neurips.cc/virtual/2025/poster/117997 | 2025 | Conference presentation and poster |
+| Schick, T. et al. (Meta AI) | "Toolformer: Language Models Can Teach Themselves to Use Tools" | 2023 | Self-supervised tool use learning — perplexity-based filtering for when to call APIs |
+| Patil, S. et al. (UC Berkeley) | "Gorilla: Connected to Massive APIs" | 2023 | Fine-tuning LLMs for API calls with AST-based evaluation and retrieval-augmented training |
+| Qin, Y. et al. (Tsinghua) | "ToolLLM: Facilitating Large Language Models to Master 16000+ Real-world APIs" | 2023 | DFSDT (Depth-First Search Decision Tree) for tool exploration with backtracking |
+| — | "SMART: Self-Aware Agent for Tool Overuse Mitigation" | 2025 | Self-awareness mechanism to prevent unnecessary tool calls when parametric knowledge is sufficient |
+| — | "Paradigm Routing as Inference-Time Optimization" | 2024 | Different reasoning paradigms should be selected per-task by a learned router |
 
-**What we adapted:** Block-sparse attention via MoE routing. Sequence is partitioned into blocks, a router selects top-K relevant blocks per query, and attention is computed only within selected blocks. Supports MLA KV compression, hard and soft routing modes, and load balancing auxiliary loss. Drop-in replacement for standard attention with sub-quadratic complexity.
+**What we adapted:** Multi-signal fusion (confidence + routing weights + thinking mode + task type) for agent signal extraction. Added SMART-style knowledge sufficiency check using Tri-Jalur routing weights. Added Toolformer-style perplexity-based confidence estimation. Added paradigm routing hints for the orchestrator.
 
 ---
 
-### 15. Gated Attention (`losion/core/attention/gated_attention.py`)
+### A2. Orchestrator — Agentic Frameworks (`losion/agent/orchestrator.py`)
 
 | Reference | Paper | Year | Key Contribution |
 |-----------|-------|------|-----------------|
-| Qwen Team | "Gated Attention" (NeurIPS 2025 Best Paper) | 2025 | Sigmoid gate after softmax attention — eliminates attention sinks, adds beneficial sparsity, synergizes with MoE routing |
-| Sun, Y. et al. | "Retentive Network: A Successor to Transformer" | 2023 | Gated retention mechanism inspiration |
+| Yao, S. et al. (Princeton) | "ReAct: Synergizing Reasoning and Acting in Language Models" | 2023 | Interleaving reasoning (Chain-of-Thought) with acting (tool use) in a single loop |
+| Shen, Y. et al. (Zhejiang) | "HuggingGPT: Solving AI Tasks with ChatGPT and its Friends in HuggingFace" | 2023 | LLM as orchestrator: Plan → Route → Execute → Synthesize pipeline |
+| Shinn, N. et al. (Northeastern) | "Reflexion: Language Agents with Verbal Reinforcement Learning" | 2023 | Agents learn from failures via self-reflection stored in memory |
+| Chen, W. et al. (Tsinghua) | "AgentVerse: Facilitating Multi-Agent Collaboration" | 2023 | Dynamic agent recruitment based on task requirements |
 
-**What we adapted:** Per-head sigmoid gating after softmax attention output. Gate = sigmoid(W_g * output) with near-identity initialization (gates start ≈1 and gradually learn to suppress). Eliminates attention sink tokens, adds soft per-head sparsity that synergizes with MoE routing. Supports MLA KV compression and QK normalization.
+**What we adapted:** ReAct-style interleaved agent loop with HuggingGPT-style pipeline separation. Reflexion-inspired reflection after each action. Orchestrator NEVER modifies the model — only uses model signals and feeds action results back as context.
 
 ---
 
-### 16. Routing Mamba (RoM) (`losion/core/ssm/routing_mamba.py`)
+### A3. Paradigm Router — Reasoning Paradigm Selection (`losion/agent/planning/paradigm_router.py`)
 
 | Reference | Paper | Year | Key Contribution |
 |-----------|-------|------|-----------------|
-| Microsoft Research | "Routing Mamba (RoM)" (NeurIPS 2025) | 2025 | Scales SSM parameters using sparse mixtures of linear projection experts — combines MoE routing with SSM efficiency |
-| NeurIPS 2025 | https://neurips.cc/virtual/2025/poster/116256 | 2025 | Conference presentation and poster |
-| Gu, A. & Dao, T. | "Mamba-2: A Generalized State Space Model" (arXiv:2405.21060) | 2024 | SSM with structured state space duality — base architecture for Routing Mamba |
-| DeepSeek-AI | "DeepSeek-V3 Technical Report" (arXiv:2412.19437) | 2024 | Aux-loss-free bias-based routing for load balancing |
+| — | "SMART: Self-Aware Agent for Tool Overuse Mitigation" | 2025 | Knowledge sufficiency check — prevents tool overuse when parametric knowledge is sufficient |
+| — | "Paradigm Routing as Inference-Time Optimization" | 2024 | Per-task paradigm selection (Direct, CoT, ReAct, RAG, Multi-Agent) by learned router |
+| Losion Tri-Jalur Router | Losion v0.4 | 2024 | Model-level routing between SSM, Attention, and Retrieval — agent-level extension |
 
-**What we adapted:** MoE routing over SSM linear projections. Multiple expert-specific B, C, dt projections with shared A matrix and D skip connection. DeepSeek-V3 style bias-based routing for load balancing. Soft mixture of expert projections → single SSM scan (efficient). Optional shared expert. Drop-in replacement for Mamba2SSD.
+**What we adapted:** Five reasoning paradigms (Direct, CoT, ReAct, RAG, MCTS) with SMART-style knowledge sufficiency check. Uses Tri-Jalur routing weights to determine if parametric knowledge is sufficient. Domain-aware and calibration-aware adjustments.
 
 ---
 
-### 17. Mamba-3 SSD (`losion/core/ssm/mamba3.py`)
+### A4. MCTS Agent Loop — Tree-Structured Action Exploration (`losion/agent/planning/mcts_agent.py`)
 
 | Reference | Paper | Year | Key Contribution |
 |-----------|-------|------|-----------------|
-| arXiv:2603.15569 | "Mamba-3: Inference-First State Space Models" | 2026 | Half the state size of Mamba-2 with comparable perplexity — three core methodological improvements from inference-first perspective |
-| Gu, A. & Dao, T. | "Mamba: Linear-Time Sequence Modeling with Selective State Spaces" (arXiv:2312.00752) | 2023 | Original Mamba SSM |
-| Gu, A. & Dao, T. | "Mamba-2" (arXiv:2405.21060) | 2024 | Predecessor architecture |
+| Zhou, A. et al. | "LATS: Language Agent Tree Search" | ICML 2024 | Unifies reasoning, acting, and planning in single MCTS framework — LM self-evaluation as value function |
+| Qin, Y. et al. (Tsinghua) | "ToolLLM: DFSDT" | 2023 | Depth-First Search Decision Tree — backtracking when tool paths fail |
+| — | "ExACT: Reflective MCTS for Agent Decision-Making" | 2024 | Combines reflection with tree search for improved agent decisions |
 
-**What we adapted:** Mamba-3 improvements: (1) Reduced state dimension d_state=32 vs Mamba-2's 64 with better utilization, (2) Dual token shift — two separate shift patterns (forward + backward) inspired by RWKV, (3) Inference-first dt discretization with clamped exponential and stabilized input scaling for stable O(1) per-token generation. Drop-in replacement for Mamba2SSD.
+**What we adapted:** LATS-style MCTS agent loop with full Select→Expand→Evaluate→Simulate→Backpropagate cycle. DFSDT-style backtracking when actions reduce confidence. UCB1 for exploration-exploitation balance. Confidence changes propagated as reward signals.
 
 ---
 
-### 18. S'MoRE — Sub-tree MoE with Residual Experts (`losion/core/retrieval/smore.py`)
+### A5. DEPS Planner — Failure Recovery (`losion/agent/planning/deps_planner.py`)
 
 | Reference | Paper | Year | Key Contribution |
 |-----------|-------|------|-----------------|
-| Meta Research | "S'MoRE: Composing Experts from Shared Residual Sub-trees" (NeurIPS 2025) | 2025 | Parameter-efficient expert diversity by composing experts from shared sub-trees with residual connections |
-| DeepSeek-AI | "DeepSeekMoE: Towards Ultimate Expert Specialization" (arXiv:2401.06066) | 2024 | Fine-grained expert segmentation and shared expert design |
+| Wang, Z. et al. (KAIST) | "DEPS: Describe, Explain, Plan, Select for Interactive Planning" | 2023, cited 447× | Structured recovery: Describe failure → Explain why → Plan alternatives → Select best |
+| Zhu, X. et al. (Tsinghua) | "GITM: Ghost in the Minecraft" | 2023 | Sub-goal tree decomposition — high-level goals decomposed into tree of sub-goals |
 
-**What we adapted:** S'MoRE expert composition with shared ResidualSubTree components (SwiGLU layers with residual connections) that multiple ComposedExperts reference for parameter sharing. Each composed expert softly blends sub-trees via learned composition weights plus an expert-specific residual branch. Achieves ~50% parameter savings vs standard MoE with equivalent expert count. Includes load balancing auxiliary loss.
+**What we adapted:** Full DEPS pipeline: Describe → Explain → Plan → Select for structured failure recovery. Maps to Losion's existing components: SignalExtractor (Describe), ReflectionEngine (Explain), MCTS (Plan), Parallel Thinking (Select). Seven failure types with tailored recovery strategies and fallback chains.
 
 ---
 
-### 19. Symbolic-MoE — Skill-based Discrete Routing (`losion/core/retrieval/symbolic_moe.py`)
+### A6. Agentic Retriever — Multi-Round Retrieval (`losion/agent/retrieval/agentic_retriever.py`)
 
 | Reference | Paper | Year | Key Contribution |
 |-----------|-------|------|-----------------|
-| Symbolic-MoE (2025) | "Skill-based Discrete Routing for Mixture of Experts" | 2025 | Top-level orchestrator using skill-type classification for pathway routing instead of pure learned routing |
-| Fedus, W. et al. | "Switch Transformers: Scaling to Trillion Parameter Models" | 2022 | MoE routing fundamentals |
-| Lewis et al. | "Retrieval-Augmented Generation" | 2020 | Task-type conditioned routing inspiration |
+| — | "CRP-RAG: CRP-based Reasoning Graph for RAG" | 2024, cited 36× | Reasoning graphs for complex query reasoning instead of single-query retrieval |
+| — | "OPEN-RAG: Enhanced Retrieval-Augmented Reasoning" | 2024, cited 79× | Self-reflection on retrieval quality for better generation |
+| — | "SR-RAG: Selective Retrieval RAG" | 2024 | Don't always retrieve — use parametric knowledge when sufficient |
+| — | "AU-RAG: Agent-based Universal RAG" | 2024 | Dynamic search across diverse pools with descriptive metadata |
 
-**What we adapted:** Two-stage routing: SkillClassifier (small MLP) classifies input into skill types (REASONING, NARRATIVE, KNOWLEDGE, CODING, CREATIVE, MATHEMATICAL), then SymbolicRoutingRule maps skill type to pathway allocation weights (e.g., REASONING → attention:0.7, NARRATIVE → SSM:0.8). Supports soft blending, hard discrete routing, and combination with Losion's BiasRouter for macro+micro routing.
+**What we adapted:** Multi-round retrieval with confidence-based query refinement: Initial search → Quality assessment → Query reformulation → Re-search → Synthesis. Five refinement strategies (add_context, rephrase, decompose, narrow, broaden). Quality scoring using result count, relevance, query coverage, and content richness.
 
 ---
 
-### 20. LLM-JEPA — Joint-Embedding Predictive Architecture for LLMs (`losion/training/llm_jepa.py`)
+### A7. Risk Simulator — Pre-Execution Safety Assessment (`losion/agent/safety/risk_simulator.py`)
 
 | Reference | Paper | Year | Key Contribution |
 |-----------|-------|------|-----------------|
-| LLM-JEPA (2025) | "LLM-JEPA: Predicting Future Latent States in Large Language Models" (arXiv, 19 citations) | 2025 | Predicts future latent states instead of next tokens — principled training objective for hybrid models |
-| LeCun, Y. | "A Path Towards Autonomous Machine Intelligence" (JEPA) | 2022 | Joint-Embedding Predictive Architecture — predict in latent space, not pixel/token space |
-| Assran, M. et al. | "I-JEPA: Self-Supervised Learning from Images via Joint-Embedding Predictive Architecture" (arXiv:2301.08243) | 2023 | Image JEPA with VICReg loss and EMA target encoder |
-| Bardes, A. et al. | "V-JEPA: Video Joint-Embedding Predictive Architecture" | 2024 | Video JEPA extending the framework to temporal sequences |
+| Ruan, J. et al. | "ToolEmu: Identifying Risks of LM Agents with an LM Emulator" | ICLR 2024 Spotlight, cited 326× | Use LM to emulate tool execution for scalable risk testing without executing dangerous tools |
 
-**What we adapted:** JEPA training for LLMs: LatentPredictor predicts future hidden states (H steps ahead) from current representations, TargetEncoder (EMA teacher) provides stable targets, VICReg loss prevents representation collapse. Total loss = LM_loss + prediction_weight * JEPA_loss. Natural fit for SSM components that already model state transitions. Compatible with LosionTrainer's training loop.
+**What we adapted:** ToolEmu-style three-layer risk assessment: (1) Static analysis with pattern matching for dangerous commands, (2) Dynamic simulation of predicted outcomes, (3) Experience-based assessment from episodic memory. Five risk levels (SAFE→CRITICAL) with approval routing.
 
 ---
 
-## Additional Research Influencing v0.6 Design
+### A8. Self-Reflection (`losion/agent/reflection.py`)
 
-| Research | Source | Impact on Losion |
-|----------|--------|------------------|
-| Anthropic's Attention Interpretability | transformer-circuits.pub/2025/attention-update/ | Multi-head coordination analysis — informed how to preserve critical attention patterns in hybrid SSM+Attention architecture |
-| "The Hidden Attention of Mamba Models" (ACL 2025, 134 citations) | aclanthology.org/2025.acl-long.76.pdf | Proves Mamba implicitly computes attention — SSM and attention aren't independent, motivating unified SSM+Attention blocks |
-| Anthropic's "Context Engineering" (Sep 2025) | anthropic.com/engineering/effective-context-engineering | Attention budget analysis — directly motivates SSM for long-range state where attention is wasteful |
-| Claude Mythos System Card (Apr 2026) | Anthropic official documentation | Behavioral observations informing OpenMythos reconstruction |
-| Jamba / Jamba-1.5 (AI21 Labs) | arXiv:2403.19887, ICLR 2025 | Pioneering hybrid Transformer-Mamba-MoE with 1:7 attention-to-SSM ratio |
-| MoBA (Moonshot AI, NeurIPS 2025) | neurips.cc/virtual/2025/poster/117997 | MoE routing applied to attention — unifies MoE+Attention in single framework |
-| Routing Mamba (Microsoft, NeurIPS 2025) | neurips.cc/virtual/2025/poster/116256 | MoE over SSM projections — the missing piece for SSM+MoE integration |
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Shinn, N. et al. (Northeastern) | "Reflexion: Language Agents with Verbal Reinforcement Learning" | 2023 | Agents learn from verbal feedback rather than parameter updates, storing reflections for future decisions |
+| Madaan, A. et al. | "Self-Refine: Iterative Refinement with Self-Feedback" | 2023 | Iterative self-improvement through structured feedback loops |
+| — | "ExACT: Reflective MCTS" | 2024 | Combines reflection with tree search |
+
+**What we adapted:** Reflexion-inspired verbal feedback: after each action, evaluate outcome quality and generate structured reflection with lesson learned. Self-Refine-inspired strategy corrections when confidence drops. Six reflection types including action success/failure, strategy correction, tool trust updates, skill refinement, and confidence recalibration.
+
+---
+
+### A9. Adaptive Calibration (`losion/agent/calibration.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| — | "ATTC: Adaptive Tool Trust Calibration for LLMs" | 2026 | Guides models to adaptively choose between tools vs. answering directly based on confidence scoring |
+| — | "Alignment for Efficient Tool Calling of LLMs" | EMNLP 2025 | Gradual decline in tool usage as model accuracy increases |
+
+**What we adapted:** Dynamic threshold calibration with three signals: domain profiles (7 domain-specific threshold sets), tool trust scores (EMA-based reliability tracking per tool per domain), and episodic experience. Successful actions lower thresholds (use more eagerly); failed actions raise them (use more cautiously).
+
+---
+
+### A10. Episodic Memory with Forgetting (`losion/agent/memory.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Park, J. et al. (Stanford/Google) | "Generative Agents: Interactive Simulacra of Human Behavior" | 2023, landmark | Multi-factor retrieval: recency × importance × relevance scoring for memory |
+| Zhong, W. et al. | "MemoryBank: Enhancing Large Language Models with Long-Term Memory" | 2023, cited 790× | Ebbinghaus forgetting curve — memories decay over time, reinforced by access |
+| — | "Synapse: Empowering LLM Agents with Episodic-Semantic Memory via Spreading Activation" | 2024 | Spreading activation — related memories activated with decreasing strength |
+| — | "MemP: Exploring Agent Procedural Memory" | 2025 | Procedural memory is separate from semantic memory |
+| — | "A-MEM: Agentic Memory" | 2025 | Agent-native memory with structured attributes and LLM-curated knowledge |
+
+**What we adapted:** Four-layer memory architecture (Working, Semantic/Engram, Episodic, Procedural/SkillStore). Ebbinghaus forgetting curve with access reinforcement. Multi-factor retrieval (recency × importance × relevance × effective_strength). Spreading activation for generalization. Periodic consolidation: merge similar episodes, discard weak ones.
+
+---
+
+### A11. Meta-Skill System (`losion/agent/meta_skills.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| — | "CASCADE: Cumulative Agentic Skill Creation through Autonomous Development and Evolution" | 2025 | Meta-skills: the ability to learn HOW to learn skills, not just individual skills |
+| — | "SoK: Beyond Tool Use in LLM Agents — Agentic Skills" | 2026 | Skill abstraction layer distinct from tools with applicability, composability, and security |
+| Wang, L. et al. (NVIDIA) | "Voyager: An Open-Ended Embodied Agent with Large Language Models" | 2023, cited 2,174× | Skill library storing reusable executable programs with iterative refinement |
+| — | "CREATOR: Disentangling Abstract and Concrete Reasoning for Tool Creation" | 2023, cited 127× | Two-phase tool creation: abstract documentation first, then concrete implementation |
+| Cai, T. et al. | "LATM: Large Language Models As Tool Makers" | 2023, cited 293× | Closed-loop: tool maker creates, tool user applies, tools persist across tasks |
+
+**What we adapted:** Three meta-skills: (1) SkillSynthesis — multi-query search with cross-referencing and test case generation, (2) SkillVerification — Bayesian confidence updates from test results, (3) SkillComposition — decompose complex tasks into skill chains with compatibility checking. Voyager-style executable skills with preconditions/postconditions/error patterns.
+
+---
+
+### A12. Self-Improving Agents — Training Integration
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Chen, Z. et al. | "FireAct: Toward Language Agent Fine-tuning" | 2023, cited 218× | Fine-tuning on agent trajectories improves both agent performance and general LLM capabilities |
+| Zeng, A. et al. (Tsinghua) | "AgentTuning: Enabling Generalized Agent Abilities for LLMs" | 2023 | Mixing agent trajectories with general instructions at ~50% ratio prevents catastrophic forgetting |
+
+**What we adapted:** Episodic memory as source for agent fine-tuning data. AgentTuning-style data mixing: successful episodes + general training data at ~50% ratio. FireAct-inspired trajectory collection from agent interactions.
 
 ---
 

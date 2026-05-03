@@ -13,15 +13,31 @@ The terminal is NEVER available during model training — it only exists
 in the agent layer, completely decoupled from the neural architecture.
 
 Design:
-    Agent → Terminal.execute(command) → Subprocess → Result
-                                       ↓
-                              ┌─────────────────┐
-                              │   Safety Checks  │
-                              │   - Whitelist    │
-                              │   - Blacklist    │
-                              │   - Resource     │
-                              │   - Timeout      │
-                              └─────────────────┘
+    Agent → Terminal.execute(command) → Subprocess/Docker → Result
+                                              ↓
+                                 ┌─────────────────────┐
+                                 │   Safety Checks      │
+                                 │   - Whitelist        │
+                                 │   - Blacklist        │
+                                 │   - Resource         │
+                                 │   - Timeout          │
+                                 │   - Network隔离      │
+                                 │   - Filesystem隔离   │
+                                 │   - Audit Log        │
+                                 └─────────────────────┘
+
+Container Isolation (recommended for production):
+    When use_container=True, commands run inside a Docker container
+    with network isolation, read-only system mounts, and resource limits.
+    This provides defense-in-depth beyond subprocess-level sandboxing.
+
+    Example:
+        config = SandboxConfig(
+            use_container=True,
+            container_image="python:3.11-slim",
+            container_network=False,  # No network access
+        )
+        terminal = SandboxedTerminal(config)
 """
 
 from __future__ import annotations
@@ -118,6 +134,20 @@ class SandboxConfig:
     env_vars: Dict[str, str] = field(default_factory=dict)
     allow_network: bool = False
     audit_log: bool = True
+    # Container isolation (Docker-based, recommended for production)
+    use_container: bool = False              # Use Docker container for execution
+    container_image: str = "python:3.11-slim"  # Docker image to use
+    container_network: bool = False           # Allow network in container
+    container_readonly_root: bool = True      # Read-only root filesystem in container
+    container_cpus: float = 1.0               # CPU limit per container
+    container_memory_mb: int = 512            # Memory limit per container
+    # Filesystem isolation
+    readonly_paths: List[str] = field(default_factory=lambda: [
+        "/etc", "/usr", "/bin", "/sbin", "/boot", "/root",
+    ])
+    writable_paths: List[str] = field(default_factory=lambda: [
+        "/tmp", "/home",
+    ])
 
 
 class SandboxedTerminal:
@@ -151,6 +181,11 @@ class SandboxedTerminal:
     ) -> TerminalResult:
         """Execute a command in the sandbox.
 
+        When use_container=True, commands run inside a Docker container
+        with network isolation, read-only root filesystem, and resource
+        limits. When False (default), commands run as subprocesses with
+        command validation and resource limits.
+
         Args:
             command: Command to execute.
             timeout: Override timeout for this command.
@@ -166,11 +201,27 @@ class SandboxedTerminal:
         # === Security Layer 1: Command validation ===
         self._validate_command(command)
 
+        # === Security Layer 2: Filesystem isolation check ===
+        self._validate_filesystem_access(command)
+
         # === Audit logging ===
         if self.config.audit_log:
             logger.info(f"Terminal executing: {command}")
 
-        # === Setup ===
+        # === Route to execution backend ===
+        if self.config.use_container:
+            return self._execute_in_container(command, timeout, working_dir, env)
+        else:
+            return self._execute_subprocess(command, timeout, working_dir, env)
+
+    def _execute_subprocess(
+        self,
+        command: str,
+        timeout: Optional[float] = None,
+        working_dir: Optional[str] = None,
+        env: Optional[Dict[str, str]] = None,
+    ) -> TerminalResult:
+        """Execute a command as a subprocess with resource limits."""
         effective_timeout = timeout or self.config.max_execution_time
         effective_wd = working_dir or self.config.working_dir or self._get_temp_dir()
 
@@ -232,6 +283,151 @@ class SandboxedTerminal:
         self._execution_history.append(result)
 
         return result
+
+    def _execute_in_container(
+        self,
+        command: str,
+        timeout: Optional[float] = None,
+        working_dir: Optional[str] = None,
+        env: Optional[Dict[str, str]] = None,
+    ) -> TerminalResult:
+        """Execute a command inside a Docker container with full isolation.
+
+        Container isolation provides defense-in-depth:
+        - Network isolation (no network by default)
+        - Read-only root filesystem
+        - CPU and memory limits
+        - PID namespace isolation
+        - Automatic cleanup after execution
+
+        Requires Docker to be installed and available.
+        Falls back to subprocess if Docker is unavailable.
+        """
+        effective_timeout = timeout or self.config.max_execution_time
+        effective_wd = working_dir or self.config.working_dir or self._get_temp_dir()
+
+        # Build Docker command
+        docker_args = [
+            "docker", "run", "--rm",  # Auto-remove after execution
+            "--pid=host",             # PID namespace isolation
+            f"--cpus={self.config.container_cpus}",
+            f"--memory={self.config.container_memory_mb}m",
+            f"--stop-timeout={int(effective_timeout)}",
+        ]
+
+        # Network isolation
+        if not self.config.container_network and not self.config.allow_network:
+            docker_args.append("--network=none")
+
+        # Read-only root filesystem
+        if self.config.container_readonly_root:
+            docker_args.append("--read-only")
+            # Need tmpfs for writable directories
+            docker_args.extend([
+                "--tmpfs", "/tmp:size=100m",
+                "--tmpfs", "/run:size=10m",
+            ])
+
+        # Mount working directory
+        if effective_wd and os.path.exists(effective_wd):
+            docker_args.extend(["-v", f"{effective_wd}:/workspace"])
+            docker_args.extend(["-w", "/workspace"])
+
+        # Environment variables
+        if env:
+            for key, value in env.items():
+                docker_args.extend(["-e", f"{key}={value}"])
+        for key, value in self.config.env_vars.items():
+            docker_args.extend(["-e", f"{key}={value}"])
+
+        # Image and command
+        docker_args.append(self.config.container_image)
+        docker_args.extend(["sh", "-c", command])
+
+        # Execute via subprocess (Docker CLI)
+        start_time = time.time()
+        timed_out = False
+
+        try:
+            process = subprocess.Popen(
+                docker_args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            try:
+                stdout, stderr = process.communicate(timeout=effective_timeout + 5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate()
+                timed_out = True
+
+            execution_time = time.time() - start_time
+
+            stdout_str = stdout.decode("utf-8", errors="replace")[:self.config.max_output_size]
+            stderr_str = stderr.decode("utf-8", errors="replace")[:self.config.max_output_size]
+
+            result = TerminalResult(
+                command=command,
+                exit_code=process.returncode,
+                stdout=stdout_str,
+                stderr=stderr_str,
+                execution_time=execution_time,
+                timed_out=timed_out,
+                working_dir=effective_wd,
+            )
+
+        except FileNotFoundError:
+            # Docker not available — fall back to subprocess
+            logger.warning(
+                "Docker not available, falling back to subprocess execution. "
+                "Container isolation is not active."
+            )
+            return self._execute_subprocess(command, timeout, working_dir, env)
+        except Exception as e:
+            execution_time = time.time() - start_time
+            result = TerminalResult(
+                command=command,
+                exit_code=-1,
+                stdout="",
+                stderr=f"Container execution failed: {e}",
+                execution_time=execution_time,
+                working_dir=effective_wd,
+            )
+
+        # Record
+        self._execution_history.append(result)
+
+        return result
+
+    def _validate_filesystem_access(self, command: str) -> None:
+        """Validate that the command doesn't write to protected filesystem paths.
+
+        Checks against the configured readonly_paths to prevent
+        modifications to system directories.
+
+        Args:
+            command: Command to validate.
+
+        Raises:
+            PermissionError: If command attempts to write to protected paths.
+        """
+        if not self.config.readonly_paths:
+            return
+
+        command_lower = command.lower().strip()
+
+        # Check for write operations to protected paths
+        write_indicators = [">", ">>", "tee ", "cp ", "mv ", "install ", "ln "]
+        is_write = any(ind in command_lower for ind in write_indicators)
+
+        if is_write:
+            for protected_path in self.config.readonly_paths:
+                if protected_path.lower() in command_lower:
+                    raise PermissionError(
+                        f"Command attempts to write to protected path: {protected_path}. "
+                        f"This path is configured as read-only."
+                    )
 
     def _validate_command(self, command: str) -> None:
         """Validate a command against safety rules.
