@@ -256,8 +256,9 @@
       "finite": true
     },
     "SymbolicMoERouter": {
-      "status": "FAIL",
-      "error": "SymbolicMoERouter.__init__() got an unexpected keyword argument 'num_experts'"
+      "status": "OK",
+      "shape": [2, 16, 3],
+      "finite": true
     },
     "AdaptiveRouter": {
       "status": "OK",

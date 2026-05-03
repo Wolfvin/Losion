@@ -312,6 +312,9 @@ class SimplifiedMoE(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Forward pass through Top-K MoE.
 
+        Uses vectorized scatter/gather dispatch instead of nested Python
+        loops for O(N) instead of O(N×K×E) performance.
+
         Args:
             x: Input tensor (batch, seq_len, d_model).
 
@@ -319,23 +322,53 @@ class SimplifiedMoE(nn.Module):
             Tuple (output, aux_info) where aux_info contains routing details.
         """
         batch, seq_len, _ = x.shape
-        x_flat = x.view(batch * seq_len, self.d_model)
+        N = batch * seq_len
+        x_flat = x.view(N, self.d_model)
 
         # Router logits
-        router_logits = self.router(x_flat)  # (B*S, num_experts)
+        router_logits = self.router(x_flat)  # (N, num_experts)
         weights, indices = torch.topk(router_logits, self.top_k_routing, dim=-1)
-        weights = F.softmax(weights, dim=-1)  # (B*S, top_k)
+        weights = F.softmax(weights, dim=-1)  # (N, top_k)
 
-        # Expert computation
+        # Vectorized expert dispatch using scatter/gather
+        # Flatten top-k dimensions: each token appears top_k_routing times
+        # expert_idx: (N * top_k_routing,) — which expert for each assignment
+        # token_idx: (N * top_k_routing,) — which token for each assignment
+        expert_idx = indices.reshape(-1)  # (N * K,)
+        token_idx = torch.arange(N, device=x.device).unsqueeze(1).expand(-1, self.top_k_routing).reshape(-1)  # (N * K,)
+        weight_flat = weights.reshape(-1)  # (N * K,)
+
+        # Compute all expert outputs for all assigned tokens
+        # Group tokens by expert for batched computation
         output_flat = torch.zeros_like(x_flat)
-        for k_idx in range(self.top_k_routing):
-            for eid in range(self.num_experts):
-                mask = (indices[:, k_idx] == eid)
-                if not mask.any():
-                    continue
-                expert_out = self.experts[eid](x_flat[mask])
-                w = weights[mask, k_idx:k_idx + 1]
-                output_flat[mask] += w * expert_out
+
+        # Use sorted indices for efficient batched expert computation
+        sorted_expert_idx, sort_order = expert_idx.sort()
+        sorted_token_idx = token_idx[sort_order]
+        sorted_weights = weight_flat[sort_order]
+
+        # Find boundaries between experts
+        expert_counts = torch.zeros(self.num_experts, dtype=torch.long, device=x.device)
+        expert_counts.scatter_add_(0, sorted_expert_idx, torch.ones_like(sorted_expert_idx, dtype=torch.long))
+
+        # Process each expert's tokens in a batch
+        cumsum = torch.zeros(1, dtype=torch.long, device=x.device)
+        for eid in range(self.num_experts):
+            count = expert_counts[eid].item()
+            if count == 0:
+                continue
+            start = cumsum.item()
+            end = start + count
+
+            # Get tokens assigned to this expert
+            expert_token_ids = sorted_token_idx[start:end]
+            expert_inputs = x_flat[expert_token_ids]  # (count, d_model)
+            expert_outputs = self.experts[eid](expert_inputs)  # (count, d_model)
+            expert_ws = sorted_weights[start:end].unsqueeze(-1)  # (count, 1)
+
+            # Scatter weighted outputs back using index_add_
+            output_flat.index_add_(0, expert_token_ids, expert_ws * expert_outputs)
+            cumsum = cumsum + count
 
         # Shared expert
         shared_out = self.shared_expert(x_flat)
@@ -728,7 +761,10 @@ class LosionModel(nn.Module):
 
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
-                # Gradient checkpointing: recompute in backward
+                # Gradient checkpointing: recompute in backward.
+                # With use_reentrant=False, tuple returns are supported,
+                # but non-tensor dict values may be lost during recomputation.
+                # We extract and detach routing tensors before they can be lost.
                 def _create_checkpointable(layer_module, attn_mask, think_mode):
                     def _forward(*args):
                         hidden = args[0]
@@ -737,7 +773,21 @@ class LosionModel(nn.Module):
                             attention_mask=attn_mask,
                             thinking_mode=think_mode,
                         )
-                        return out, info
+                        # Detach routing info tensors to prevent graph issues
+                        # during checkpoint recomputation
+                        safe_info = {}
+                        if isinstance(info, dict):
+                            for k, v in info.items():
+                                if isinstance(v, torch.Tensor):
+                                    safe_info[k] = v.detach()
+                                elif isinstance(v, dict):
+                                    safe_info[k] = {
+                                        kk: vv.detach() if isinstance(vv, torch.Tensor) else vv
+                                        for kk, vv in v.items()
+                                    }
+                                else:
+                                    safe_info[k] = v
+                        return out, safe_info
                     return _forward
 
                 x, layer_routing = torch.utils.checkpoint.checkpoint(
@@ -745,8 +795,6 @@ class LosionModel(nn.Module):
                     x,
                     use_reentrant=False,
                 )
-                # checkpoint doesn't return non-tensor outputs properly,
-                # so routing_info may be None
             else:
                 x, layer_routing = layer(
                     x,

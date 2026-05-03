@@ -561,15 +561,13 @@ class GatedMultiHeadAttention(nn.Module):
         elif not self.use_mla and cached_kv is not None:
             offset = cached_kv.shape[1]
 
-        q_rope = q[..., : self.d_kv // 2].contiguous()
-        k_rope = k[..., : self.d_kv // 2].contiguous()
-
-        q_rope = self.rope(q_rope, offset=offset)
-        k_rope = self.rope(k_rope, offset=0)
-
-        half = self.d_kv // 2
-        q = torch.cat([q_rope, q[..., half:]], dim=-1)
-        k = torch.cat([k_rope, k[..., half:]], dim=-1)
+        # Apply RoPE to full q/k tensors — InterleavedRoPE handles
+        # d_rope vs dim internally: it rotates the first d_rope dimensions
+        # and leaves the rest unchanged (when interleaved=False).
+        # Passing the full tensor (last dim == self.dim) ensures correct
+        # head detection (has_heads=True for 4D input).
+        q = self.rope(q, offset=offset)
+        k = self.rope(k, offset=0)
 
         # ---- KV cache handling ----
         if self.use_mla:
@@ -583,10 +581,8 @@ class GatedMultiHeadAttention(nn.Module):
             k_full = self.k_up_proj(c_kv_full).view(batch, -1, self.n_heads, self.d_kv)
             v_full = self.v_up_proj(c_kv_full).view(batch, -1, self.n_heads, self.d_kv)
 
-            # Apply RoPE to reconstructed K
-            k_full_rope = k_full[..., :half].contiguous()
-            k_full_rope = self.rope(k_full_rope, offset=0)
-            k_full = torch.cat([k_full_rope, k_full[..., half:]], dim=-1)
+            # Apply RoPE to reconstructed K (full tensor)
+            k_full = self.rope(k_full, offset=0)
 
             present_kv = (c_kv_full, None)
         else:

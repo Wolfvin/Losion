@@ -202,14 +202,39 @@ class _FallbackMoE(nn.Module):
     def forward(self, x):
         logits = self.router(x)
         weights = F.softmax(logits, dim=-1)
-        top_w, top_idx = weights.topk(2, dim=-1)
-        out = torch.zeros_like(x)
-        for k in range(2):
-            for eid in range(len(self.experts)):
-                mask = (top_idx[..., k] == eid)
-                if mask.any():
-                    out[mask] += top_w[mask, k:k+1] * self.experts[eid](x[mask])
-        out = out + self.shared_expert(x)
+        top_k = 2
+        top_w, top_idx = weights.topk(top_k, dim=-1)
+
+        # Vectorized dispatch: sort by expert for batched computation
+        N = x.shape[:-1].numel()
+        d_model = x.shape[-1]
+        x_flat = x.reshape(N, d_model)
+        expert_idx = top_idx.reshape(-1)
+        token_idx = torch.arange(N, device=x.device).unsqueeze(1).expand(-1, top_k).reshape(-1)
+        weight_flat = top_w.reshape(-1)
+
+        sorted_expert_idx, sort_order = expert_idx.sort()
+        sorted_token_idx = token_idx[sort_order]
+        sorted_weights = weight_flat[sort_order]
+
+        num_experts = len(self.experts)
+        expert_counts = torch.zeros(num_experts, dtype=torch.long, device=x.device)
+        expert_counts.scatter_add_(0, sorted_expert_idx, torch.ones_like(sorted_expert_idx, dtype=torch.long))
+
+        out_flat = torch.zeros_like(x_flat)
+        cumsum = 0
+        for eid in range(num_experts):
+            count = expert_counts[eid].item()
+            if count == 0:
+                continue
+            expert_token_ids = sorted_token_idx[cumsum:cumsum + count]
+            expert_inputs = x_flat[expert_token_ids]
+            expert_outputs = self.experts[eid](expert_inputs)
+            expert_ws = sorted_weights[cumsum:cumsum + count].unsqueeze(-1)
+            out_flat.index_add_(0, expert_token_ids, expert_ws * expert_outputs)
+            cumsum += count
+
+        out = out_flat.view_as(x) + self.shared_expert(x)
         return out, {"router_logits": logits}
 
 

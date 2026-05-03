@@ -1,7 +1,28 @@
 """
 Losion — Hybrid AI Framework with Tri-Jalur Router Architecture.
 
-Version 1.0.0 — "Verified & Alive"
+Version 1.2.0 — "Bug-Squash Release"
+
+v1.2.0 Bug Fixes & Improvements:
+  - [CRITICAL] GatedAttention: Fixed tensor dimension mismatch in RoPE application.
+    InterleavedRoPE now receives full (batch, seq_len, n_heads, d_kv) tensors
+    instead of sliced (batch, seq_len, n_heads, d_kv//2) tensors, fixing the
+    "Tensors must have same number of dimensions: got 2 and 3" error.
+  - [CRITICAL] SymbolicMoERouter: Fixed API mismatch in test script.
+    SymbolicMoERouter is a skill→pathway router, not an expert router;
+    removed invalid num_experts/num_active_experts kwargs.
+  - [CRITICAL] MoBA: Added dimension guards for 2D input and 3D KV cache,
+    plus safer unpacking of past_key_value tuples.
+  - [WARNING] ThinkingToggle: Fixed dead gradients in task_classifier and
+    context_integrator. Added gradient scaling buffers (10x) with
+    straight-through estimator to amplify gradient signal through mean
+    aggregation. Updated compute_auxiliary_loss() with matching scaling.
+  - [WARNING] SimplifiedMoE/_FallbackMoE: Replaced O(N×K×E) nested Python
+    loops with vectorized sort-based scatter/gather dispatch using index_add_.
+  - [WARNING] Version sync: Unified version to 1.2.0 across __init__.py,
+    pyproject.toml, and setup.py.
+  - [INFO] Gradient checkpointing: Improved routing_info preservation by
+    storing detach-safe copies of routing tensors.
 
 v1.0.0 End-to-End Verified:
   All 40+ components have been tested with actual forward+backward passes.
@@ -48,6 +69,6 @@ Router:  Adaptive (BiasRouter + ThinkingToggle + Symbolic-MoE), GRPO/DAPO-traine
          + Router ↔ Expert Co-Evolution (Evoformer Level 5)
 """
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 __author__ = "Losion Contributors"
 __license__ = "MIT"

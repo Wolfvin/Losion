@@ -640,6 +640,8 @@ class MoBAAttention(nn.Module):
         Returns:
             Query tensor, shape ``(batch, seq_len, n_heads, d_head)``.
         """
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
         batch, seq_len, _ = x.shape
         q = self.q_proj(x)
         return q.view(batch, seq_len, self.n_heads, self.d_head)
@@ -662,6 +664,8 @@ class MoBAAttention(nn.Module):
             - ``c_kv``: ``(batch, seq_len, kv_lora_rank)`` if MLA,
               else ``None``.
         """
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
         batch, seq_len, _ = x.shape
 
         if self.use_mla_compression:
@@ -881,7 +885,13 @@ class MoBAAttention(nn.Module):
         kv_cache = None
         c_kv_cache = None
         if past_key_value is not None:
-            kv_cache, c_kv_cache = past_key_value
+            if isinstance(past_key_value, tuple):
+                if len(past_key_value) >= 2:
+                    kv_cache, c_kv_cache = past_key_value[0], past_key_value[1]
+                else:
+                    kv_cache = past_key_value[0]
+            else:
+                kv_cache = past_key_value
 
         # ---- Project Q, K, V ----
         q = self._project_q(x)  # (batch, seq_len, n_heads, d_head)
@@ -906,9 +916,17 @@ class MoBAAttention(nn.Module):
             k = k_r
 
         # ---- Concatenate with cache ----
-        if kv_cache is not None:
+        if kv_cache is not None and kv_cache.dim() == 4:
             past_k = kv_cache[:, :, :, :self.d_head]
             past_v = kv_cache[:, :, :, self.d_head:]
+            k_full = torch.cat([past_k, k], dim=1)
+            v_full = torch.cat([past_v, v], dim=1)
+        elif kv_cache is not None and kv_cache.dim() == 3:
+            # Fallback: treat as (batch, past_len, d_inner) and reshape
+            past_k = kv_cache[:, :, :self.d_inner // 2].view(
+                batch, -1, self.n_heads, self.d_head)
+            past_v = kv_cache[:, :, self.d_inner // 2:].view(
+                batch, -1, self.n_heads, self.d_head)
             k_full = torch.cat([past_k, k], dim=1)
             v_full = torch.cat([past_v, v], dim=1)
         else:
@@ -919,6 +937,9 @@ class MoBAAttention(nn.Module):
 
         # ---- Routing ----
         n_blocks = self.partitioner.num_blocks(full_len)
+        # Guard: if sequence is too short for block routing, skip MoBA routing
+        # and use standard attention instead
+        effective_top_k = min(self.top_k_blocks, n_blocks)
 
         # Build d_model-dimensional KV representation for the router.
         # The router expects d_model input, so we project from d_inner.

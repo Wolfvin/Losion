@@ -624,7 +624,7 @@ def test_individual_components(config: LosionConfig):
     # SymbolicMoERouter
     try:
         from losion.core.retrieval.symbolic_moe import SymbolicMoERouter
-        component = SymbolicMoERouter(d_model=d_model, num_experts=4, num_active_experts=2).to(device)
+        component = SymbolicMoERouter(d_model=d_model, routing_mode="soft").to(device)
         out = component(x)
         output = out[0] if isinstance(out, tuple) else out
         results["SymbolicMoERouter"] = {"status": "OK", "shape": list(output.shape), "finite": bool(torch.isfinite(output).all())}

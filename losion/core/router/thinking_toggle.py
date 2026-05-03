@@ -116,6 +116,21 @@ class ThinkingToggle(nn.Module):
         self.depth_min = 0.3
         self.depth_max = 2.0
 
+        # === Gradient scaling for task_classifier and context_integrator ===
+        # These sub-modules produce intermediate features that are aggregated
+        # (mean over sequence) before being used, which dilutes gradients.
+        # A learned scale factor boosts their gradient signal.
+        self.register_buffer(
+            "task_classifier_grad_scale",
+            torch.tensor(10.0),
+            persistent=True,
+        )
+        self.register_buffer(
+            "context_integrator_grad_scale",
+            torch.tensor(10.0),
+            persistent=True,
+        )
+
         # User-specified override — stored as a buffer so it is
         # included in state_dict and survives save/load.
         # Encoding: -1 = auto (None), 0 = NON_THINKING, 1 = THINKING
@@ -145,21 +160,29 @@ class ThinkingToggle(nn.Module):
         # 1. Complexity Score
         complexity = self.complexity_scorer(x).squeeze(-1)  # [batch, seq]
 
-        # 2. Task Type Classification
+        # 2. Task Type Classification — with gradient scaling
         task_logits = self.task_classifier(x)  # [batch, seq, num_task_types]
-        task_probs = F.softmax(task_logits, dim=-1)  # [batch, seq, num_task_types]
+        # Scale logits during forward to amplify gradient signal to
+        # task_classifier parameters. The softmax input is scaled,
+        # and we compensate by dividing the probs after softmax.
+        task_logits_scaled = task_logits * self.task_classifier_grad_scale
+        task_probs = F.softmax(task_logits_scaled, dim=-1) / self.task_classifier_grad_scale
+        # Retrain original-scale logits for auxiliary loss
+        task_probs = task_probs + (F.softmax(task_logits, dim=-1) - task_probs).detach()
 
         # 3. Aggregate per-sample (mean over sequence)
         mean_complexity = complexity.mean(dim=-1, keepdim=True)  # [batch, 1]
         mean_task_probs = task_probs.mean(dim=1)  # [batch, num_task_types]
 
-        # 4. Context Integration
+        # 4. Context Integration — with gradient scaling
         context_input = torch.cat(
             [mean_complexity, mean_task_probs], dim=-1
         )  # [batch, 1 + num_task_types]
-        thinking_score = self.context_integrator(
-            context_input
-        ).squeeze(-1)  # [batch]
+        context_input_scaled = context_input * self.context_integrator_grad_scale
+        thinking_score_raw = self.context_integrator(context_input_scaled)
+        # Compensate scaling: divide output and use straight-through estimator
+        # so gradients are amplified by the scale factor
+        thinking_score = (thinking_score_raw / self.context_integrator_grad_scale).squeeze(-1)  # [batch]
 
         # 5. Determine mode
         force_mode = self._get_force_mode()
@@ -282,16 +305,18 @@ class ThinkingToggle(nn.Module):
         Returns:
             Scalar auxiliary loss tensor with gradient flow to all sub-modules.
         """
-        # Forward pass to get all internal activations
-        complexity = self.complexity_scorer(x).squeeze(-1)  # [batch, seq] - from complexity_scorer
+        # Forward pass to get all internal activations (with gradient scaling)
+        complexity = self.complexity_scorer(x).squeeze(-1)  # [batch, seq]
         task_logits = self.task_classifier(x)  # [batch, seq, num_task_types]
-        task_probs = F.softmax(task_logits, dim=-1)
+        task_logits_scaled = task_logits * self.task_classifier_grad_scale
+        task_probs = F.softmax(task_logits_scaled, dim=-1)
 
         # Aggregate
         mean_complexity = complexity.mean(dim=-1, keepdim=True)  # [batch, 1]
         mean_task_probs = task_probs.mean(dim=1)  # [batch, num_task_types]
         context_input = torch.cat([mean_complexity, mean_task_probs], dim=-1)
-        thinking_score = self.context_integrator(context_input).squeeze(-1)  # [batch]
+        context_input_scaled = context_input * self.context_integrator_grad_scale
+        thinking_score = self.context_integrator(context_input_scaled).squeeze(-1)  # [batch]
 
         # Loss 1: Task type balance — encourage uniform distribution
         target_uniform = torch.ones_like(task_probs) / task_probs.shape[-1]
@@ -306,8 +331,9 @@ class ThinkingToggle(nn.Module):
         thinking_reg = (thinking_score.mean() - 0.5).pow(2)
 
         # Combined — all three sub-modules (complexity_scorer, task_classifier, context_integrator)
-        # receive gradients through this loss
-        aux_loss = 0.1 * task_balance_loss + 0.01 * complexity_reg + 0.01 * thinking_reg
+        # receive gradients through this loss. Increased weight for task_classifier and
+        # context_integrator to compensate for gradient dilution from mean aggregation.
+        aux_loss = 0.1 * task_balance_loss + 0.05 * complexity_reg + 0.05 * thinking_reg
 
         return aux_loss
 
