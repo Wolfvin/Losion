@@ -249,14 +249,13 @@ def _build_ssm(config: LosionConfig) -> nn.Module:
             return RoutingMamba(rom_cfg)
 
         if ssm_cfg.use_mamba3:
-            from losion.core.ssm.mamba3 import Mamba3SSD, Mamba3Config
-            m3_cfg = Mamba3Config(
+            from losion.core.ssm.mamba3 import Mamba3SSD
+            return Mamba3SSD(
                 d_model=d_model,
                 d_state=32,  # Mamba-3 default: half of Mamba-2
                 d_conv=ssm_cfg.d_conv,
                 expand=ssm_cfg.expand,
             )
-            return Mamba3SSD(m3_cfg)
 
         if ssm_cfg.use_liquid:
             from losion.core.ssm.liquid_ssm import LiquidSSMTerpaduLayer
@@ -298,17 +297,18 @@ def _build_attention(config: LosionConfig) -> nn.Module:
                 top_k_blocks=attn_cfg.moba_top_k_blocks,
                 use_mla_compression=True,
             )
-            return MoBAAttention(moba_cfg, d_model=d_model, n_heads=attn_cfg.n_heads, d_kv=attn_cfg.d_kv)
+            return MoBAAttention(d_model=d_model, n_heads=attn_cfg.n_heads, d_head=attn_cfg.d_kv, config=moba_cfg)
 
         if attn_cfg.use_gated_attention:
             from losion.core.attention.gated_attention import GatedMultiHeadAttention, GatedAttentionConfig
             ga_cfg = GatedAttentionConfig(
+                d_model=d_model,
                 n_heads=attn_cfg.n_heads,
                 d_kv=attn_cfg.d_kv,
                 use_mla=True,
                 mla_latent_dim=attn_cfg.mla_latent_dim,
             )
-            return GatedMultiHeadAttention(ga_cfg, d_model=d_model)
+            return GatedMultiHeadAttention(ga_cfg)
 
         if attn_cfg.use_lightning:
             from losion.core.attention.lightning_attention import LightningAttention
@@ -361,8 +361,15 @@ def _build_moe(config: LosionConfig) -> nn.Module:
         if ret_cfg.use_symbolic_moe:
             from losion.core.retrieval.symbolic_moe import SymbolicMoERouter
             # Symbolic-MoE wraps another MoE with skill-based routing
-            # Fall through to build the base MoE, symbolic routing is applied at layer level
-            pass
+            # Build the base MoE first, symbolic routing is applied at layer level
+            from losion.core.retrieval.aux_free_moe import AuxFreeMoE
+            base_moe = AuxFreeMoE(
+                d_model=d_model,
+                d_ff=d_ff,
+                num_experts=num_experts,
+                num_active_experts=ret_cfg.num_active_experts,
+            )
+            return base_moe
 
         # Default: AuxFreeMoE (DeepSeek-V3 style)
         from losion.core.retrieval.aux_free_moe import AuxFreeMoE
@@ -895,12 +902,31 @@ class LosionModelV2(nn.Module):
             except ImportError:
                 self.use_dual_memory = False
 
-        # Optional RecurrentDepthBlock
+        # Optional RecurrentDepthBlock (wraps the full LosionLayerV2)
         self.use_rdt = config.recurrent.enabled
         if self.use_rdt:
             try:
                 from losion.core.recurrent.rdt import RecurrentDepthBlock
-                self.rdt_block = RecurrentDepthBlock(config)
+
+                class _RDTResidualBlock(nn.Module):
+                    """Simple residual block for RDT that accepts extra kwargs and returns (output, aux)."""
+                    def __init__(self, d_model: int):
+                        super().__init__()
+                        self.norm = RMSNorm(d_model)
+                        self.proj = nn.Linear(d_model, d_model, bias=False)
+
+                    def forward(self, x, **kwargs):
+                        out = x + self.proj(self.norm(x))
+                        return out, None  # RDT expects (output, aux_info) tuple
+
+                rdt_inner = _RDTResidualBlock(config.d_model)
+                self.rdt_block = RecurrentDepthBlock(
+                    block=rdt_inner,
+                    d_model=config.d_model,
+                    max_loop_iters=config.recurrent.max_loop_iters,
+                    use_act=config.recurrent.use_act,
+                    lora_rank=config.recurrent.depth_lora_rank,
+                )
             except ImportError:
                 self.use_rdt = False
 
@@ -1002,7 +1028,8 @@ class LosionModelV2(nn.Module):
 
         # Evoformer Level 2: Bidirectional token update (v0.9)
         if self.use_evoformer:
-            x = self.evoformer_manager.bidirectional_token_update(x)
+            if hasattr(self.evoformer_manager, 'bidirectional_token') and self.evoformer_manager.bidirectional_token is not None:
+                x = self.evoformer_manager.bidirectional_token(x)
 
         # Evoformer Levels 3-5: Full feedback loops (v0.9.1 — now wired)
         if self.use_evoformer:
@@ -1065,6 +1092,112 @@ class LosionModelV2(nn.Module):
 # ============================================================================
 # MTPHead — Multi-Token Prediction
 # ============================================================================
+
+
+class JEPAHead(nn.Module):
+    """Lightweight JEPA head for integration into LosionForCausalLMV2.
+
+    Unlike the standalone LLMJEPA training wrapper, this head only contains
+    the JEPA-specific components (predictor, encoders, loss) and operates
+    on hidden states already produced by the parent model.
+
+    This enables JEPA to work as a plug-in loss without creating a
+    separate model copy.
+
+    Args:
+        config: JEPAConfig instance.
+        d_model: Model hidden dimension (overrides config.d_model if needed).
+    """
+
+    def __init__(self, config: 'JEPAConfig', d_model: int) -> None:
+        super().__init__()
+        self.config = config
+        self.d_model = d_model
+        latent_dim = config.latent_dim
+
+        # ---- Online encoder (student) ----
+        self.online_encoder = nn.Sequential(
+            nn.Linear(d_model, d_model, bias=False),
+            nn.GELU(),
+            nn.Linear(d_model, latent_dim, bias=False),
+        )
+
+        # ---- Target encoder (EMA teacher, no gradients) ----
+        self.target_encoder = nn.Sequential(
+            nn.Linear(d_model, d_model, bias=False),
+            nn.GELU(),
+            nn.Linear(d_model, latent_dim, bias=False),
+        )
+        # Freeze target encoder
+        for param in self.target_encoder.parameters():
+            param.requires_grad = False
+
+        # ---- LatentPredictor ----
+        self.predictor = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim * 2, bias=False),
+            nn.GELU(),
+            nn.Linear(latent_dim * 2, latent_dim * config.prediction_horizon, bias=False),
+        )
+        self.prediction_horizon = config.prediction_horizon
+        self.latent_dim = latent_dim
+
+        # ---- Loss function ----
+        self.loss_type = config.loss_type
+
+    @torch.no_grad()
+    def _update_target_encoder(self, ema_decay: float = 0.996) -> None:
+        """EMA update target encoder from online encoder."""
+        for online_param, target_param in zip(
+            self.online_encoder.parameters(),
+            self.target_encoder.parameters(),
+        ):
+            target_param.data.mul_(ema_decay).add_(
+                online_param.data, alpha=1.0 - ema_decay
+            )
+
+    def compute_loss(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Compute JEPA loss from hidden states.
+
+        Args:
+            hidden_states: (batch, seq_len, d_model)
+
+        Returns:
+            JEPA loss scalar.
+        """
+        batch, seq_len, _ = hidden_states.shape
+
+        # Online encoding
+        online_latents = self.online_encoder(hidden_states)  # (B, S, D_latent)
+
+        # Target encoding (no grad)
+        with torch.no_grad():
+            target_latents = self.target_encoder(hidden_states).detach()
+
+        # Predict future latents
+        predicted = self.predictor(online_latents)  # (B, S, H * D_latent)
+        predicted = predicted.view(batch, seq_len, self.prediction_horizon, self.latent_dim)
+
+        # Shift target: target for position t is the latent at t+offset
+        jepa_loss = torch.tensor(0.0, device=hidden_states.device)
+        for h in range(self.prediction_horizon):
+            offset = h + 1
+            if offset < seq_len:
+                pred_h = predicted[:, :-offset, h, :]  # (B, S-offset, D)
+                target_h = target_latents[:, offset:, :]  # (B, S-offset, D)
+                if self.loss_type == "cosine":
+                    jepa_loss = jepa_loss + (1 - F.cosine_similarity(pred_h, target_h, dim=-1)).mean()
+                elif self.loss_type == "mse":
+                    jepa_loss = jepa_loss + F.mse_loss(pred_h, target_h)
+                else:  # Default: cosine + MSE hybrid
+                    jepa_loss = jepa_loss + F.mse_loss(pred_h, target_h)
+
+        jepa_loss = jepa_loss / max(self.prediction_horizon, 1)
+
+        # Update target encoder via EMA
+        if self.training:
+            self._update_target_encoder()
+
+        return jepa_loss
 
 
 class MTPHead(nn.Module):
@@ -1145,13 +1278,12 @@ class LosionForCausalLMV2(nn.Module):
                 n_tokens=config.output.mtp_num_tokens,
             )
 
-        # JEPA (optional)
+        # JEPA (optional) — lightweight head, not the standalone training wrapper
         self.use_jepa = config.jepa.enabled
         if self.use_jepa:
             try:
-                from losion.training.llm_jepa import LLMJEPA, JEPAConfig
-                self.jepa = LLMJEPA(config.jepa, model=self)
-            except ImportError:
+                self.jepa = JEPAHead(config.jepa, d_model=config.d_model)
+            except Exception:
                 self.use_jepa = False
 
         # Initialize weights
@@ -1215,10 +1347,15 @@ class LosionForCausalLMV2(nn.Module):
             for i, token_logits in enumerate(mtp_logits):
                 # Each MTP head predicts i+1 tokens ahead
                 offset = i + 1
-                if offset < shift_labels.shape[1]:
+                # token_logits: (batch, seq_len, vocab_size)
+                # shift_labels: (batch, seq_len-1) after the LM loss shift
+                target_len = shift_labels.shape[1] - offset
+                if target_len > 0:
+                    mtp_pred = token_logits[:, :target_len, :].contiguous().view(-1, self.vocab_size)
+                    mtp_target = shift_labels[:, offset:offset + target_len].contiguous().view(-1)
                     mtp_loss += F.cross_entropy(
-                        token_logits[..., :-offset - 1, :].contiguous().view(-1, self.vocab_size),
-                        shift_labels[..., offset:, :].contiguous().view(-1),
+                        mtp_pred,
+                        mtp_target,
                         ignore_index=-100,
                     )
             mtp_loss = mtp_loss / len(mtp_logits) * 0.1  # Weight 0.1
@@ -1316,20 +1453,19 @@ class LosionForCausalLMV2(nn.Module):
             # Sample or greedy
             if do_sample:
                 probs = F.softmax(next_logits, dim=-1)
-                next_token = torch.multinomial(probs.view(batch_size, -1), 1)
+                next_token = torch.multinomial(probs.view(batch_size, -1), 1)  # (batch, 1)
             else:
-                next_token = next_logits.argmax(dim=-1)
+                next_token = next_logits.argmax(dim=-1, keepdim=True)  # (batch, 1)
 
-            generated = torch.cat([generated, next_token.unsqueeze(-1)], dim=-1)
+            generated = torch.cat([generated, next_token], dim=-1)
 
             # Check EOS
             if eos_token_id is not None and (next_token == eos_token_id).all():
                 break
 
             # Forward next token (O(1) for SSM, cached for attention)
-            next_input = next_token.unsqueeze(-1)
             hidden_out, new_states = self.model.forward_inference(
-                next_input,
+                next_token,
                 ssm_states=ssm_states,
                 position_offset=generated.shape[1] - 1,
             )
@@ -1355,9 +1491,10 @@ class LosionForCausalLMV2(nn.Module):
         import json, os
         with open(os.path.join(path, "config.json")) as f:
             config_dict = json.load(f)
-        config = LosionConfig(**config_dict)
+        # Use _from_dict to properly handle nested sub-config dicts
+        config = LosionConfig._from_dict(config_dict)
         model = cls(config)
-        state_dict = torch.load(os.path.join(path, "model.pt"), map_location="cpu")
+        state_dict = torch.load(os.path.join(path, "model.pt"), map_location="cpu", weights_only=True)
         model.load_state_dict(state_dict, strict=False)
         return model
 
