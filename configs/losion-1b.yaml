@@ -1,5 +1,5 @@
 # ============================================================================
-# Losion-1B v0.4 — Konfigurasi Prototipe 1B Parameter
+# Losion-1B v1.0.0 — Konfigurasi Prototipe 1B Parameter
 # ============================================================================
 # Model prototipe untuk eksperimen dan pengembangan. Cukup kecil untuk
 # di-training di single GPU (RTX 4090 / A10G), cukup besar untuk
@@ -11,6 +11,28 @@
 #   - Parallel-head mode (eliminate routing overhead)
 #   - BitNet 1.58-bit quantization
 #   - MTP speculative decoding
+# v0.5 additions:
+#   - Mamba3 SSM backbone
+#   - Structured sparse SSM
+#   - Gated attention
+#   - MoBA block attention
+#   - Cross-Jalur routing
+#   - SMoRe retrieval
+#   - Infinite MoE
+#   - Leap MTP
+#   - Anchored decoder
+# v0.6 additions:
+#   - Recurrent-Depth Transformer
+#   - LLM-JEPA
+# v0.8 additions:
+#   - DAPO
+#   - RLVR
+#   - Expert Prefetching
+# v0.9 additions:
+#   - AttnRes
+#   - Evoformer
+#   - Child-3W
+#   - Dual Memory
 # ============================================================================
 
 model:
@@ -31,6 +53,11 @@ model:
     use_liquid: true
     complexity_bottleneck: 64
     depth_entropy_weight: 0.01
+    # v0.5: Mamba3 & Structured Sparse
+    use_mamba3: false
+    use_routing_mamba: false
+    use_structured_sparse: false
+    structured_sparse_n_groups: 4
 
   attention:
     n_heads: 12
@@ -49,6 +76,14 @@ model:
     use_shared_attention: false  # disabled for 1B (only 12 layers)
     shared_n_groups: 1
     shared_pattern: "all_shared"
+    # v0.5: Gated Attention, MoBA, Cross-Jalur
+    use_gated_attention: false
+    use_moba: false
+    moba_block_size: 512
+    moba_top_k_blocks: 4
+    use_cross_jalur_routing: false
+    cross_jalur_blend_alpha: 0.3
+    cross_jalur_graph_top_k: 8
 
   retrieval:
     num_experts: 16
@@ -65,6 +100,16 @@ model:
     use_gradient_routed: false
     # v0.4: Asymmetric placement
     use_asymmetric: false
+    # v0.5: SMoRe, Symbolic MoE, Infinite MoE
+    use_smore: false
+    smore_num_sub_trees: 4
+    smore_sub_tree_depth: 2
+    use_symbolic_moe: false
+    use_infinite_moe: false
+    infinite_moe_code_dim: 32
+    infinite_moe_hypernet_hidden: 256
+    infinite_moe_low_rank_residual: true
+    infinite_moe_codebook_size: 256
 
   router:
     top_k_pathways: 2
@@ -79,6 +124,14 @@ model:
     # v0.4: MTP Speculative Decoding
     use_speculative: true
     speculative_draft_tokens: 2
+    # v0.5: Leap MTP, Anchored Decoder
+    use_leap_mtp: false
+    leap_mtp_schedule: "geometric"
+    leap_mtp_num_leaps: 4
+    leap_mtp_max_leap: 8
+    use_anchored_decoder: false
+    anchored_n_refine_steps: 3
+    anchored_d_refine: 512
 
   # v0.4: Parallel-head mode for 1B
   use_parallel_head: true
@@ -100,6 +153,79 @@ model:
     enabled: false  # run after training
     search_epochs: 10
     darts_lr: 0.001
+
+  # v0.6: Recurrent-Depth Transformer
+  recurrent:
+    enabled: false
+    max_loop_iters: 8
+    use_lti_stable: true
+    use_act: true
+    act_halting_threshold: 0.99
+    use_depth_lora: true
+    depth_lora_rank: 8
+
+  # v0.6: LLM-JEPA
+  jepa:
+    enabled: false
+    prediction_horizon: 4
+    latent_dim: 256
+    predictor_depth: 3
+    loss_type: "vicreg"
+    teacher_ema_decay: 0.996
+    prediction_weight: 0.1
+
+  # v0.8: DAPO
+  dapo:
+    enabled: false
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    dynamic_sampling: true
+    token_level_loss: true
+    overlong_filter: true
+
+  # v0.8: RLVR
+  rlvr:
+    enabled: false
+    difficulty_schedule: "curriculum"
+    math_tolerance: 1.0e-4
+    code_timeout: 5
+
+  # v0.8: Expert Prefetching
+  prefetch:
+    enabled: false
+    predictor_hidden_dim: 128
+    prefetch_budget: 4
+
+  # v0.9: AttnRes
+  attn_res:
+    enabled: false
+    mode: "block"
+    num_blocks: 8
+    use_gate: true
+    use_token_compression: false
+
+  # v0.9: Evoformer
+  evoformer:
+    enabled: false
+    n_recycling_steps: 3
+    use_layer_recycling: true
+    use_token_recycling: true
+    use_decoder_feedback: true
+    use_prediction_recycling: true
+    use_router_coevolve: true
+
+  # v0.9: Child-3W
+  child_3w:
+    enabled: false
+    num_children: 4
+    top_k_children: 2
+
+  # v0.9: Dual Memory
+  dual_memory:
+    enabled: false
+    working_memory_size: 512
+    long_term_memory_dim: 256
+    consolidation_method: "attention"
 
 training:
   batch_size: 32

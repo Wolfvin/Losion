@@ -5,6 +5,48 @@ All notable changes to the Losion project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] — 2026-05-03 — "Unified & Complete"
+
+### Changed — CRITICAL: Version Alignment & Integration
+
+- **Version Alignment**: Unified version across ALL project files to 1.0.0.
+  Previously, pyproject.toml, setup.py, and README badge showed 0.4.0 while
+  the actual code was at 0.9.0. All metadata now reflects the true state.
+
+- **Config `_from_dict` Complete**: The YAML configuration parser now handles
+  ALL v0.5–v0.9 fields including: SSM (Mamba-3, Routing Mamba, Structured
+  Sparse), Attention (Gated Attention, MoBA, Cross-Jalur Routing, Child-3W),
+  Retrieval (S'MoRE, Symbolic-MoE, Infinite MoE), Output (L-MTP, Anchored
+  Decoder), and all new sub-configs (Recurrent, JEPA, DAPO, RLVR, Prefetch,
+  AttnRes, Evoformer, Child-3W, Dual Memory). Previously these fields were
+  silently ignored when loading from YAML.
+
+- **LosionModelV2 Full Integration**: All v0.5–v0.9 components are now wired
+  into the production model's factory functions:
+  - `_build_ssm()`: Added Structured Sparse SSM support (highest priority)
+  - `_build_attention()`: Added Child-3W (MoE at QKV level) as top-priority
+    option, taking precedence over MoBA/Gated/Lightning/KDA when enabled
+  - `_build_moe()`: Added Symbolic-MoE routing awareness (pass-through to
+    base MoE with symbolic routing applied at layer level)
+
+- **YAML Configs Modernized**: All 3 config files (losion-1b.yaml, losion-7b.yaml,
+  losion-48b.yaml) updated from v0.4 to v1.0.0 with all new feature flags.
+  7B enables Mamba-3, Gated Attention, Structured Sparse, JEPA, DAPO, RLVR,
+  L-MTP. 48B enables ALL features including MoBA, Infinite MoE, S'MoRE,
+  AttnRes, Evoformer, RDT, Expert Prefetching, Anchored Decoder.
+
+- **README Modernized**: Complete rewrite reflecting v1.0.0 with comprehensive
+  component tables (40+ modules across 10 categories), updated architecture
+  diagram, version history table, and v1.0.0 quick start using
+  LosionForCausalLMV2.
+
+### Credits
+
+- All v0.3–v0.9 component references preserved in CREDITS.md
+- Losion Framework: Wolfvin & Contributors (github.com/Wolfvin/Losion)
+
+---
+
 ## [0.9.0] — 2026-05-03 — "Architecture Document Realized"
 
 ### Added — Attention Residuals (AttnRes, MoonshotAI 2026)

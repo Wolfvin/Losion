@@ -1,7 +1,7 @@
 """
 Losion — Hybrid AI Framework with Tri-Jalur Router Architecture.
 
-Version 0.9.0 — "Architecture Document Realized"
+Version 1.0.0 — "Unified & Complete"
 
 Losion combines three complementary computational pathways into a single
 adaptive architecture:
@@ -49,6 +49,6 @@ v0.9 Upgrades — "Architecture Document Realized":
                 AnchoredDecoderConfig, DualMemoryConfig sub-configs
 """
 
-__version__ = "0.9.0"
+__version__ = "1.0.0"
 __author__ = "Losion Contributors"
 __license__ = "MIT"

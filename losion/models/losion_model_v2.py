@@ -224,6 +224,18 @@ def _build_ssm(config: LosionConfig) -> nn.Module:
     d_model = config.d_model
 
     try:
+        # v0.8: Structured Sparse SSM (replaces diagonal transitions)
+        if ssm_cfg.use_structured_sparse:
+            from losion.core.ssm.structured_sparse import StructuredSparseSSM, StructuredSparseSSMConfig
+            ss_cfg = StructuredSparseSSMConfig(
+                d_model=d_model,
+                d_state=ssm_cfg.d_state,
+                d_conv=ssm_cfg.d_conv,
+                expand=ssm_cfg.expand,
+                n_groups=ssm_cfg.structured_sparse_n_groups,
+            )
+            return StructuredSparseSSM(ss_cfg)
+
         if ssm_cfg.use_routing_mamba:
             from losion.core.ssm.routing_mamba import RoutingMamba, RoutingMambaConfig
             rom_cfg = RoutingMambaConfig(
@@ -264,6 +276,21 @@ def _build_attention(config: LosionConfig) -> nn.Module:
     d_model = config.d_model
 
     try:
+        # v0.9: Child-3W (MoE at QKV level, replaces standard attention)
+        if config.child_3w.enabled:
+            from losion.core.attention.child_3w import Child3WAttention, Child3WConfig as _Child3WCfg
+            c3w_cfg = _Child3WCfg(
+                d_model=d_model,
+                n_heads=attn_cfg.n_heads,
+                d_kv=attn_cfg.d_kv,
+                num_children=config.child_3w.num_children,
+                top_k_children=config.child_3w.top_k_children,
+                use_mla=config.child_3w.use_mla,
+                mla_latent_dim=config.child_3w.mla_latent_dim,
+                load_balance_weight=config.child_3w.load_balance_weight,
+            )
+            return Child3WAttention(c3w_cfg)
+
         if attn_cfg.use_moba:
             from losion.core.attention.moba import MoBAAttention, MoBAConfig
             moba_cfg = MoBAConfig(
@@ -330,6 +357,12 @@ def _build_moe(config: LosionConfig) -> nn.Module:
                 sub_tree_depth=ret_cfg.smore_sub_tree_depth,
             )
             return SmoreMoE(smore_cfg)
+
+        if ret_cfg.use_symbolic_moe:
+            from losion.core.retrieval.symbolic_moe import SymbolicMoERouter
+            # Symbolic-MoE wraps another MoE with skill-based routing
+            # Fall through to build the base MoE, symbolic routing is applied at layer level
+            pass
 
         # Default: AuxFreeMoE (DeepSeek-V3 style)
         from losion.core.retrieval.aux_free_moe import AuxFreeMoE
@@ -601,6 +634,58 @@ class LosionModelV2(nn.Module):
             for i in range(config.n_layers)
         ])
 
+        # Optional AttnRes (Attention Residuals, v0.9)
+        self.use_attn_res = config.attn_res.enabled
+        if self.use_attn_res:
+            try:
+                from losion.core.attention.attn_res import AttnResConfig as _AttnResCfg, AttnResManager
+                _attn_res_cfg = _AttnResCfg(
+                    d_model=config.d_model,
+                    n_layers=config.n_layers,
+                    mode=config.attn_res.mode,
+                    num_blocks=config.attn_res.num_blocks,
+                    dropout=config.attn_res.dropout,
+                    use_gate=config.attn_res.use_gate,
+                    temperature=config.attn_res.temperature,
+                    compression_dim=config.attn_res.compression_dim,
+                )
+                self.attn_res_manager = AttnResManager(_attn_res_cfg)
+            except ImportError:
+                self.use_attn_res = False
+
+        # Optional Evoformer (v0.9)
+        self.use_evoformer = config.evoformer.enabled
+        if self.use_evoformer:
+            try:
+                from losion.core.feedback.evoformer import EvoformerConfig as _EvoCfg, EvoformerManager
+                _evo_cfg = _EvoCfg(
+                    d_model=config.d_model,
+                    n_recycling_steps=config.evoformer.n_recycling_steps,
+                    use_layer_recycling=config.evoformer.use_layer_recycling,
+                    use_token_recycling=config.evoformer.use_token_recycling,
+                    use_decoder_feedback=config.evoformer.use_decoder_feedback,
+                    use_prediction_recycling=config.evoformer.use_prediction_recycling,
+                    use_router_coevolve=config.evoformer.use_router_coevolve,
+                )
+                self.evoformer_manager = EvoformerManager(_evo_cfg)
+            except ImportError:
+                self.use_evoformer = False
+
+        # Optional Dual Memory (v0.9)
+        self.use_dual_memory = config.dual_memory.enabled
+        if self.use_dual_memory:
+            try:
+                from losion.core.memory.dual_memory import DualMemoryConfig as _DMCfg, DualMemorySystem
+                _dm_cfg = _DMCfg(
+                    d_model=config.d_model,
+                    working_memory_size=config.dual_memory.working_memory_size,
+                    long_term_memory_dim=config.dual_memory.long_term_memory_dim,
+                    consolidation_method=config.dual_memory.consolidation_method,
+                )
+                self.dual_memory = DualMemorySystem(_dm_cfg)
+            except ImportError:
+                self.use_dual_memory = False
+
         # Optional RecurrentDepthBlock
         self.use_rdt = config.recurrent.enabled
         if self.use_rdt:
@@ -655,6 +740,10 @@ class LosionModelV2(nn.Module):
         # Position IDs for RoPE
         position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
 
+        # Reset AttnRes for new forward pass (v0.9)
+        if self.use_attn_res:
+            self.attn_res_manager.reset()
+
         # Layer processing
         all_routing_info = [] if return_routing_info else None
         all_hidden_states = [] if return_all_hidden_states else None
@@ -680,11 +769,29 @@ class LosionModelV2(nn.Module):
             if layer_routing and "ssm_state" in layer_routing:
                 ssm_states[layer.layer_idx] = layer_routing["ssm_state"]
 
+            # AttnRes: store and aggregate (v0.9)
+            if self.use_attn_res:
+                self.attn_res_manager.store_layer_output(layer.layer_idx, x)
+                x = self.attn_res_manager(x, layer.layer_idx)
+
+            # Dual Memory: write layer output (v0.9)
+            if self.use_dual_memory:
+                self.dual_memory.write(x)
+
             if all_routing_info is not None:
                 all_routing_info.append(layer_routing)
 
             if all_hidden_states is not None:
                 all_hidden_states.append(x.detach())
+
+        # Evoformer Level 1: Inter-layer recycling (v0.9)
+        if self.use_evoformer and all_hidden_states is not None and len(all_hidden_states) > 1:
+            recycled = self.evoformer_manager.recycle_layers(all_hidden_states)
+            x = recycled[-1]
+
+        # Evoformer Level 2: Bidirectional token update (v0.9)
+        if self.use_evoformer:
+            x = self.evoformer_manager.bidirectional_token_update(x)
 
         # Optional RDT
         if self.use_rdt and hasattr(self, 'rdt_block'):

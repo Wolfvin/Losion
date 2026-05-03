@@ -756,6 +756,14 @@ class LosionConfig:
             use_liquid=ssm_raw.get("use_liquid", False),
             complexity_bottleneck=ssm_raw.get("complexity_bottleneck", 64),
             depth_entropy_weight=ssm_raw.get("depth_entropy_weight", 0.01),
+            # v0.6 additions
+            use_mamba3=ssm_raw.get("use_mamba3", False),
+            use_routing_mamba=ssm_raw.get("use_routing_mamba", False),
+            routing_mamba_num_experts=ssm_raw.get("routing_mamba_num_experts", 4),
+            routing_mamba_active_experts=ssm_raw.get("routing_mamba_active_experts", 2),
+            # v0.8 additions
+            use_structured_sparse=ssm_raw.get("use_structured_sparse", False),
+            structured_sparse_n_groups=ssm_raw.get("structured_sparse_n_groups", 4),
         )
         kwargs["ssm"] = ssm
 
@@ -781,6 +789,15 @@ class LosionConfig:
             shared_n_groups=attn_raw.get("shared_n_groups", 1),
             shared_pattern=attn_raw.get("shared_pattern", "all_shared"),
             shared_unique_ratio=attn_raw.get("shared_unique_ratio", 0.25),
+            # v0.6 additions
+            use_gated_attention=attn_raw.get("use_gated_attention", False),
+            use_moba=attn_raw.get("use_moba", False),
+            moba_block_size=attn_raw.get("moba_block_size", 512),
+            moba_top_k_blocks=attn_raw.get("moba_top_k_blocks", 4),
+            # v0.8 additions
+            use_cross_jalur_routing=attn_raw.get("use_cross_jalur_routing", False),
+            cross_jalur_blend_alpha=attn_raw.get("cross_jalur_blend_alpha", 0.3),
+            cross_jalur_graph_top_k=attn_raw.get("cross_jalur_graph_top_k", 8),
         )
         kwargs["attention"] = attn
 
@@ -804,6 +821,17 @@ class LosionConfig:
             gradient_routed_lr=ret_raw.get("gradient_routed_lr", 0.01),
             use_asymmetric=ret_raw.get("use_asymmetric", False),
             asymmetric_moe_layers=ret_raw.get("asymmetric_moe_layers", []),
+            # v0.6 additions
+            use_smore=ret_raw.get("use_smore", False),
+            smore_num_sub_trees=ret_raw.get("smore_num_sub_trees", 4),
+            smore_sub_tree_depth=ret_raw.get("smore_sub_tree_depth", 2),
+            use_symbolic_moe=ret_raw.get("use_symbolic_moe", False),
+            # v0.8 additions
+            use_infinite_moe=ret_raw.get("use_infinite_moe", False),
+            infinite_moe_code_dim=ret_raw.get("infinite_moe_code_dim", 32),
+            infinite_moe_hypernet_hidden=ret_raw.get("infinite_moe_hypernet_hidden", 256),
+            infinite_moe_low_rank_residual=ret_raw.get("infinite_moe_low_rank_residual", True),
+            infinite_moe_codebook_size=ret_raw.get("infinite_moe_codebook_size", 256),
         )
         kwargs["retrieval"] = ret
 
@@ -829,6 +857,15 @@ class LosionConfig:
             use_flow_matching=out_raw.get("use_flow_matching", False),
             use_speculative=out_raw.get("use_speculative", False),
             speculative_draft_tokens=out_raw.get("speculative_draft_tokens", 2),
+            # v0.8 additions — L-MTP
+            use_leap_mtp=out_raw.get("use_leap_mtp", False),
+            leap_mtp_schedule=out_raw.get("leap_mtp_schedule", "geometric"),
+            leap_mtp_num_leaps=out_raw.get("leap_mtp_num_leaps", 4),
+            leap_mtp_max_leap=out_raw.get("leap_mtp_max_leap", 8),
+            # v0.9 — Anchored Diffusion Decoder
+            use_anchored_decoder=out_raw.get("use_anchored_decoder", False),
+            anchored_n_refine_steps=out_raw.get("anchored_n_refine_steps", 3),
+            anchored_d_refine=out_raw.get("anchored_d_refine", 512),
         )
         kwargs["output"] = output
 
@@ -886,6 +923,122 @@ class LosionConfig:
             darts_lr=nas_raw.get("darts_lr", 0.001),
         )
         kwargs["nas"] = nas
+
+        # v0.6: Recurrent config
+        rec_raw = model_raw.get("recurrent", {})
+        recurrent = RecurrentConfig(
+            enabled=rec_raw.get("enabled", False),
+            max_loop_iters=rec_raw.get("max_loop_iters", 16),
+            use_lti_stable=rec_raw.get("use_lti_stable", True),
+            use_act=rec_raw.get("use_act", True),
+            act_halting_threshold=rec_raw.get("act_halting_threshold", 0.99),
+            use_depth_lora=rec_raw.get("use_depth_lora", True),
+            depth_lora_rank=rec_raw.get("depth_lora_rank", 8),
+            use_loop_index_embedding=rec_raw.get("use_loop_index_embedding", True),
+        )
+        kwargs["recurrent"] = recurrent
+
+        # v0.6: JEPA config
+        jepa_raw = model_raw.get("jepa", {})
+        jepa = JEPAConfig(
+            enabled=jepa_raw.get("enabled", False),
+            prediction_horizon=jepa_raw.get("prediction_horizon", 4),
+            latent_dim=jepa_raw.get("latent_dim", 256),
+            predictor_depth=jepa_raw.get("predictor_depth", 3),
+            loss_type=jepa_raw.get("loss_type", "vicreg"),
+            teacher_ema_decay=jepa_raw.get("teacher_ema_decay", 0.996),
+            prediction_weight=jepa_raw.get("prediction_weight", 0.1),
+        )
+        kwargs["jepa"] = jepa
+
+        # v0.8: DAPO config
+        dapo_raw = model_raw.get("dapo", {})
+        dapo = DAPOConfig(
+            enabled=dapo_raw.get("enabled", False),
+            clip_ratio_low=dapo_raw.get("clip_ratio_low", 0.2),
+            clip_ratio_high=dapo_raw.get("clip_ratio_high", 0.28),
+            dynamic_sampling=dapo_raw.get("dynamic_sampling", True),
+            token_level_loss=dapo_raw.get("token_level_loss", True),
+            overlong_filter=dapo_raw.get("overlong_filter", True),
+            num_responses_per_prompt=dapo_raw.get("num_responses_per_prompt", 8),
+            kl_coefficient=dapo_raw.get("kl_coefficient", 0.1),
+        )
+        kwargs["dapo"] = dapo
+
+        # v0.8: RLVR config
+        rlvr_raw = model_raw.get("rlvr", {})
+        rlvr = RLVRConfig(
+            enabled=rlvr_raw.get("enabled", False),
+            difficulty_schedule=rlvr_raw.get("difficulty_schedule", "curriculum"),
+            math_tolerance=rlvr_raw.get("math_tolerance", 1e-4),
+            code_timeout=rlvr_raw.get("code_timeout", 5),
+            use_math_verifier=rlvr_raw.get("use_math_verifier", True),
+            use_code_verifier=rlvr_raw.get("use_code_verifier", True),
+            use_format_verifier=rlvr_raw.get("use_format_verifier", True),
+            curriculum_warmup_steps=rlvr_raw.get("curriculum_warmup_steps", 1000),
+        )
+        kwargs["rlvr"] = rlvr
+
+        # v0.8: Prefetch config
+        pf_raw = model_raw.get("prefetch", {})
+        prefetch = PrefetchConfig(
+            enabled=pf_raw.get("enabled", False),
+            predictor_hidden_dim=pf_raw.get("predictor_hidden_dim", 128),
+            prefetch_budget=pf_raw.get("prefetch_budget", 4),
+            adaptive_temperature=pf_raw.get("adaptive_temperature", True),
+        )
+        kwargs["prefetch"] = prefetch
+
+        # v0.9: AttnRes config
+        ar_raw = model_raw.get("attn_res", {})
+        attn_res = AttnResConfig(
+            enabled=ar_raw.get("enabled", False),
+            mode=ar_raw.get("mode", "block"),
+            num_blocks=ar_raw.get("num_blocks", 8),
+            dropout=ar_raw.get("dropout", 0.0),
+            use_gate=ar_raw.get("use_gate", True),
+            temperature=ar_raw.get("temperature", 1.0),
+            compression_dim=ar_raw.get("compression_dim", 0),
+            use_token_compression=ar_raw.get("use_token_compression", False),
+            token_compression_type=ar_raw.get("token_compression_type", "gated"),
+            token_compression_d_state=ar_raw.get("token_compression_d_state", 256),
+        )
+        kwargs["attn_res"] = attn_res
+
+        # v0.9: Evoformer config
+        evo_raw = model_raw.get("evoformer", {})
+        evoformer = EvoformerConfig(
+            enabled=evo_raw.get("enabled", False),
+            n_recycling_steps=evo_raw.get("n_recycling_steps", 3),
+            use_layer_recycling=evo_raw.get("use_layer_recycling", True),
+            use_token_recycling=evo_raw.get("use_token_recycling", True),
+            use_decoder_feedback=evo_raw.get("use_decoder_feedback", True),
+            use_prediction_recycling=evo_raw.get("use_prediction_recycling", True),
+            use_router_coevolve=evo_raw.get("use_router_coevolve", True),
+        )
+        kwargs["evoformer"] = evoformer
+
+        # v0.9: Child-3W config
+        c3w_raw = model_raw.get("child_3w", {})
+        child_3w = Child3WConfig(
+            enabled=c3w_raw.get("enabled", False),
+            num_children=c3w_raw.get("num_children", 4),
+            top_k_children=c3w_raw.get("top_k_children", 2),
+            use_mla=c3w_raw.get("use_mla", False),
+            mla_latent_dim=c3w_raw.get("mla_latent_dim", 0),
+            load_balance_weight=c3w_raw.get("load_balance_weight", 0.01),
+        )
+        kwargs["child_3w"] = child_3w
+
+        # v0.9: Dual Memory config
+        dm_raw = model_raw.get("dual_memory", {})
+        dual_memory = DualMemoryConfig(
+            enabled=dm_raw.get("enabled", False),
+            working_memory_size=dm_raw.get("working_memory_size", 512),
+            long_term_memory_dim=dm_raw.get("long_term_memory_dim", 256),
+            consolidation_method=dm_raw.get("consolidation_method", "attention"),
+        )
+        kwargs["dual_memory"] = dual_memory
 
         return cls(**kwargs)
 
