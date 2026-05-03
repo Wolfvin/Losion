@@ -330,7 +330,7 @@ class Mamba2SSD(nn.Module):
     def forward_inference(
         self,
         input: torch.Tensor,
-        state: torch.Tensor,
+        state: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass untuk inferensi token-per-token (O(1) per token).
@@ -338,11 +338,19 @@ class Mamba2SSD(nn.Module):
         Args:
             input: Tensor input satu token, bentuk (batch, 1, d_model).
             state: State rekurensi, bentuk (batch, d_inner, d_state).
+                If None, a zero state is automatically created.
 
         Returns:
             Tuple (output, new_state).
         """
         batch = input.shape[0]
+
+        # Initialise zero state if not provided
+        if state is None:
+            state = torch.zeros(
+                batch, self.d_inner, self.d_state,
+                dtype=input.dtype, device=input.device,
+            )
 
         # Proyeksi
         xz = self.in_proj(input)

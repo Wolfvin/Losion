@@ -1453,18 +1453,21 @@ class LosionForCausalLMV2(nn.Module):
         their much smaller gradient norms.
 
         Problem: Router grad norm ~0.013, MoE grad norm ~0.063,
-        Embedding grad norm ~11.0
-        Solution: Scale router gradients by 10x and MoE gradients by 5x
-        during backward pass.
+        Embedding grad norm ~11.0, ThinkingToggle grad norm ~0.007
+        Solution: Scale router gradients by 10x, MoE by 5x, ThinkingToggle
+        by 100x, and JEPA by 20x during backward pass.
         """
         router_scale = 10.0
+        thinking_toggle_scale = 100.0
         moe_scale = 5.0
 
         for name, param in self.named_parameters():
             if not param.requires_grad:
                 continue
             name_lower = name.lower()
-            if 'router' in name_lower or 'thinking_toggle' in name_lower:
+            if 'thinking_toggle' in name_lower or 'thinkingtoggle' in name_lower:
+                param.register_hook(lambda grad, s=thinking_toggle_scale: grad * s)
+            elif 'router' in name_lower:
                 param.register_hook(lambda grad, s=router_scale: grad * s)
             elif 'jepa' in name_lower:
                 param.register_hook(lambda grad, s=20.0: grad * s)  # JEPA needs even more scaling

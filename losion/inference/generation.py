@@ -28,6 +28,26 @@ import torch
 import torch.nn.functional as F
 
 
+def _get_logits(output: Any) -> torch.Tensor:
+    """Extract logits from model output (dict or object).
+
+    LosionForCausalLMV2.forward() returns a dict like {'logits': ..., 'loss': ...},
+    but some callers (e.g. HuggingFace-style models) return objects with a .logits
+    attribute.  This helper normalises both cases so generation code works with
+    either return type.
+
+    Args:
+        output: Model output — either a dict with a 'logits' key, or an object
+            with a ``.logits`` attribute.
+
+    Returns:
+        The logits tensor.
+    """
+    if isinstance(output, dict):
+        return output["logits"]
+    return output.logits
+
+
 # ============================================================================
 # GenerationConfig
 # ============================================================================
@@ -450,7 +470,7 @@ class SpeculativeDecoder:
             for _ in range(num_draft):
                 # Forward pass through full model
                 output = self.model(input_ids=current_ids)
-                next_logits = output.logits[:, -1, :]  # [1, vocab_size]
+                next_logits = _get_logits(output)[:, -1, :]  # [1, vocab_size]
 
                 # Greedy selection for draft (fast)
                 next_token = next_logits.argmax(dim=-1).item()
@@ -493,7 +513,7 @@ class SpeculativeDecoder:
 
         with torch.no_grad():
             output = self.model(input_ids=full_input)
-            all_logits = output.logits  # [1, input_len + draft_len, vocab_size]
+            all_logits = _get_logits(output)  # [1, input_len + draft_len, vocab_size]
 
         accepted_tokens: List[int] = []
         scores: List[float] = []
@@ -743,7 +763,7 @@ class ContinuousBatcher:
         # Forward pass
         with torch.no_grad():
             output = self.model(input_ids=padded)
-            logits = output.logits[:, -1, :]  # [batch, vocab_size]
+            logits = _get_logits(output)[:, -1, :]  # [batch, vocab_size]
 
         # Process each request individually
         for i, rid in enumerate(request_ids):
@@ -924,7 +944,7 @@ class LosionGenerator:
 
         # Prefill: full forward pass
         output = self.model(input_ids=input_ids)
-        next_logits = output.logits[:, -1:, :]
+        next_logits = _get_logits(output)[:, -1:, :]
 
         # Get KV cache and SSM states from model
         ssm_states: Dict[int, Any] = {}
@@ -969,7 +989,7 @@ class LosionGenerator:
                 # Fallback: full forward
                 current_ids = torch.cat([current_ids, next_tensor], dim=1)
                 output = self.model(input_ids=current_ids)
-                next_logits = output.logits[:, -1:, :]
+                next_logits = _get_logits(output)[:, -1:, :]
 
         return generated_ids, scores
 
@@ -995,7 +1015,7 @@ class LosionGenerator:
 
         # Prefill: full forward pass
         output = self.model(input_ids=input_ids)
-        next_logits = output.logits[:, -1:, :]
+        next_logits = _get_logits(output)[:, -1:, :]
 
         # Get KV cache and SSM states from model
         ssm_states: Dict[int, Any] = {}
@@ -1045,7 +1065,7 @@ class LosionGenerator:
                 # Fallback: full forward
                 current_ids = torch.cat([current_ids, next_tensor], dim=1)
                 output = self.model(input_ids=current_ids)
-                next_logits = output.logits[:, -1:, :]
+                next_logits = _get_logits(output)[:, -1:, :]
 
         return generated_ids, scores
 
@@ -1082,7 +1102,7 @@ class LosionGenerator:
 
         for step in range(config.max_new_tokens):
             output = self.model(input_ids=current_ids)
-            next_logits = output.logits[:, -1, :]  # [num_beams, vocab_size]
+            next_logits = _get_logits(output)[:, -1, :]  # [num_beams, vocab_size]
 
             # Process logits per beam
             processed = processor.process(next_logits, current_ids)
@@ -1197,7 +1217,7 @@ class LosionGenerator:
             if not accepted_tokens:
                 # Fallback: generate one token normally
                 output = self.model(input_ids=current_ids)
-                next_logits = output.logits[:, -1, :]
+                next_logits = _get_logits(output)[:, -1, :]
                 processor = LogitsProcessor(config)
                 processed = processor.process(next_logits, current_ids)
                 next_token = processed.argmax(dim=-1).item()
@@ -1297,7 +1317,7 @@ class LosionGenerator:
 
         while num_generated < config.max_new_tokens:
             output = self.model(input_ids=current_ids)
-            next_logits = output.logits[:, -1, :]
+            next_logits = _get_logits(output)[:, -1, :]
 
             processed = processor.process(next_logits, current_ids)
 
