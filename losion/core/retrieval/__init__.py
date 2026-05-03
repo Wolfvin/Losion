@@ -19,6 +19,13 @@ v0.5 additions (Priority 1):
 v0.6 additions:
   SmoreMoE              — Sub-tree MoE with Residual Experts (Meta, NeurIPS 2025)
   SymbolicMoERouter     — Skill-based discrete routing (Symbolic-MoE, 2025)
+
+v0.7 additions:
+  InfiniteMoE           — Infinite Mixture of Experts (∞-MoE, arXiv 2601.17680, 2026)
+  InfiniteMoEConfig     — Configuration for ∞-MoE
+  ExpertCodeRouter      — Continuous-space expert code router
+  ContinuousExpertGenerator — Hypernetwork for on-the-fly expert generation
+  ExpertCodeClusterer   — Inference-time code clustering for efficiency
 """
 
 from losion.core.retrieval.engram import EngramMemory, EngramEntry
@@ -47,6 +54,14 @@ from losion.core.retrieval.symbolic_moe import (
     SymbolicMoERouter,
     SymbolicRoutingInfo,
 )
+from losion.core.retrieval.infinite_moe import (
+    InfiniteMoEConfig,
+    InfiniteMoE,
+    InfiniteMoERoutingInfo,
+    ExpertCodeRouter,
+    ContinuousExpertGenerator,
+    ExpertCodeClusterer,
+)
 
 __all__ = [
     "EngramMemory",
@@ -71,4 +86,10 @@ __all__ = [
     "SymbolicRoutingRule",
     "SymbolicMoERouter",
     "SymbolicRoutingInfo",
+    "InfiniteMoEConfig",
+    "InfiniteMoE",
+    "InfiniteMoERoutingInfo",
+    "ExpertCodeRouter",
+    "ContinuousExpertGenerator",
+    "ExpertCodeClusterer",
 ]

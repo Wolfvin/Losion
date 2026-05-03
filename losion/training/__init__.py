@@ -4,6 +4,7 @@ Losion Training — Modul pelatihan untuk framework Losion.
 Mengimplementasikan training 4-fase dengan dukungan:
 - LosionTrainer: Trainer utama dengan 4 fase curriculum
 - GRPOTrainer: Group Relative Policy Optimization (dari DeepSeek-R1)
+- DAPOTrainer: Decoupled Clip & Dynamic Sampling Policy Optimization (Yu et al., 2025)
 - AdvancedGRPOTrainer: GRPO + Self-Play + Value Head (DeepMind)
 - CurriculumScheduler: Penjadwal transisi antar fase
 - Advanced RLHF: Self-Play Preference, Value Head, Self-Consistency
@@ -15,6 +16,7 @@ Mengimplementasikan training 4-fase dengan dukungan:
 Penggunaan:
     >>> from losion.training import LosionTrainer, GRPOTrainer, CurriculumScheduler
     >>> from losion.training import AdvancedGRPOTrainer
+    >>> from losion.training import DAPOTrainer, DAPOConfig
     >>> from losion.training import ETRTrainer, ETRRewardFunction, ETRConfig
     >>> from losion.config import LosionConfig
     >>> config = LosionConfig()
@@ -77,6 +79,12 @@ from losion.training.llm_jepa import (
     VICRegLoss,
     LLMJEPA,
 )
+from losion.training.dapo import (
+    DAPOConfig,
+    DAPOResult,
+    DAPORewardFunction,
+    DAPOTrainer,
+)
 from losion.training.losion_recipe import (
     WSDLRScheduler,
     WSDConfig,
@@ -136,6 +144,11 @@ __all__ = [
     "TargetEncoder",
     "VICRegLoss",
     "LLMJEPA",
+    # DAPO
+    "DAPOConfig",
+    "DAPOResult",
+    "DAPORewardFunction",
+    "DAPOTrainer",
     # Losion Training Recipe
     "WSDLRScheduler",
     "WSDConfig",

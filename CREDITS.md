@@ -417,6 +417,90 @@ original authors for their contributions to the open research community.
 
 ---
 
+## v0.8 — "Next-Gen Training & Infinite Experts" Improvements
+
+### 29. DAPO — Decoupled Clip & Dynamic Sampling Policy Optimization (`losion/training/dapo.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Yu et al. | "DAPO: An Open-Source LLM Reinforcement Learning System at Scale" (arXiv 2503.14476) | 2025 | 4 improvements over GRPO: decoupled clip, dynamic sampling, token-level loss, overlong filtering |
+| Shao, Z. et al. | "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models" | 2024 | GRPO baseline that DAPO improves upon |
+
+**What we adapted:** Complete DAPO implementation replacing GRPO as the default RL optimizer. Decoupled clip with separate low/high ratios (0.2/0.28) prevents both policy collapse and reward hacking. Dynamic sampling filters prompts with zero-variance rewards for ~15-20% efficiency gain. Token-level loss for finer credit assignment. Overlong filtering penalizes excessively long responses.
+
+---
+
+### 30. ∞-MoE — Infinite Mixture of Experts (`losion/core/retrieval/infinite_moe.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| arXiv 2601.17680 | "∞-MoE: Generalizing Mixture of Experts to Infinite Experts" | 2026 | Extends MoE from finite discrete set to continuous expert space via hypernetwork parameterization |
+
+**What we adapted:** Continuous expert parameterization using ExpertCodeRouter (produces expert codes + routing logits in continuous space) + ContinuousExpertGenerator (hypernetwork that generates expert weights from codes). Shared base expert + code-conditioned scaling/bias/low-rank residual modifications. ExpertCodeClusterer for inference efficiency. Drop-in replacement for discrete MoE layers.
+
+---
+
+### 31. L-MTP — Leap Multi-Token Prediction (`losion/core/output/leap_mtp.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| arXiv 2505.17505, NeurIPS 2025 (poster 120311) | "L-MTP: Leap Multi-Token Prediction Beyond Adjacent" | 2025 | Extends MTP to predict tokens at arbitrary future positions (leaping), improving speculative decoding efficiency |
+
+**What we adapted:** Geometric leap schedule (1, 2, 4, 8 steps) for 4 leap heads covering 8 positions (2x vs adjacent MTP's 4). Two-stage training: warm-up heads with frozen backbone, then joint fine-tuning. Geometric decay loss weights per leap distance. LeapSpeculativeDecoder with gap-filling via SSM pathway. Backward compatible: `ADJACENT` schedule = standard MTP.
+
+---
+
+### 32. Cross-Jalur Attention-MoE Routing (`losion/core/retrieval/cross_jalur_routing.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| arXiv 2505.00792 | "Improving Routing in Sparse MoE with Graph of Tokens" | 2025 | Uses attention matrix to guide MoE routing — tokens that attend to each other should route to similar experts |
+
+**What we adapted:** Cross-jalur bridge between Attention (Jalur 2) and MoE (Jalur 3). AttentionGraphBuilder constructs sparse token affinity graph from attention weights. CrossJalurRouter performs graph convolution to propagate routing logits across attended tokens. RoutingSmoother blends original and attention-informed logits with learnable gate. Drop-in module compatible with any Losion MoE implementation.
+
+---
+
+### 33. RLVR — Reinforcement Learning with Verifiable Rewards (`losion/training/rlvr.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| NeurIPS 2025 (posters 119944, 116633) | Multiple RLVR papers | 2025 | Scales RL training using objective, programmable reward functions instead of learned reward models |
+| arXiv 2601.05607 | RLVR theoretical framework | 2026 | Proves RLVR consistently improves policy performance over time |
+| arXiv 2603.22117 | RLVR with verifiable math/code rewards | 2026 | Verifiable rewards for math and code tasks |
+
+**What we adapted:** Multiple verifier types: MathVerifier (numeric + symbolic), CodeVerifier (sandboxed execution), FormatVerifier (regex + length + JSON), ExactMatchVerifier (exact/fuzzy matching). CompositeVerifier with curriculum difficulty scheduling (EASY→MEDIUM→HARD). Integrates with DAPO/GRPO as the reward function provider.
+
+---
+
+### 34. Expert Prefetching — Speculating Experts (`losion/inference/expert_prefetch.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| arXiv 2603.19289 | "Speculating Experts Accelerates Inference for MoE" | 2026 | Uses computed representations to predict which MoE experts are needed in subsequent layers, enabling prefetching |
+
+**What we adapted:** LightweightPredictor (2-layer MLP, <1% parameter overhead) per layer that predicts expert routing for the next layer. Supports both finite MoE (discrete expert index prediction) and ∞-MoE (continuous code prediction with L2 distance matching). PrefetchAccuracyTracker with rolling-window precision/recall. Adaptive temperature scheduling based on recent recall. ExpertPrefetcher orchestrator for multi-layer coordination.
+
+---
+
+### 35. Losion Training Orchestrator (`losion/training/losion_orchestrator.py`)
+
+| Reference | Paper | Year | Key Contribution |
+|-----------|-------|------|-----------------|
+| Losion Framework | Unified training methodology | 2026 | One-stop training orchestrator integrating ALL 13+ Losion training techniques |
+| WSD Schedule | ICLR 2025 | 2025 | Warmup-Stable-Decay LR schedule |
+| DAPO | arXiv 2503.14476 | 2025 | Decoupled clip policy optimization |
+| RLVR | NeurIPS 2025 | 2025 | Verifiable rewards |
+| LLM-JEPA | arXiv 2509.14252 | 2025 | Future state prediction |
+| TACO | DeepSeek-V2 | 2024 | Compute-aligned training |
+| ETR Reward | DeepSeekMath + Gemini 2.5 | 2024-2025 | Entropy trend reward |
+| Gen. Distillation | Kim & Rush (2016), Agarwal et al. (2024) | 2016-2024 | Sequence-level distillation |
+| BitDistill | Wang et al. (2024) | 2024 | Joint quantization + distillation |
+| Curriculum Learning | Multiple sources | 2024-2025 | Phase-aware data difficulty |
+
+**What we adapted:** Comprehensive training orchestrator that manages the complete 4-phase Losion training pipeline. Phase 1: WSD + JEPA + expert specialization. Phase 2: JEPA (reduced) + TACO + curriculum + active learning. Phase 3: DAPO/GRPO (auto-selected) + RLVR + ETR + TACO + evolutionary search. Phase 4: Gen distillation + BitDistill + ETR + early exit. Full checkpoint save/resume with all training state.
+
+---
+
 ## Foundational Technologies Used Throughout Losion
 
 | Technology | Reference | Key Contribution to Losion |

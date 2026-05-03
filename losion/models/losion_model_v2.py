@@ -305,6 +305,20 @@ def _build_moe(config: LosionConfig) -> nn.Module:
     num_experts = ret_cfg.num_experts if ret_cfg.num_experts > 0 else max(8, min(64, d_model // 32))
 
     try:
+        # v0.8: Infinite MoE (continuous expert space)
+        if ret_cfg.use_infinite_moe:
+            from losion.core.retrieval.infinite_moe import InfiniteMoE, InfiniteMoEConfig
+            inf_cfg = InfiniteMoEConfig(
+                d_model=d_model,
+                d_ff=d_ff,
+                top_k=ret_cfg.num_active_experts,
+                code_dim=ret_cfg.infinite_moe_code_dim,
+                hypernet_hidden_dim=ret_cfg.infinite_moe_hypernet_hidden,
+                use_low_rank_residual=ret_cfg.infinite_moe_low_rank_residual,
+                codebook_size=ret_cfg.infinite_moe_codebook_size,
+            )
+            return InfiniteMoE(inf_cfg)
+
         if ret_cfg.use_smore:
             from losion.core.retrieval.smore import SmoreMoE, SmoreConfig
             smore_cfg = SmoreConfig(
@@ -459,13 +473,24 @@ class LosionLayerV2(nn.Module):
         w_attn = route_weights[:, :, 1:2]
         w_ret = route_weights[:, :, 2:3]
 
-        # Handle dimension mismatch (some modules return d_inner instead of d_model)
+        # Handle dimension mismatch via learned projection (v0.8: replaced zero-filled linear)
+        if not hasattr(self, '_dim_aligned'):
+            self._dim_aligned = True
         if ssm_out.shape[-1] != self.d_model:
-            ssm_out = F.linear(ssm_out, torch.zeros(self.d_model, ssm_out.shape[-1], device=ssm_out.device))
+            if not hasattr(self, 'ssm_proj'):
+                self.ssm_proj = nn.Linear(ssm_out.shape[-1], self.d_model, bias=False).to(ssm_out.device)
+                nn.init.eye_(self.ssm_proj.weight[:min(ssm_out.shape[-1], self.d_model)])
+            ssm_out = self.ssm_proj(ssm_out)
         if attn_out.shape[-1] != self.d_model:
-            attn_out = F.linear(attn_out, torch.zeros(self.d_model, attn_out.shape[-1], device=attn_out.device))
+            if not hasattr(self, 'attn_proj'):
+                self.attn_proj = nn.Linear(attn_out.shape[-1], self.d_model, bias=False).to(attn_out.device)
+                nn.init.eye_(self.attn_proj.weight[:min(attn_out.shape[-1], self.d_model)])
+            attn_out = self.attn_proj(attn_out)
         if ret_out.shape[-1] != self.d_model:
-            ret_out = F.linear(ret_out, torch.zeros(self.d_model, ret_out.shape[-1], device=ret_out.device))
+            if not hasattr(self, 'ret_proj'):
+                self.ret_proj = nn.Linear(ret_out.shape[-1], self.d_model, bias=False).to(ret_out.device)
+                nn.init.eye_(self.ret_proj.weight[:min(ret_out.shape[-1], self.d_model)])
+            ret_out = self.ret_proj(ret_out)
 
         combined = w_ssm * ssm_out + w_attn * attn_out + w_ret * ret_out
 

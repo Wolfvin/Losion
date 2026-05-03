@@ -97,6 +97,9 @@ class SSMConfig:
     use_routing_mamba: bool = False
     routing_mamba_num_experts: int = 4
     routing_mamba_active_experts: int = 2
+    # v0.8 additions — Structured Sparse Transition (NeurIPS '25)
+    use_structured_sparse: bool = False
+    structured_sparse_n_groups: int = 4
 
 
 @dataclass
@@ -146,6 +149,10 @@ class AttentionConfig:
     use_moba: bool = False
     moba_block_size: int = 512
     moba_top_k_blocks: int = 4
+    # v0.8 additions
+    use_cross_jalur_routing: bool = False
+    cross_jalur_blend_alpha: float = 0.3
+    cross_jalur_graph_top_k: int = 8
 
 
 @dataclass
@@ -197,6 +204,12 @@ class RetrievalConfig:
     smore_num_sub_trees: int = 4
     smore_sub_tree_depth: int = 2
     use_symbolic_moe: bool = False
+    # v0.8 additions — Infinite MoE & Cross-Jalur Routing
+    use_infinite_moe: bool = False
+    infinite_moe_code_dim: int = 32
+    infinite_moe_hypernet_hidden: int = 256
+    infinite_moe_low_rank_residual: bool = True
+    infinite_moe_codebook_size: int = 256
 
     def __post_init__(self) -> None:
         if self.num_experts > 0 and self.top_k_routing < self.num_active_experts:
@@ -234,12 +247,21 @@ class OutputConfig:
         use_flow_matching: Whether to use flow matching for output refinement.
         use_speculative: Whether to use MTP speculative decoding (v0.4).
         speculative_draft_tokens: Number of draft tokens for speculative decoding.
+        use_leap_mtp: Whether to use L-MTP Leap Multi-Token Prediction (v0.8, NeurIPS '25).
+        leap_mtp_schedule: Leap schedule type ("geometric", "arithmetic", "adjacent").
+        leap_mtp_num_leaps: Number of leap heads.
+        leap_mtp_max_leap: Maximum leap distance.
     """
     use_mtp: bool = False
     mtp_num_tokens: int = 2
     use_flow_matching: bool = False
     use_speculative: bool = False
     speculative_draft_tokens: int = 2
+    # v0.8 additions — L-MTP (Leap Multi-Token Prediction)
+    use_leap_mtp: bool = False
+    leap_mtp_schedule: str = "geometric"
+    leap_mtp_num_leaps: int = 4
+    leap_mtp_max_leap: int = 8
 
 
 @dataclass
@@ -291,6 +313,85 @@ class JEPAConfig:
     loss_type: str = "vicreg"
     teacher_ema_decay: float = 0.996
     prediction_weight: float = 0.1
+
+
+@dataclass
+class DAPOConfig:
+    """Configuration for DAPO training (v0.8).
+
+    DAPO: Decoupled Clip & Dynamic Sampling Policy Optimization.
+    Improves over GRPO with 4 key innovations.
+
+    Ref: Yu et al., "DAPO: An Open-Source LLM RL System at Scale", arXiv 2503.14476 (2025)
+
+    Attributes:
+        enabled: Whether to enable DAPO (replaces GRPO in Phase 3).
+        clip_ratio_low: Lower bound clip ratio (prevents policy collapse).
+        clip_ratio_high: Upper bound clip ratio (prevents reward hacking).
+        dynamic_sampling: Whether to filter prompts with uniform rewards.
+        token_level_loss: Whether to use token-level policy gradient loss.
+        overlong_filter: Whether to filter overlong responses.
+        num_responses_per_prompt: Number of responses sampled per prompt.
+        kl_coefficient: KL penalty coefficient against reference policy.
+    """
+    enabled: bool = False
+    clip_ratio_low: float = 0.2
+    clip_ratio_high: float = 0.28
+    dynamic_sampling: bool = True
+    token_level_loss: bool = True
+    overlong_filter: bool = True
+    num_responses_per_prompt: int = 8
+    kl_coefficient: float = 0.1
+
+
+@dataclass
+class RLVRConfig:
+    """Configuration for RLVR training (v0.8).
+
+    RLVR: Reinforcement Learning with Verifiable Rewards.
+    Uses objective, programmable reward functions instead of learned reward models.
+
+    Ref: NeurIPS 2025 (posters 119944, 116633), arXiv 2601.05607, 2603.22117
+
+    Attributes:
+        enabled: Whether to enable RLVR verifiable rewards.
+        difficulty_schedule: Verification difficulty ("easy", "medium", "hard", "curriculum").
+        math_tolerance: Numeric tolerance for math verification.
+        code_timeout: Timeout for code execution verification.
+        use_math_verifier: Whether to use math answer verification.
+        use_code_verifier: Whether to use code execution verification.
+        use_format_verifier: Whether to use format checking.
+        curriculum_warmup_steps: Steps for curriculum difficulty warmup.
+    """
+    enabled: bool = False
+    difficulty_schedule: str = "curriculum"
+    math_tolerance: float = 1e-4
+    code_timeout: int = 5
+    use_math_verifier: bool = True
+    use_code_verifier: bool = True
+    use_format_verifier: bool = True
+    curriculum_warmup_steps: int = 1000
+
+
+@dataclass
+class PrefetchConfig:
+    """Configuration for Expert Prefetching (v0.8).
+
+    Speculating Experts: Uses computed representations to predict which MoE experts
+    will be needed in subsequent layers, enabling prefetching.
+
+    Ref: arXiv 2603.19289 (March 2026)
+
+    Attributes:
+        enabled: Whether to enable expert prefetching.
+        predictor_hidden_dim: Hidden dimension for the lightweight predictor.
+        prefetch_budget: Maximum number of experts to prefetch per layer.
+        adaptive_temperature: Whether to adaptively adjust prediction temperature.
+    """
+    enabled: bool = False
+    predictor_hidden_dim: int = 128
+    prefetch_budget: int = 4
+    adaptive_temperature: bool = True
 
 
 @dataclass
@@ -443,6 +544,9 @@ class LosionConfig:
     output: OutputConfig = field(default_factory=OutputConfig)
     recurrent: RecurrentConfig = field(default_factory=RecurrentConfig)
     jepa: JEPAConfig = field(default_factory=JEPAConfig)
+    dapo: DAPOConfig = field(default_factory=DAPOConfig)
+    rlvr: RLVRConfig = field(default_factory=RLVRConfig)
+    prefetch: PrefetchConfig = field(default_factory=PrefetchConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     hardware: HardwareConfig = field(default_factory=HardwareConfig)
     quantization: QuantizationConfig = field(default_factory=QuantizationConfig)

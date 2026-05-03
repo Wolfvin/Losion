@@ -5,6 +5,89 @@ All notable changes to the Losion project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-05-03 — "Next-Gen Training & Infinite Experts"
+
+### Added — DAPO (Replaces GRPO)
+
+- **DAPO** (`training/dapo.py`): Decoupled Clip & Dynamic Sampling Policy Optimization.
+  4 key improvements over GRPO: (1) Decoupled clip with separate low/high ratios (0.2/0.28)
+  prevents both policy collapse and reward hacking, (2) Dynamic sampling filters prompts with
+  zero-variance rewards for ~15-20% efficiency gain, (3) Token-level policy gradient loss for
+  finer credit assignment, (4) Overlong filtering penalizes excessively long responses.
+  Includes DAPOResult, DAPORewardFunction, and full DAPOTrainer with Losion Tri-Jalur
+  compatibility (different thinking_mode per sample).
+  Credits: Yu et al., arXiv 2503.14476 (2025).
+
+### Added — ∞-MoE (Infinite Mixture of Experts)
+
+- **∞-MoE** (`core/retrieval/infinite_moe.py`): Extends MoE from finite discrete experts to
+  continuous (infinite) expert space. ExpertCodeRouter produces expert codes + routing logits
+  in continuous space. ContinuousExpertGenerator (hypernetwork) generates expert weights from
+  codes — shared base expert + code-conditioned scaling/bias/low-rank residual modifications.
+  ExpertCodeClusterer for inference efficiency (merges nearby codes). Drop-in replacement for
+  discrete MoE layers with unlimited capacity.
+  Credits: arXiv 2601.17680 (2026).
+
+### Added — L-MTP (Leap Multi-Token Prediction)
+
+- **L-MTP** (`core/output/leap_mtp.py`): Extends MTP from predicting adjacent future tokens to
+  LEAPING — predicting tokens at arbitrary future positions. Geometric leap schedule (1, 2, 4,
+  8 steps) covers 2x more positions than adjacent MTP. Two-stage training: warm-up heads
+  with frozen backbone, then joint fine-tuning. Geometric decay loss weights. LeapSpeculative
+  Decoder with gap-filling via SSM pathway. Backward compatible: ADJACENT schedule = standard
+  MTP.
+  Credits: arXiv 2505.17505, NeurIPS 2025.
+
+### Added — Cross-Jalur Attention-MoE Routing
+
+- **Cross-Jalur Routing** (`core/retrieval/cross_jalur_routing.py`): Bridges Jalur 2 (Attention)
+  and Jalur 3 (MoE/Retrieval) using attention weights to guide expert selection. AttentionGraph
+  Builder constructs sparse token affinity graph from attention weights. CrossJalurRouter
+  performs graph convolution to propagate routing logits across attended tokens. RoutingSmoother
+  blends original and attention-informed logits with learnable gate. Reduces routing
+  fluctuations and improves expert specialization.
+  Credits: arXiv 2505.00792 (2025).
+
+### Added — RLVR (Reinforcement Learning with Verifiable Rewards)
+
+- **RLVR** (`training/rlvr.py`): Replaces learned reward models with objective, programmable
+  verification functions. MathVerifier (numeric + symbolic comparison), CodeVerifier (sandboxed
+  execution), FormatVerifier (regex + length + JSON), ExactMatchVerifier (exact/fuzzy matching).
+  CompositeVerifier with curriculum difficulty scheduling (EASY→MEDIUM→HARD). Integrates with
+  DAPO/GRPO as the reward function provider.
+  Credits: NeurIPS 2025, arXiv 2601.05607, 2603.22117.
+
+### Added — Expert Prefetching (Speculating Experts)
+
+- **Expert Prefetcher** (`inference/expert_prefetch.py`): Uses computed representations to predict
+  which MoE experts are needed in subsequent layers, enabling prefetching and hiding
+  communication latency. LightweightPredictor (2-layer MLP, <1% parameter overhead) per layer.
+  Supports both finite MoE (discrete prediction) and ∞-MoE (continuous code prediction with L2
+  distance matching). PrefetchAccuracyTracker with rolling-window precision/recall. Adaptive
+  temperature scheduling.
+  Credits: arXiv 2603.19289 (2026).
+
+### Added — Losion Training Orchestrator
+
+- **LosionTrainingOrchestrator** (`training/losion_orchestrator.py`): One-stop training
+  orchestrator integrating ALL 13+ Losion training techniques into a unified 4-phase pipeline.
+  Phase 1: WSD + JEPA + expert specialization. Phase 2: JEPA (reduced) + TACO + curriculum +
+  active learning. Phase 3: DAPO/GRPO (auto-selected based on config) + RLVR + ETR + TACO +
+  evolutionary search. Phase 4: Gen distillation + BitDistill + ETR + early exit. Full
+  checkpoint save/resume with all training state. Comprehensive metrics tracking.
+
+### Changed — Model & Config Updates
+
+- **LosionModelV2** (`models/losion_model_v2.py`): Added ∞-MoE support in _build_moe().
+  Fixed dimension mismatch handling — replaced zero-filled linear projections with proper
+  learned projections with identity initialization.
+- **LosionConfig** (`config.py`): Added DAPOConfig, RLVRConfig, PrefetchConfig sub-configs.
+  Added Infinite MoE fields in RetrievalConfig. Added L-MTP fields in OutputConfig. Added
+  Cross-Jalur Routing fields in AttentionConfig. Added Structured Sparse fields in SSMConfig.
+- **CREDITS.md**: Added 7 new component references (#29-#35) for all v0.8 additions.
+
+---
+
 ## [0.7.0] — 2026-05-03 — "Integrated & Complete"
 
 ### Added — CRITICAL: Model Integration
