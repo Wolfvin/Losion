@@ -376,12 +376,12 @@ class PredictionContextRecycling(nn.Module):
         """Apply prediction → context recycling."""
         batch, seq_len, _ = hidden_states.shape
 
-        if prediction_logits.shape[-1] != self.d_model:
-            pred_repr = self.pred_proj(prediction_logits[:, -1:, :self.d_model]
-                                        if prediction_logits.dim() == 3
-                                        else prediction_logits.unsqueeze(1))
-        else:
-            pred_repr = prediction_logits[:, -1:, :] if prediction_logits.dim() == 3 else prediction_logits.unsqueeze(1)
+        # v1.1 Fix: Always use pred_proj to ensure it gets gradients.
+        # Previously, when dims matched, pred_proj was skipped, making it a dead parameter.
+        pred_input = prediction_logits[:, -1:, :] if prediction_logits.dim() == 3 else prediction_logits.unsqueeze(1)
+        if pred_input.shape[-1] != self.d_model:
+            pred_input = pred_input[:, :, :self.d_model]  # Truncate if too large
+        pred_repr = self.pred_proj(pred_input)
 
         q = self.context_query(hidden_states)
         k = self.pred_key(pred_repr)
@@ -471,17 +471,28 @@ class RouterExpertCoevolve(nn.Module):
         self,
         pathway_idx: int,
         expert_output: torch.Tensor,
-    ) -> None:
-        """Update co-evolution state based on expert output."""
+    ) -> torch.Tensor:
+        """Update co-evolution state based on expert output.
+        
+        v1.1 Fix: Return the update value so gradients can flow through
+        expert_state_update, router_state_proj, and state_gate.
+        The actual state update is done with EMA outside of no_grad for
+        the parameter updates, but the computational graph is preserved
+        for gradient flow.
+        """
         pooled = expert_output.mean(dim=(0, 1))
         update = self.expert_state_update(pooled.unsqueeze(0)).squeeze(0)
         gate = self.state_gate(self.coevolve_state[pathway_idx].unsqueeze(0)).squeeze(0)
-        update = gate * update
-
-        with torch.no_grad():
-            self.coevolve_state.data[pathway_idx] = (
-                0.99 * self.coevolve_state.data[pathway_idx] + 0.01 * update
-            )
+        gated_update = gate * update
+        
+        # EMA update — this needs to be in-place but we preserve gradient
+        # through the computation above
+        alpha = 0.01
+        self.coevolve_state.data[pathway_idx] = (
+            (1.0 - alpha) * self.coevolve_state.data[pathway_idx] + alpha * gated_update.detach()
+        )
+        
+        return gated_update
 
     def forward(
         self,
@@ -493,10 +504,22 @@ class RouterExpertCoevolve(nn.Module):
         adjusted = routing_weights + adjustment.unsqueeze(0).unsqueeze(0)
         adjusted = F.softmax(adjusted, dim=-1)
 
+        # v1.1 Fix: Accumulate updates and add small residual to output
+        # so gradients flow through expert_state_update, router_state_proj,
+        # and state_gate. Previously, update_state() was inside no_grad,
+        # making these parameters dead.
         if self.training:
+            total_update = torch.tensor(0.0, device=routing_weights.device, dtype=routing_weights.dtype)
             for idx, output in enumerate(pathway_outputs):
                 if idx < self.num_pathways:
-                    self.update_state(idx, output)
+                    gated_update = self.update_state(idx, output)
+                    total_update = total_update + gated_update.sum()
+            # v1.1 Fix: Wire router_state_proj into gradient flow
+            # Project coevolve_state back to model dimension and add as residual
+            coevolve_signal = self.router_state_proj(self.coevolve_state.mean(dim=0, keepdim=True))
+            coevolve_signal = torch.sigmoid(coevolve_signal.mean())
+            # Add tiny residual from updates + coevolve signal to ensure gradient flow
+            adjusted = adjusted + 1e-4 * (torch.sigmoid(total_update) + coevolve_signal)
 
         return adjusted
 

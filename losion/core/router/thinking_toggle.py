@@ -44,6 +44,7 @@ class ThinkingAssessment:
     dominant_task: TaskType
     depth_multiplier: float  # Berapa kali lipat depth untuk Jalur 2+3
     confidence: float  # Confidence dalam assessment
+    thinking_score: torch.Tensor = None  # [batch] — per-sample thinking score from context_integrator
 
 
 class ThinkingToggle(nn.Module):
@@ -201,6 +202,7 @@ class ThinkingToggle(nn.Module):
             dominant_task=dominant_task,
             depth_multiplier=depth_multiplier,
             confidence=confidence,
+            thinking_score=thinking_score,  # Preserve gradient flow to context_integrator
         )
 
     def _get_force_mode(self) -> Optional[ThinkingMode]:

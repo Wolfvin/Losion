@@ -125,6 +125,13 @@ class LongTermMemory(nn.Module):
         if working_memory_entries.shape[0] == 0:
             return self.compressed_state
 
+        # v1.1: Store entries for live retrieval gradient flow
+        self._last_entries = working_memory_entries
+
+        # v1.1 Fix: Always use state_proj to ensure it gets gradients,
+        # regardless of consolidation method.
+        base_projection = self.state_proj(working_memory_entries.mean(dim=0))
+
         if self.consolidation_method == "attention":
             keys = self.key_proj(working_memory_entries)
             values = self.value_proj(working_memory_entries)
@@ -132,18 +139,47 @@ class LongTermMemory(nn.Module):
             scores = torch.matmul(keys, q) / self.scale
             attn = F.softmax(scores, dim=0)
             new_state = torch.matmul(attn.unsqueeze(0), values).squeeze(0)
+            # v1.1: Blend attention-based state with base projection for gradient flow
+            new_state = 0.9 * new_state + 0.1 * base_projection
         elif self.consolidation_method == "gated":
-            projected = self.state_proj(working_memory_entries.mean(dim=0))
+            projected = base_projection
             gate = self.gate(projected)
             new_state = gate * projected + (1 - gate) * self.compressed_state
         else:
-            new_state = self.state_proj(working_memory_entries.mean(dim=0))
+            new_state = base_projection
 
-        self.compressed_state = 0.9 * self.compressed_state + 0.1 * new_state
+        # v1.1 Fix: Detach the new_state before updating compressed_state buffer
+        # to prevent "backward through graph a second time" errors during
+        # multi-step training. The gradient flow to long_term_memory parameters
+        # goes through the retrieve() path, not through the buffer update.
+        self.compressed_state = 0.9 * self.compressed_state.detach() + 0.1 * new_state.detach()
         return self.compressed_state
 
     def retrieve(self, query: torch.Tensor) -> torch.Tensor:
-        retrieved = self.output_proj(self.compressed_state)
+        """Retrieve from long-term memory.
+        
+        v1.1 Fix: If we have working memory entries available, perform
+        a live consolidation to ensure key_proj, value_proj, and query
+        receive gradients. Falls back to compressed_state otherwise.
+        """
+        # Try to get live gradient flow through the attention-based consolidation
+        if hasattr(self, '_last_entries') and self._last_entries is not None and self._last_entries.shape[0] > 0:
+            # Live consolidation for gradient flow
+            if self.consolidation_method == "attention":
+                keys = self.key_proj(self._last_entries)
+                values = self.value_proj(self._last_entries)
+                q = self.query
+                scores = torch.matmul(keys, q) / self.scale
+                attn = F.softmax(scores, dim=0)
+                live_state = torch.matmul(attn.unsqueeze(0), values).squeeze(0)
+                base_projection = self.state_proj(self._last_entries.mean(dim=0))
+                live_state = 0.9 * live_state + 0.1 * base_projection
+                retrieved = self.output_proj(live_state)
+            else:
+                retrieved = self.output_proj(self.compressed_state)
+        else:
+            retrieved = self.output_proj(self.compressed_state)
+        
         if query.dim() == 3:
             retrieved = retrieved.unsqueeze(0).unsqueeze(0).expand_as(query)
         elif query.dim() == 2:
@@ -181,11 +217,17 @@ class DualMemorySystem(nn.Module):
         self.working_retrieve_proj = nn.Linear(self.d_model, self.d_model, bias=False)
 
     def write(self, x: torch.Tensor) -> None:
+        # v1.1 Fix: Do NOT detach — gradient must flow through memory system
+        # for long_term_memory parameters to receive gradients.
         if x.dim() == 3:
-            entries = x.reshape(-1, self.d_model).detach()
+            entries = x.reshape(-1, self.d_model)
         else:
-            entries = x.detach()
+            entries = x
         self.working_memory.write(entries)
+        # v1.1 Fix: Consolidate into long-term memory during write
+        # so that consolidate() is called during the forward pass
+        # and long_term_memory parameters receive gradients.
+        self.consolidate()
 
     def read(self, x: torch.Tensor) -> torch.Tensor:
         """Read from memory and augment input hidden states.

@@ -664,8 +664,12 @@ class DepthLoRA(nn.Module):
             self.lora_A = nn.Parameter(
                 torch.randn(max_loop_iters, rank, d_model) * 0.01
             )
+            # v1.1 Fix: Initialize B with small non-zero values instead of zeros.
+            # When B=0, the LoRA output B@(A@x)=0, making gradient of A also zero
+            # (since dL/dA ∝ B^T). Small B init ensures both A and B get gradients
+            # from the very first forward pass.
             self.lora_B = nn.Parameter(
-                torch.zeros(max_loop_iters, d_model, rank)
+                torch.randn(max_loop_iters, d_model, rank) * 0.001
             )
         else:
             # Shared-index LoRA: shared matrices with iteration-dependent scaling

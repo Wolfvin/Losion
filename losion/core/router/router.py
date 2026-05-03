@@ -90,8 +90,13 @@ class AdaptiveRouter(nn.Module):
 
         # === Thinking-Weight Adjustment Layer ===
         # Modifikasi routing weights berdasarkan thinking assessment
+        # Fix: Include task_type_probs + thinking_score in adjuster input so that
+        # task_classifier AND context_integrator receive gradients through the adjuster.
+        # Input: routing_weights(3) + complexity_signal(1) + thinking_score(1) + task_type_probs(5)
+        from .thinking_toggle import TaskType
+        num_task_types = len(TaskType)
         self.thinking_adjuster = nn.Sequential(
-            nn.Linear(num_pathways + 1, num_pathways * 2),
+            nn.Linear(num_pathways + 1 + 1 + num_task_types, num_pathways * 2),
             nn.SiLU(),
             nn.Linear(num_pathways * 2, num_pathways),
         )
@@ -177,10 +182,22 @@ class AdaptiveRouter(nn.Module):
         complexity = assessment.complexity_score  # [batch, seq]
         thinking_signal = complexity.unsqueeze(-1)  # [batch, seq, 1]
 
-        # Concat routing weights + thinking signal
+        # v1.1 Fix: Include thinking_score (from context_integrator) so it
+        # receives gradients through the adjuster. Broadcast per-batch score
+        # to per-token: [batch] → [batch, 1, 1] → [batch, seq, 1]
+        thinking_score_signal = assessment.thinking_score  # [batch]
+        if thinking_score_signal is not None:
+            thinking_score_signal = thinking_score_signal.unsqueeze(-1).unsqueeze(-1)  # [batch, 1, 1]
+            thinking_score_signal = thinking_score_signal.expand(batch_size, seq_len, 1)  # [batch, seq, 1]
+        else:
+            thinking_score_signal = torch.zeros(batch_size, seq_len, 1, device=device, dtype=dtype)
+
+        # Concat routing weights + thinking signal + thinking score + task type probs
+        # Fix: Include task_type_probs AND thinking_score so task_classifier
+        # AND context_integrator receive gradients through the thinking_adjuster.
         adjuster_input = torch.cat(
-            [routing_weights, thinking_signal], dim=-1
-        )  # [batch, seq, num_pathways + 1]
+            [routing_weights, thinking_signal, thinking_score_signal, assessment.task_type_probs], dim=-1
+        )  # [batch, seq, num_pathways + 1 + 1 + num_task_types]
 
         # Hitung adjustment
         adjustment = self.thinking_adjuster(adjuster_input)  # [batch, seq, num_pathways]

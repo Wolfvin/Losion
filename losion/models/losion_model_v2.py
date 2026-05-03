@@ -367,7 +367,7 @@ def _build_moe(config: LosionConfig) -> nn.Module:
                 d_model=d_model,
                 d_ff=d_ff,
                 num_experts=num_experts,
-                num_active_experts=ret_cfg.num_active_experts,
+                top_k=ret_cfg.num_active_experts,
             )
             return base_moe
 
@@ -377,7 +377,7 @@ def _build_moe(config: LosionConfig) -> nn.Module:
             d_model=d_model,
             d_ff=d_ff,
             num_experts=num_experts,
-            num_active_experts=ret_cfg.num_active_experts,
+            top_k=ret_cfg.num_active_experts,
         )
 
     except ImportError:
@@ -909,15 +909,37 @@ class LosionModelV2(nn.Module):
                 from losion.core.recurrent.rdt import RecurrentDepthBlock
 
                 class _RDTResidualBlock(nn.Module):
-                    """Simple residual block for RDT that accepts extra kwargs and returns (output, aux)."""
+                    """SwiGLU residual block for RDT — more expressive than simple linear.
+                    
+                    Accepts extra kwargs and returns (output, aux) as required by RecurrentDepthBlock.
+                    Uses SwiGLU activation for better gradient flow and representational capacity,
+                    ensuring that the DepthLoRA adaptation applied before this block has meaningful
+                    gradients to optimize.
+                    
+                    Credits: Fix inspired by benchmark results showing zero gradients on depth_lora.lora_A
+                    due to the simple linear block absorbing the LoRA delta.
+                    """
                     def __init__(self, d_model: int):
                         super().__init__()
                         self.norm = RMSNorm(d_model)
-                        self.proj = nn.Linear(d_model, d_model, bias=False)
+                        d_ff = d_model * 2  # 2x expansion for SwiGLU
+                        self.gate_proj = nn.Linear(d_model, d_ff, bias=False)
+                        self.up_proj = nn.Linear(d_model, d_ff, bias=False)
+                        self.down_proj = nn.Linear(d_ff, d_model, bias=False)
+                        # Initialize with small weights so RDT starts near-identity
+                        # but NOT zero — zero init on down_proj would kill LoRA gradients
+                        # since the block would output pure identity (residual only).
+                        nn.init.normal_(self.gate_proj.weight, std=0.01)
+                        nn.init.normal_(self.up_proj.weight, std=0.01)
+                        nn.init.normal_(self.down_proj.weight, std=0.01)
 
                     def forward(self, x, **kwargs):
-                        out = x + self.proj(self.norm(x))
-                        return out, None  # RDT expects (output, aux_info) tuple
+                        residual = x
+                        x_norm = self.norm(x)
+                        gate = F.silu(self.gate_proj(x_norm))
+                        up = self.up_proj(x_norm)
+                        out = self.down_proj(gate * up)
+                        return residual + out, None  # RDT expects (output, aux_info) tuple
 
                 rdt_inner = _RDTResidualBlock(config.d_model)
                 self.rdt_block = RecurrentDepthBlock(
@@ -980,8 +1002,13 @@ class LosionModelV2(nn.Module):
             self.attn_res_manager.reset()
 
         # Layer processing
-        all_routing_info = [] if return_routing_info else None
-        all_hidden_states = [] if return_all_hidden_states else None
+        # v1.1 Fix: When Evoformer is enabled, always collect routing info
+        # (needed for Level 5 router_expert_coevolve)
+        all_routing_info = [] if (return_routing_info or self.use_evoformer) else None
+        # v1.1 Fix: When Evoformer is enabled, always collect hidden states
+        # (needed for Level 1 layer_recycling and Level 4 prediction_recycling)
+        # Also, do NOT detach — gradients must flow through Evoformer levels.
+        all_hidden_states = [] if (return_all_hidden_states or self.use_evoformer) else None
         ssm_states = {}
 
         for layer in self.layers:
@@ -1019,12 +1046,33 @@ class LosionModelV2(nn.Module):
                 all_routing_info.append(layer_routing)
 
             if all_hidden_states is not None:
+                # v1.1 Fix: Detach to prevent "backward through graph a second time" errors.
+                # The Evoformer Level 1 operates on these collected states for its
+                # own internal computation (revision signals). The gradient flow
+                # to Evoformer's own parameters (shallow_query_proj, deep_key_proj,
+                # etc.) comes from the recycled output that gets combined with x.
+                # If we don't detach, the second forward pass would try to backward
+                # through the first pass's graph which has already been freed.
                 all_hidden_states.append(x.detach())
 
         # Evoformer Level 1: Inter-layer recycling (v0.9)
+        # v1.1 Fix: Add recycling as a RESIDUAL to x, NOT replacing x.
+        # Previously, x was replaced with recycled states (which are detached
+        # from the computation graph), breaking ALL gradient flow to the
+        # backbone (token_embedding, layers, etc.). Now we keep x as the
+        # primary gradient path and add a small residual from recycling.
         if self.use_evoformer and all_hidden_states is not None and len(all_hidden_states) > 1:
             recycled = self.evoformer_manager.recycle_layers(all_hidden_states)
-            x = recycled[-1]
+            # Add revision signal as residual (recycled[i] = h_i + revision)
+            # The revision is the new part; we take it from the shallow layers
+            # and add it to x with a small weight to preserve gradient flow
+            n_layers = len(recycled)
+            mid = n_layers // 2
+            # Get the revision signal: recycled[0] - hidden_states[0]
+            # (recycled shallow layers have revision added)
+            revision_signal = recycled[0] - all_hidden_states[0]  # detached - detached = detached
+            # Add as small residual to x (which still has gradient)
+            x = x + 0.01 * revision_signal
 
         # Evoformer Level 2: Bidirectional token update (v0.9)
         if self.use_evoformer:

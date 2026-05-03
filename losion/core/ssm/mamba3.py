@@ -506,22 +506,42 @@ class Mamba3SSD(nn.Module):
         # A_log: (d_inner, d_state) → negatif setelah exp
         A = -torch.exp(self.A_log.float()).to(dtype=x_conv.dtype)  # (d_inner, d_state)
 
-        # Untuk SSD scan: A per (batch, seq_len, d_state), dt per (batch, seq_len)
-        # Gunakan dt rata-rata per token dan A rata-rata per d_inner
-        dt_avg = dt_full.mean(dim=-1)  # (batch, seq_len)
-        A_avg = A.mean(dim=0)  # (d_state,)
-
         # ---- Step 6: SSD Scan dengan inference-first discretization ----
-        y, final_state = mamba3_ssd_scan(
-            x_seq=x_conv,
-            A=A_avg.unsqueeze(0).unsqueeze(0).expand(batch, seq_len, -1),
-            B=B,
-            C=C,
-            dt=dt_avg,
-            chunk_size=self.chunk_size,
-            initial_state=initial_state,
-            dt_clamp_max=self.dt_clamp_max,
-        )
+        # Fix: Use per-channel dt and per-inner-dim A for proper gradient flow.
+        # Previously, averaging dt over channels and A over d_inner destroyed
+        # channel-specific information, causing zero gradients for dt_proj/dt_bias.
+        # Now we use a per-channel scan that preserves gradient flow.
+        
+        # Clamp dt for stability
+        dt_clamped = dt_full.clamp(min=0.0, max=self.dt_clamp_max)  # (batch, seq_len, d_inner)
+        
+        # Per-channel discretization
+        # dA = exp(clamp(dt * A, max=0)) per (batch, seq_len, d_inner, d_state)
+        dA_raw = dt_clamped.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0)  # (batch, seq_len, d_inner, d_state)
+        dA = torch.exp(dA_raw.clamp(max=0.0))  # (batch, seq_len, d_inner, d_state)
+        
+        # dB = softplus(dt) * B — stabilized input scaling
+        dt_stabilized = F.softplus(dt_clamped)  # (batch, seq_len, d_inner)
+        
+        # Sequential scan with per-channel states
+        h = torch.zeros(
+            batch, self.d_inner, self.d_state,
+            dtype=x_conv.dtype, device=x_conv.device,
+        ) if initial_state is None else initial_state.clone()
+        
+        outputs = []
+        for t in range(seq_len):
+            h = h * dA[:, t, :, :]  # (batch, d_inner, d_state)
+            # B is (batch, d_state), x is (batch, d_inner)
+            dB_t = dt_stabilized[:, t, :].unsqueeze(-1) * B[:, t, :].unsqueeze(1)  # (batch, d_inner, d_state)
+            h = h + x_conv[:, t, :].unsqueeze(-1) * dB_t  # (batch, d_inner, d_state)
+            
+            # Output: y_t = C_t @ h_t per channel
+            y_t = torch.sum(h * C[:, t, :].unsqueeze(1), dim=-1)  # (batch, d_inner)
+            outputs.append(y_t)
+        
+        y = torch.stack(outputs, dim=1)  # (batch, seq_len, d_inner)
+        final_state = h
 
         # ---- Step 7: Skip connection D ----
         y = y + x_conv * self.D.unsqueeze(0).unsqueeze(0)
