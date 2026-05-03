@@ -271,6 +271,46 @@ class ThinkingToggle(nn.Module):
         mask = (assessment.complexity_score > self.threshold).float()
         return mask
 
+    def compute_auxiliary_loss(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute auxiliary loss ensuring gradient flow to all ThinkingToggle sub-modules.
+
+        This loss encourages:
+        1. Balanced task type predictions (prevents collapse to one task type)
+        2. Non-degenerate complexity scores (prevents saturation to 0 or 1)
+        3. Non-degenerate thinking scores from context_integrator
+
+        Returns:
+            Scalar auxiliary loss tensor with gradient flow to all sub-modules.
+        """
+        # Forward pass to get all internal activations
+        complexity = self.complexity_scorer(x).squeeze(-1)  # [batch, seq] - from complexity_scorer
+        task_logits = self.task_classifier(x)  # [batch, seq, num_task_types]
+        task_probs = F.softmax(task_logits, dim=-1)
+
+        # Aggregate
+        mean_complexity = complexity.mean(dim=-1, keepdim=True)  # [batch, 1]
+        mean_task_probs = task_probs.mean(dim=1)  # [batch, num_task_types]
+        context_input = torch.cat([mean_complexity, mean_task_probs], dim=-1)
+        thinking_score = self.context_integrator(context_input).squeeze(-1)  # [batch]
+
+        # Loss 1: Task type balance — encourage uniform distribution
+        target_uniform = torch.ones_like(task_probs) / task_probs.shape[-1]
+        task_balance_loss = F.kl_div(task_probs.log(), target_uniform, reduction='batchmean')
+
+        # Loss 2: Complexity regularization — prevent saturation
+        complexity_mean = complexity.mean()
+        complexity_var = complexity.var()
+        complexity_reg = (complexity_mean - 0.5).pow(2) + (1.0 - complexity_var).clamp(min=0.0)
+
+        # Loss 3: Thinking score regularization — prevent collapse to 0 or 1
+        thinking_reg = (thinking_score.mean() - 0.5).pow(2)
+
+        # Combined — all three sub-modules (complexity_scorer, task_classifier, context_integrator)
+        # receive gradients through this loss
+        aux_loss = 0.1 * task_balance_loss + 0.01 * complexity_reg + 0.01 * thinking_reg
+
+        return aux_loss
+
     def get_depth_schedule(
         self, assessment: ThinkingAssessment
     ) -> torch.Tensor:

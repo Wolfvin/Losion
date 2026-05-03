@@ -5,6 +5,113 @@ All notable changes to the Losion project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] — 2026-05-03 — "Bug Fix Release"
+
+### Fixed — CRITICAL: 5 Bugs Resolved
+
+- **Bug 1 — ThinkingToggle gradient flow**: `task_classifier` and `context_integrator`
+  (48 parameters) received no gradients during training. Root cause: while the
+  AdaptiveRouter's `thinking_adjuster` already included their outputs in the computation
+  graph, there was no explicit loss term ensuring gradient flow when the model's main
+  loss didn't backprop through the adjuster strongly enough. Fix: Added
+  `compute_auxiliary_loss()` method to ThinkingToggle that computes a regularization
+  loss (task type balance + complexity anti-saturation + thinking score anti-collapse)
+  ensuring ALL sub-modules receive gradients. Verified: 0 parameters without gradient.
+
+- **Bug 2 — GatedAttention crash standalone**: `GatedAttentionHead.forward()` and
+  `GatedMultiHeadAttention.forward()` crashed when called with 2D input (no batch
+  dimension). The sigmoid gate and attention computation expected 3D tensors. Fix:
+  Added dimension validation at the top of both `forward()` methods — auto-unsqueeze
+  2D inputs and squeeze outputs back before return.
+
+- **Bug 3 — MoBA crash standalone**: `MoBAAttention.forward()` crashed with
+  "too many indices for tensor of dimension 2" when called with 2D input. Same
+  pattern as GatedAttention. Fix: Added identical 2D→3D dimension handling.
+
+- **Bug 4 — SymbolicMoERouter constructor mismatch**: `_build_moe()` imported
+  `SymbolicMoERouter` but didn't properly wire it with the base MoE. The router's
+  constructor (`d_model`, `routing_rule`, `skill_classifier`, `routing_mode`,
+  `temperature`, `classifier_bottleneck`) didn't match how it was being called.
+  Fix: Created `_SymbolicMoEWrapper` class that holds both an `AuxFreeMoE` base
+  and a `SymbolicMoERouter` with correct constructor arguments. The wrapper applies
+  symbolic routing before the base MoE forward pass.
+
+- **Bug 5 — KV Cache not passed between generation steps**: The most subtle bug.
+  In `LosionModelV2.forward_inference()`, `new_kvs` was declared but never filled
+  or returned — attention KV cache was discarded every step. In
+  `LosionLayerV2.forward_inference()`, the attention KV cache was extracted from
+  the result tuple but only the output tensor was kept. Fix: Three-part change:
+  (1) `LosionLayerV2.forward_inference()` now captures and returns `attn_kv_cache`
+  from attention modules, (2) `LosionModelV2.forward_inference()` now collects
+  `attn_kv_cache` from each layer into `new_kvs` and returns it alongside
+  `ssm_states`, (3) `LosionForCausalLMV2.generate()` now passes and updates
+  `past_kvs` during the generation loop.
+
+### Fixed — MEDIUM: 5 Issues Resolved
+
+- **Issue 1 — KVQuantization & DMS not integrated**: `kv_quantization.py` and
+  `dynamic_sparsification.py` existed but were never imported or used in the model.
+  Fix: Integrated into `LosionForCausalLMV2.__init__()` (config-driven initialization)
+  and `generate()` method (per-step DMS eviction + KV quantization update).
+
+- **Issue 2-3 — Silent failures**: 10+ `except Exception: pass` blocks in the
+  orchestrator and JEPA loss computation silently swallowed errors, making debugging
+  impossible. Fix: Replaced with `except Exception as e: logger.warning(...)` with
+  descriptive component names (JEPA, ETR, BitDistill, TACO, Distillation, etc.).
+
+- **Issue 4-5 — Router & MoE gradient norms too small**: Router gradient norm was
+  0.013 vs embedding 11.0 (800x slower), MoE was 0.063 (175x slower). Fix: Added
+  `_apply_gradient_scaling()` method to `LosionForCausalLMV2` that registers
+  gradient scaling hooks: router/thinking_toggle params get 10x scaling, MoE/expert
+  params get 5x scaling, JEPA params get 20x scaling.
+
+### Fixed — LOW: 4 Issues Resolved
+
+- **Issue 6 — LosionGenerator doesn't use KV cache**: `_generate_greedy()` and
+  `_generate_sampling()` in `generation.py` re-forwarded the entire context every
+  step (O(n²)). Fix: Rewrote both methods to use a prefill + decode pattern —
+  full forward for prefill, then `forward_inference()` with SSM states + KV cache
+  for O(1) per-token decode steps. Graceful fallback when `forward_inference`
+  unavailable.
+
+- **Issue 7 — Sliding window & MoSA not in YAML configs**: v1.1 features existed
+  in the model but couldn't be toggled from YAML. Fix: Added `sliding_window`,
+  `mosa`, `kv_quant`, `dms`, and `parallel_head` sections to `losion-1b.yaml`
+  (all disabled by default).
+
+- **Issue 8 — `_from_dict` missing v1.1 sub-configs**: `SlidingWindowConfig`,
+  `MoSAConfig`, `KVQuantConfig`, `DMSConfig`, `ParallelHeadConfig` weren't parsed
+  in `LosionConfig._from_dict()`. Loading from YAML with these sections would crash.
+  Fix: Added parsers for all 5 sub-configs after the `dual_memory` block.
+
+- **Issue 9 — JEPA gradient norm very small (0.0096)**: JEPA params learned 1100x
+  slower than embedding. Fix: Included in gradient scaling (20x for JEPA params).
+
+### Changed — Generation logits dimension fix
+
+- `LosionForCausalLMV2.generate()`: Fixed logits shape handling. Previously,
+  `next_logits` was `(batch, 1, vocab_size)` (3D) which caused dimension mismatch
+  with `generated` (2D). Now properly squeezed to `(batch, vocab_size)` before
+  token selection and concatenation.
+
+### Verification Results
+
+- Forward pass: Clean, no NaN/Inf
+- Backward pass: All parameter categories have gradients (0 params without gradient,
+  excluding non-trainable target encoder and MTP auxiliary heads)
+- Gradient norms after scaling: router avg=0.11, MoE avg=0.34, JEPA avg=0.11,
+  embedding avg=9.58
+- Generation with KV cache: Works correctly, 20 tokens generated
+- Save/Load round-trip: Perfect (max diff = 0.0)
+- YAML config parsing: All v1.1 sub-configs parsed correctly
+- Training: Loss decreasing (7.65 → 6.75 over 3 steps)
+
+### Credits
+
+- Losion Framework: Wolfvin & Contributors (github.com/Wolfvin/Losion)
+
+---
+
 ## [1.1.0] — 2026-05-03 — "Memory Efficiency v0.10"
 
 ### Added — Sliding Window Attention (RATTENTION-inspired)

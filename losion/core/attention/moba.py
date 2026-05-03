@@ -855,12 +855,21 @@ class MoBAAttention(nn.Module):
               ``"routing_weights"``, ``"aux_loss"``, and
               ``"present_key_value"``.
         """
+        # Handle standalone call without batch dimension
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+            squeeze_output = True
+        else:
+            squeeze_output = False
+
         batch, seq_len, _ = x.shape
 
         if seq_len == 0:
             dummy_out = torch.zeros(
                 batch, 0, self.d_model, dtype=x.dtype, device=x.device
             )
+            if squeeze_output:
+                dummy_out = dummy_out.squeeze(0)
             return dummy_out, {
                 "selected_blocks": None,
                 "routing_weights": None,
@@ -957,6 +966,9 @@ class MoBAAttention(nn.Module):
 
         present_key_value = (new_kv_cache, new_c_kv)
 
+        if squeeze_output:
+            output = output.squeeze(0)
+
         routing_info = {
             "selected_blocks": selected_blocks,
             "routing_weights": routing_weights,
@@ -987,9 +999,21 @@ class MoBAAttention(nn.Module):
             Tuple ``(output, routing_info)`` with the same structure
             as ``forward()``.
         """
-        return self.forward(
+        # Handle standalone call without batch dimension
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+            squeeze_output = True
+        else:
+            squeeze_output = False
+
+        output, routing_info = self.forward(
             x,
             attention_mask=None,
             past_key_value=past_key_value,
             position_offset=0,
         )
+
+        if squeeze_output:
+            output = output.squeeze(0)
+
+        return output, routing_info

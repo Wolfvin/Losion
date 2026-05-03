@@ -227,6 +227,36 @@ model:
     long_term_memory_dim: 256
     consolidation_method: "attention"
 
+  # v1.1 — Memory Efficiency Features
+  sliding_window:
+    enabled: false
+    window_size: 512
+    use_token_sink: true
+    num_sink_tokens: 1
+
+  mosa:
+    enabled: false
+    num_sparse_experts: 4
+    top_k_experts: 2
+    sparsity_ratio: 0.5
+
+  kv_quant:
+    enabled: false
+    mode: "int8"
+    group_size: 64
+
+  dms:
+    enabled: false
+    target_cache_ratio: 0.5
+    eviction_strategy: "importance"
+    update_frequency: 64
+    min_tokens_to_keep: 32
+
+  parallel_head:
+    enabled: false
+    num_meta_tokens: 4
+    use_gated_fusion: true
+
 training:
   batch_size: 32
   learning_rate: 3.0e-4

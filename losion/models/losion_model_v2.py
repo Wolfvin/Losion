@@ -390,16 +390,40 @@ def _build_moe(config: LosionConfig) -> nn.Module:
 
         if ret_cfg.use_symbolic_moe:
             from losion.core.retrieval.symbolic_moe import SymbolicMoERouter
-            # Symbolic-MoE wraps another MoE with skill-based routing
-            # Build the base MoE first, symbolic routing is applied at layer level
             from losion.core.retrieval.aux_free_moe import AuxFreeMoE
+
+            class _SymbolicMoEWrapper(nn.Module):
+                """Wraps base MoE with SymbolicMoERouter for skill-based routing."""
+                def __init__(self, base_moe, symbolic_router):
+                    super().__init__()
+                    self.base_moe = base_moe
+                    self.symbolic_router = symbolic_router
+
+                def forward(self, x):
+                    # Get routing weights from symbolic router
+                    pathway_weights, skill_probs, routing_info = self.symbolic_router(x)
+                    # Forward through base MoE
+                    result = self.base_moe(x)
+                    # Add symbolic routing info to aux_info
+                    if isinstance(result, tuple):
+                        out, aux = result
+                        if isinstance(aux, dict):
+                            aux["symbolic_routing"] = routing_info
+                        return out, aux
+                    return result
+
             base_moe = AuxFreeMoE(
                 d_model=d_model,
                 d_ff=d_ff,
                 num_experts=num_experts,
                 top_k=ret_cfg.num_active_experts,
             )
-            return base_moe
+            symbolic_router = SymbolicMoERouter(
+                d_model=d_model,
+                routing_mode="soft",
+                classifier_bottleneck=128,
+            )
+            return _SymbolicMoEWrapper(base_moe, symbolic_router)
 
         # Default: AuxFreeMoE (DeepSeek-V3 style)
         from losion.core.retrieval.aux_free_moe import AuxFreeMoE
@@ -797,24 +821,30 @@ class LosionLayerV2(nn.Module):
 
         # Attention (with KV cache) — use unified adapter
         attn_input = self.attn_norm(x)
+        attn_kv_cache = None
         if hasattr(self.attention_layer, 'forward_inference'):
             try:
-                attn_out = self.attention_layer.forward_inference(
+                attn_result = self.attention_layer.forward_inference(
                     attn_input, past_kv=past_kv, position_ids=position_ids
                 )
             except TypeError:
                 try:
-                    attn_out = self.attention_layer.forward_inference(
+                    attn_result = self.attention_layer.forward_inference(
                         attn_input, past_key_value=past_kv, position_offset=(
                             position_ids[0, -1].item() if position_ids is not None and position_ids.numel() > 0 else 0
                         )
                     )
                 except TypeError:
-                    attn_out = self.attention_layer.forward_inference(attn_input)
+                    attn_result = self.attention_layer.forward_inference(attn_input)
         else:
-            attn_out = self._forward_attention(attn_input, None, past_kv, position_ids)
-        if isinstance(attn_out, tuple):
-            attn_out = attn_out[0]
+            attn_result = self._forward_attention(attn_input, None, past_kv, position_ids)
+        if isinstance(attn_result, tuple):
+            attn_out = attn_result[0]
+            # Capture KV cache from attention layer
+            if len(attn_result) > 1:
+                attn_kv_cache = attn_result[1]
+        else:
+            attn_out = attn_result
 
         # MoE (standard forward) — use unified adapter
         ret_input = self.retrieval_norm(x)
@@ -834,7 +864,11 @@ class LosionLayerV2(nn.Module):
         output = x + self.dropout(combined)
         output = self.output_norm(output)
 
-        return output, {"ssm_state": ssm_state_new, "route_weights": route_weights}
+        return output, {
+            "ssm_state": ssm_state_new,
+            "route_weights": route_weights,
+            "attn_kv_cache": attn_kv_cache,
+        }
 
 
 # ============================================================================
@@ -1161,10 +1195,13 @@ class LosionModelV2(nn.Module):
             )
             if info.get("ssm_state") is not None:
                 new_states[layer.layer_idx] = info["ssm_state"]
+            # Capture KV cache from attention layers
+            if info.get("attn_kv_cache") is not None:
+                new_kvs[layer.layer_idx] = info["attn_kv_cache"]
 
         x = self.final_norm(x)
 
-        return x, {"ssm_states": new_states}
+        return x, {"ssm_states": new_states, "past_kvs": new_kvs}
 
 
 # ============================================================================
@@ -1364,8 +1401,45 @@ class LosionForCausalLMV2(nn.Module):
             except Exception:
                 self.use_jepa = False
 
+        # KV Cache Quantization (optional, v1.1)
+        self.use_kv_quant = config.kv_quant.enabled
+        if self.use_kv_quant:
+            try:
+                from losion.inference.kv_quantization import QuantizedKVCache, KVQuantConfig as _KVQCfg, QuantizationMode
+                mode_map = {"fp16": QuantizationMode.FP16, "int8": QuantizationMode.INT8, "int4": QuantizationMode.INT4, "nf4": QuantizationMode.NF4}
+                quant_mode = mode_map.get(config.kv_quant.mode, QuantizationMode.INT8)
+                self.kv_quant_cache = QuantizedKVCache(
+                    n_layers=config.n_layers,
+                    n_heads=config.attention.n_heads,
+                    d_kv=config.attention.d_kv,
+                    config=_KVQCfg(mode=quant_mode, group_size=config.kv_quant.group_size),
+                    mla_latent_dim=config.attention.mla_latent_dim,
+                    max_seq_len=config.max_seq_len,
+                )
+            except ImportError:
+                self.use_kv_quant = False
+
+        # DMS - Dynamic Memory Sparsification (optional, v1.1)
+        self.use_dms = config.dms.enabled
+        if self.use_dms:
+            try:
+                from losion.core.memory.dynamic_sparsification import DynamicMemorySparsification, DMSConfig as _DMSCfg
+                self.dms = DynamicMemorySparsification(_DMSCfg(
+                    enabled=True,
+                    target_cache_ratio=config.dms.target_cache_ratio,
+                    eviction_strategy=config.dms.eviction_strategy,
+                    update_frequency=config.dms.update_frequency,
+                    min_tokens_to_keep=config.dms.min_tokens_to_keep,
+                ))
+                self.dms.init_predictor(d_kv=config.attention.d_kv)
+            except ImportError:
+                self.use_dms = False
+
         # Initialize weights
         self.apply(self._init_weights)
+
+        # Gradient scaling for router and MoE (v1.1 fix)
+        self._apply_gradient_scaling()
 
     @staticmethod
     def _init_weights(module: nn.Module) -> None:
@@ -1373,6 +1447,29 @@ class LosionForCausalLMV2(nn.Module):
             nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="linear")
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
+
+    def _apply_gradient_scaling(self) -> None:
+        """Apply gradient scaling to router and MoE parameters to compensate for
+        their much smaller gradient norms.
+
+        Problem: Router grad norm ~0.013, MoE grad norm ~0.063,
+        Embedding grad norm ~11.0
+        Solution: Scale router gradients by 10x and MoE gradients by 5x
+        during backward pass.
+        """
+        router_scale = 10.0
+        moe_scale = 5.0
+
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            name_lower = name.lower()
+            if 'router' in name_lower or 'thinking_toggle' in name_lower:
+                param.register_hook(lambda grad, s=router_scale: grad * s)
+            elif 'jepa' in name_lower:
+                param.register_hook(lambda grad, s=20.0: grad * s)  # JEPA needs even more scaling
+            elif 'retrieval' in name_lower or 'moe' in name_lower or 'expert' in name_lower:
+                param.register_hook(lambda grad, s=moe_scale: grad * s)
 
     def forward(
         self,
@@ -1450,8 +1547,9 @@ class LosionForCausalLMV2(nn.Module):
                 if loss is not None:
                     loss = loss + self.config.jepa.prediction_weight * jepa_loss
                 loss_dict["jepa_loss"] = jepa_loss.item()
-            except Exception:
-                pass
+            except Exception as e:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(f"JEPA loss computation failed: {e}")
 
         return {
             "logits": logits,
@@ -1499,9 +1597,11 @@ class LosionForCausalLMV2(nn.Module):
         outputs = self.model(input_ids=input_ids)
         hidden_states = outputs["hidden_states"]
         ssm_states = outputs.get("ssm_states", {})
+        past_kvs = outputs.get("past_kvs", {})
 
         # Get last hidden state for first generated token
-        next_logits = self.lm_head(hidden_states[:, -1:, :])
+        # logits shape: (batch, 1, vocab_size) → squeeze to (batch, vocab_size)
+        next_logits = self.lm_head(hidden_states[:, -1:, :]).squeeze(1)  # (batch, vocab_size)
 
         # Generation loop
         for step in range(max_new_tokens):
@@ -1512,12 +1612,12 @@ class LosionForCausalLMV2(nn.Module):
             # Repetition penalty
             if repetition_penalty != 1.0:
                 for token_id in generated[0].unique():
-                    next_logits[0, 0, token_id] /= repetition_penalty
+                    next_logits[0, token_id] /= repetition_penalty
 
             # Top-K
             if top_k > 0:
                 top_k_vals, _ = torch.topk(next_logits, min(top_k, next_logits.shape[-1]), dim=-1)
-                threshold = top_k_vals[:, :, -1:]
+                threshold = top_k_vals[:, -1:]
                 next_logits = next_logits.where(next_logits >= threshold, float("-inf"))
 
             # Top-P
@@ -1531,7 +1631,7 @@ class LosionForCausalLMV2(nn.Module):
             # Sample or greedy
             if do_sample:
                 probs = F.softmax(next_logits, dim=-1)
-                next_token = torch.multinomial(probs.view(batch_size, -1), 1)  # (batch, 1)
+                next_token = torch.multinomial(probs, 1)  # (batch, 1)
             else:
                 next_token = next_logits.argmax(dim=-1, keepdim=True)  # (batch, 1)
 
@@ -1545,10 +1645,35 @@ class LosionForCausalLMV2(nn.Module):
             hidden_out, new_states = self.model.forward_inference(
                 next_token,
                 ssm_states=ssm_states,
+                past_kvs=past_kvs,
                 position_offset=generated.shape[1] - 1,
             )
             ssm_states = new_states.get("ssm_states", ssm_states)
-            next_logits = self.lm_head(hidden_out)
+            past_kvs = new_states.get("past_kvs", past_kvs)
+
+            # Apply DMS eviction if enabled
+            if self.use_dms and step > 0 and step % self.config.dms.update_frequency == 0:
+                for layer_idx, kv in list(past_kvs.items()):
+                    if isinstance(kv, tuple) and len(kv) >= 2 and kv[0] is not None:
+                        k, v = kv[0], kv[1]
+                        if k.dim() == 4 and v.dim() == 4:  # (batch, n_heads, seq, d_kv)
+                            import torch.nn.functional as _F
+                            q = k[:, :, -1:, :]  # Last query as proxy
+                            importance = self.dms.compute_importance(q, k)
+                            should_evict = self.dms.should_evict(k.shape[2])
+                            if should_evict:
+                                keep_mask = self.dms.select_eviction_targets(importance, k.shape[2])
+                                new_k, new_v = self.dms.evict(k, v, keep_mask)
+                                past_kvs[layer_idx] = (new_k, new_v)
+
+            # Apply KV quantization if enabled
+            if self.use_kv_quant and step > 0:
+                for layer_idx, kv in list(past_kvs.items()):
+                    if isinstance(kv, tuple) and len(kv) >= 1 and kv[0] is not None:
+                        self.kv_quant_cache.update(layer_idx, kv[0].float())
+
+            # hidden_out shape: (batch, 1, d_model) → logits (batch, vocab_size)
+            next_logits = self.lm_head(hidden_out).squeeze(1)
 
         return generated
 

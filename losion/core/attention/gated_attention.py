@@ -232,6 +232,13 @@ class GatedAttentionHead(nn.Module):
             ``(batch, seq_len, d_model)`` and ``updated_kv_cache`` is a
             tuple ``(k_full, v_full)``.
         """
+        # Handle standalone call without batch dimension
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+            squeeze_output = True
+        else:
+            squeeze_output = False
+
         batch, seq_len, _ = x.shape
 
         # ---- Project Q, K, V ----
@@ -303,6 +310,9 @@ class GatedAttentionHead(nn.Module):
 
         # ---- Output projection ----
         output = self.out_proj(gated_output)  # (batch, seq_len, d_model)
+
+        if squeeze_output:
+            output = output.squeeze(0)
 
         return output, present_kv
 
@@ -517,10 +527,19 @@ class GatedMultiHeadAttention(nn.Module):
             Tuple ``(output, present_key_value)`` where ``output`` has shape
             ``(batch, seq_len, d_model)``.
         """
+        # Handle standalone call without batch dimension
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+            squeeze_output = True
+        else:
+            squeeze_output = False
+
         batch, seq_len, _ = x.shape
 
         if seq_len == 0:
             dummy = torch.zeros(batch, 0, self.d_model, dtype=x.dtype, device=x.device)
+            if squeeze_output:
+                dummy = dummy.squeeze(0)
             return dummy, (None, None)
 
         # ---- Unpack past state ----
@@ -604,6 +623,9 @@ class GatedMultiHeadAttention(nn.Module):
 
         output = self.out_proj(gated_output)
         output = self.out_norm(output)
+
+        if squeeze_output:
+            output = output.squeeze(0)
 
         return output, present_kv
 

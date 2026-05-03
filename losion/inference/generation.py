@@ -908,7 +908,7 @@ class LosionGenerator:
         config: GenerationConfig,
         original_len: int,
     ) -> Tuple[List[int], List[float]]:
-        """Greedy decoding: always pick the highest probability token.
+        """Greedy decoding with KV cache support.
 
         Args:
             input_ids: Input token IDs [1, seq_len].
@@ -922,14 +922,23 @@ class LosionGenerator:
         generated_ids = input_ids[0].tolist()
         scores: List[float] = []
 
+        # Prefill: full forward pass
+        output = self.model(input_ids=input_ids)
+        next_logits = output.logits[:, -1:, :]
+
+        # Get KV cache and SSM states from model
+        ssm_states: Dict[int, Any] = {}
+        past_kvs: Dict[int, Any] = {}
+        use_kv_cache = (
+            config.use_cache
+            and hasattr(self.model, 'model')
+            and hasattr(self.model.model, 'forward_inference')
+        )
+
         current_ids = input_ids.clone()
 
-        for _ in range(config.max_new_tokens):
-            output = self.model(input_ids=current_ids)
-            next_logits = output.logits[:, -1, :]  # [1, vocab_size]
-
-            # Process logits
-            processed = processor.process(next_logits, current_ids)
+        for step in range(config.max_new_tokens):
+            processed = processor.process(next_logits[:, -1, :], current_ids)
             next_token = processed.argmax(dim=-1).item()
 
             # Score
@@ -937,7 +946,6 @@ class LosionGenerator:
             scores.append(score)
             generated_ids.append(next_token)
 
-            # Check stopping criteria
             if self._should_stop(next_token, len(scores), config):
                 break
 
@@ -945,7 +953,23 @@ class LosionGenerator:
             next_tensor = torch.tensor(
                 [[next_token]], device=self.device, dtype=current_ids.dtype
             )
-            current_ids = torch.cat([current_ids, next_tensor], dim=1)
+
+            if use_kv_cache:
+                # Use forward_inference for O(1) SSM + cached attention
+                hidden_out, new_states = self.model.model.forward_inference(
+                    next_tensor,
+                    ssm_states=ssm_states,
+                    past_kvs=past_kvs,
+                    position_offset=original_len + step,
+                )
+                ssm_states = new_states.get("ssm_states", ssm_states)
+                past_kvs = new_states.get("past_kvs", past_kvs)
+                next_logits = self.model.lm_head(hidden_out)
+            else:
+                # Fallback: full forward
+                current_ids = torch.cat([current_ids, next_tensor], dim=1)
+                output = self.model(input_ids=current_ids)
+                next_logits = output.logits[:, -1:, :]
 
         return generated_ids, scores
 
@@ -954,7 +978,7 @@ class LosionGenerator:
         input_ids: torch.Tensor,
         config: GenerationConfig,
     ) -> Tuple[List[int], List[float]]:
-        """Sampling-based generation with temperature, top-k, top-p.
+        """Sampling-based generation with KV cache support.
 
         Args:
             input_ids: Input token IDs [1, seq_len].
@@ -967,14 +991,26 @@ class LosionGenerator:
         generated_ids = input_ids[0].tolist()
         scores: List[float] = []
 
+        original_len = input_ids.shape[1]
+
+        # Prefill: full forward pass
+        output = self.model(input_ids=input_ids)
+        next_logits = output.logits[:, -1:, :]
+
+        # Get KV cache and SSM states from model
+        ssm_states: Dict[int, Any] = {}
+        past_kvs: Dict[int, Any] = {}
+        use_kv_cache = (
+            config.use_cache
+            and hasattr(self.model, 'model')
+            and hasattr(self.model.model, 'forward_inference')
+        )
+
         current_ids = input_ids.clone()
 
-        for _ in range(config.max_new_tokens):
-            output = self.model(input_ids=current_ids)
-            next_logits = output.logits[:, -1, :]
-
+        for step in range(config.max_new_tokens):
             # Process logits
-            processed = processor.process(next_logits, current_ids)
+            processed = processor.process(next_logits[:, -1, :], current_ids)
 
             # Sample
             next_token = processor.sample(processed)
@@ -989,11 +1025,27 @@ class LosionGenerator:
             if self._should_stop(token_id, len(scores), config):
                 break
 
-            # Append token
+            # Append token for next iteration
             next_tensor = torch.tensor(
                 [[token_id]], device=self.device, dtype=current_ids.dtype
             )
-            current_ids = torch.cat([current_ids, next_tensor], dim=1)
+
+            if use_kv_cache:
+                # Use forward_inference for O(1) SSM + cached attention
+                hidden_out, new_states = self.model.model.forward_inference(
+                    next_tensor,
+                    ssm_states=ssm_states,
+                    past_kvs=past_kvs,
+                    position_offset=original_len + step,
+                )
+                ssm_states = new_states.get("ssm_states", ssm_states)
+                past_kvs = new_states.get("past_kvs", past_kvs)
+                next_logits = self.model.lm_head(hidden_out)
+            else:
+                # Fallback: full forward
+                current_ids = torch.cat([current_ids, next_tensor], dim=1)
+                output = self.model(input_ids=current_ids)
+                next_logits = output.logits[:, -1:, :]
 
         return generated_ids, scores
 

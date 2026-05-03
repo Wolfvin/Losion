@@ -1141,6 +1141,55 @@ class LosionConfig:
         )
         kwargs["dual_memory"] = dual_memory
 
+        # v1.1: Sliding Window config
+        sw_raw = model_raw.get("sliding_window", {})
+        sliding_window = SlidingWindowConfig(
+            enabled=sw_raw.get("enabled", False),
+            window_size=sw_raw.get("window_size", 512),
+            use_token_sink=sw_raw.get("use_token_sink", True),
+            num_sink_tokens=sw_raw.get("num_sink_tokens", 1),
+        )
+        kwargs["sliding_window"] = sliding_window
+
+        # v1.1: MoSA config
+        mosa_raw = model_raw.get("mosa", {})
+        mosa = MoSAConfig(
+            enabled=mosa_raw.get("enabled", False),
+            num_sparse_experts=mosa_raw.get("num_sparse_experts", 4),
+            top_k_experts=mosa_raw.get("top_k_experts", 2),
+            sparsity_ratio=mosa_raw.get("sparsity_ratio", 0.5),
+        )
+        kwargs["mosa"] = mosa
+
+        # v1.1: KV Quant config
+        kq_raw = model_raw.get("kv_quant", {})
+        kv_quant = KVQuantConfig(
+            enabled=kq_raw.get("enabled", False),
+            mode=kq_raw.get("mode", "int8"),
+            group_size=kq_raw.get("group_size", 64),
+        )
+        kwargs["kv_quant"] = kv_quant
+
+        # v1.1: DMS config
+        dms_raw = model_raw.get("dms", {})
+        dms = DMSConfig(
+            enabled=dms_raw.get("enabled", False),
+            target_cache_ratio=dms_raw.get("target_cache_ratio", 0.5),
+            eviction_strategy=dms_raw.get("eviction_strategy", "importance"),
+            update_frequency=dms_raw.get("update_frequency", 64),
+            min_tokens_to_keep=dms_raw.get("min_tokens_to_keep", 32),
+        )
+        kwargs["dms"] = dms
+
+        # v1.1: Parallel Head config
+        ph_raw = model_raw.get("parallel_head", {})
+        parallel_head = ParallelHeadConfig(
+            enabled=ph_raw.get("enabled", False),
+            num_meta_tokens=ph_raw.get("num_meta_tokens", 4),
+            use_gated_fusion=ph_raw.get("use_gated_fusion", True),
+        )
+        kwargs["parallel_head"] = parallel_head
+
         return cls(**kwargs)
 
     def to_dict(self) -> Dict[str, Any]:
