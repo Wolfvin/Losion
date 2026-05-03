@@ -13,7 +13,7 @@ V0.4 addition:
   ParallelHeadLayer — Parallel-head mode for Losion-1B (eliminate routing overhead)
 """
 
-from losion.models.parallel_head import ParallelHeadLayer
+from losion.models.parallel_head import ParallelHybridHead, ParallelHeadConfig as _PHCfg
 from losion.models.losion_model import LosionModel, LosionLayer, LosionLayerOutput, RMSNorm
 from losion.models.losion_decoder import LosionForCausalLM, LosionCausalLMOutput
 from losion.models.losion_model_v2 import (
@@ -25,7 +25,7 @@ from losion.models.losion_model_v2 import (
 )
 
 __all__ = [
-    "ParallelHeadLayer",
+    "ParallelHybridHead",
     "LosionModel",
     "LosionLayer",
     "LosionLayerOutput",

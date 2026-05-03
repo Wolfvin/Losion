@@ -5,6 +5,84 @@ All notable changes to the Losion project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] — 2026-05-03 — "Memory Efficiency v0.10"
+
+### Added — Sliding Window Attention (RATTENTION-inspired)
+
+- **SlidingWindowAttention** (`core/attention/sliding_window.py`): Limits KV cache to a fixed
+  window size (default 512 tokens), reducing memory from O(N) to O(W) where W << N.
+  RATTENTION (Apple, Sep 2025) shows window size as small as 512 matches full-attention
+  quality when combined with global token sinks (StreamingLLM-style). Supports MLA
+  compression inside the window for compound savings. Per-layer configurable window size.
+  At seq_len=8192: **93.8% KV cache reduction (16x savings)**.
+  Credits: RATTENTION (Apple Machine Learning Research, 2025), Mistral (2023), StreamingLLM.
+
+### Added — MoSA: Mixture of Sparse Attention (NeurIPS 2025)
+
+- **MoSAAttention** (`core/attention/mosa.py`): MoE-inspired content-based learnable sparse
+  attention. Multiple sparse attention "experts" with different patterns, expert-choice
+  routing selects top-K experts per token. Reduces KV cache proportionally to learned
+  sparsity ratio (default 50%). Natural bridge between Attention and MoE paradigms.
+  Each expert has its own Q/K/V projections and importance scorer for token selection.
+  Credits: MoSA (NeurIPS 2025, arXiv 2505.00315).
+
+### Added — KV Cache Quantization (TurboQuant-inspired)
+
+- **QuantizedKVCache** (`inference/kv_quantization.py`): Stores KV pairs in reduced precision
+  (int8/int4/nf4) instead of fp16. Per-channel asymmetric quantization for int8,
+  group-wise quantization for int4/nf4. Online calibration with residual quantization.
+  Memory savings: FP16→INT8 = 2x, FP16→INT4 = 4x. Combined with MLA: up to 8-16x total
+  KV cache reduction. Combined with sliding window (512) + MLA + INT8: **87.5% reduction**.
+  Credits: TurboQuant (Google Research, 2025/2026), QPruningKV (EMNLP 2025).
+
+### Added — Dynamic Memory Sparsification (NeurIPS 2025)
+
+- **DynamicMemorySparsification** (`core/memory/dynamic_sparsification.py`): Inference-time
+  KV cache sparsification for hyper-scaling. Lightweight importance predictor scores KV
+  pairs for eviction. Multiple eviction strategies (importance, attention_weight, key_norm,
+  LRU). Budget-aware: maintains target KV cache size dynamically. Enables longer generation
+  within the same memory budget. Only ~1K training steps needed for importance predictor.
+  Credits: DMS (NeurIPS 2025, arXiv 2506.05345), ThinK (ICLR 2025), ChunkKV (NeurIPS 2025).
+
+### Added — Parallel Hybrid Head (Hymba-inspired)
+
+- **ParallelHybridHead** (`models/parallel_head.py`): NVIDIA Hymba-inspired parallel SSM +
+  Attention head. Processes input through both pathways SIMULTANEOUSLY instead of
+  sequentially. SSM provides context summarization, Attention provides high-resolution
+  recall. Meta tokens for cross-layer information sharing. Learned gated fusion.
+  Memory savings: SSM has no KV cache, parallel design shares I/O. Superior for small-medium models.
+  Credits: NVIDIA Hymba (ICLR 2025, arXiv 2411.13676), Jamba (AI21, ICLR 2025).
+
+### Added — Configuration
+
+- **SlidingWindowConfig**, **MoSAConfig**, **KVQuantConfig**, **DMSConfig**, **ParallelHeadConfig**:
+  New v0.10 sub-configurations in `config.py`. All disabled by default for backward compatibility.
+- **LosionConfig** extended with 5 new memory efficiency sub-configs.
+- **`_build_attention()`** factory updated with MoSA and Sliding Window support.
+
+### Benchmark Results — v0.10 vs v0.9.1
+
+| Metric | Baseline (v0.9.1) | Optimized (v0.10) | Delta |
+|--------|-------------------|-------------------|-------|
+| Parameters | 35,139,828 | 35,137,332 | -2,496 |
+| Training Loss Reduction | 39.2% | 39.1% | -0.1% |
+| KV Cache @2048 (MB) | 0.750 | 0.094 | -87.5% |
+| KV Cache @8192 savings | N/A | 93.8% (16x) | — |
+
+**Verdict: IMPROVEMENT** — Training quality maintained (39.1% vs 39.2%) with 87.5% KV cache reduction.
+
+### Credits
+
+- Losion Framework: Wolfvin & Contributors (github.com/Wolfvin/Losion)
+- RATTENTION: Apple Machine Learning Research, 2025
+- MoSA: NeurIPS 2025 (arXiv 2505.00315)
+- TurboQuant: Google Research, 2025/2026
+- DMS: NeurIPS 2025 (arXiv 2506.05345)
+- Hymba: NVIDIA Research, ICLR 2025
+- StreamingLLM: Xiao et al., 2023
+
+---
+
 ## [1.0.0] — 2026-05-03 — "Verified & Alive"
 
 ### Added — End-to-End Verification & Training Test

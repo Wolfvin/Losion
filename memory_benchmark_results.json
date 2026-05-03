@@ -1,0 +1,164 @@
+{
+  "baseline": {
+    "params": 35139828,
+    "model_memory_mb": 134.0478057861328,
+    "training": {
+      "initial_loss": 11.611126899719238,
+      "final_loss": 7.062417507171631,
+      "loss_reduction_pct": 39.175434321173405,
+      "converged": true,
+      "peak_memory_mb": 0,
+      "model_memory_mb": 134.0478057861328
+    },
+    "kv_cache": {
+      "param_memory_mb": 134.0478057861328,
+      "grad_memory_mb": 0.0,
+      "total_model_mb": 134.0478057861328,
+      "cuda_allocated_mb": 0.0,
+      "cuda_reserved_mb": 0.0,
+      "kv_cache_mb": 0.0146484375,
+      "kv_cache_summary": {
+        "total_memory_mb": 0.0146484375,
+        "n_layers": 4,
+        "mla_mode": true,
+        "per_layer": {
+          "layer_0": {
+            "seq_len": 40,
+            "memory_mb": 0.003662109375,
+            "mla_mode": true
+          },
+          "layer_1": {
+            "seq_len": 40,
+            "memory_mb": 0.003662109375,
+            "mla_mode": true
+          },
+          "layer_2": {
+            "seq_len": 40,
+            "memory_mb": 0.003662109375,
+            "mla_mode": true
+          },
+          "layer_3": {
+            "seq_len": 40,
+            "memory_mb": 0.003662109375,
+            "mla_mode": true
+          }
+        }
+      },
+      "generated_seq_len": 40
+    }
+  },
+  "optimized": {
+    "params": 35137332,
+    "model_memory_mb": 134.0382843017578,
+    "training": {
+      "initial_loss": 11.624332427978516,
+      "final_loss": 7.074709892272949,
+      "loss_reduction_pct": 39.138785507846585,
+      "converged": true,
+      "peak_memory_mb": 0,
+      "model_memory_mb": 134.0382843017578
+    },
+    "kv_cache": {
+      "param_memory_mb": 134.0382843017578,
+      "grad_memory_mb": 0.0,
+      "total_model_mb": 134.0382843017578,
+      "cuda_allocated_mb": 0.0,
+      "cuda_reserved_mb": 0.0,
+      "kv_cache_mb": 0.0146484375,
+      "kv_cache_summary": {
+        "total_memory_mb": 0.0146484375,
+        "n_layers": 4,
+        "mla_mode": true,
+        "per_layer": {
+          "layer_0": {
+            "seq_len": 40,
+            "memory_mb": 0.003662109375,
+            "mla_mode": true
+          },
+          "layer_1": {
+            "seq_len": 40,
+            "memory_mb": 0.003662109375,
+            "mla_mode": true
+          },
+          "layer_2": {
+            "seq_len": 40,
+            "memory_mb": 0.003662109375,
+            "mla_mode": true
+          },
+          "layer_3": {
+            "seq_len": 40,
+            "memory_mb": 0.003662109375,
+            "mla_mode": true
+          }
+        }
+      },
+      "generated_seq_len": 40
+    }
+  },
+  "kv_theoretical": {
+    "standard_fp16": {
+      "description": "Standard attention, FP16",
+      "total_mb": 6.0,
+      "savings_vs_standard_fp16_pct": 0.0,
+      "ratio_vs_standard_fp16": 1.0
+    },
+    "standard_int8": {
+      "description": "Standard attention, INT8",
+      "total_mb": 3.0,
+      "savings_vs_standard_fp16_pct": 50.0,
+      "ratio_vs_standard_fp16": 2.0
+    },
+    "standard_int4": {
+      "description": "Standard attention, INT4",
+      "total_mb": 1.5,
+      "savings_vs_standard_fp16_pct": 75.0,
+      "ratio_vs_standard_fp16": 4.0
+    },
+    "mla_fp16": {
+      "description": "MLA compressed, FP16",
+      "total_mb": 0.75,
+      "savings_vs_standard_fp16_pct": 87.5,
+      "ratio_vs_standard_fp16": 8.0
+    },
+    "mla_int8": {
+      "description": "MLA compressed, INT8",
+      "total_mb": 0.375,
+      "savings_vs_standard_fp16_pct": 93.75,
+      "ratio_vs_standard_fp16": 16.0
+    },
+    "mla_int4": {
+      "description": "MLA compressed, INT4",
+      "total_mb": 0.1875,
+      "savings_vs_standard_fp16_pct": 96.875,
+      "ratio_vs_standard_fp16": 32.0
+    },
+    "sw512_mla_fp16": {
+      "description": "Sliding Window(512) + MLA, FP16",
+      "total_mb": 0.1875,
+      "savings_vs_standard_fp16_pct": 96.875,
+      "ratio_vs_standard_fp16": 32.0
+    },
+    "sw512_mla_int8": {
+      "description": "Sliding Window(512) + MLA, INT8",
+      "total_mb": 0.09375,
+      "savings_vs_standard_fp16_pct": 98.4375,
+      "ratio_vs_standard_fp16": 64.0
+    },
+    "sw512_mla_int4": {
+      "description": "Sliding Window(512) + MLA, INT4",
+      "total_mb": 0.046875,
+      "savings_vs_standard_fp16_pct": 99.21875,
+      "ratio_vs_standard_fp16": 128.0
+    },
+    "_baseline_mb": 6.0,
+    "_config": {
+      "n_layers": 4,
+      "n_heads": 4,
+      "d_kv": 48,
+      "seq_len": 2048,
+      "mla_latent_dim": 48,
+      "batch_size": 1
+    }
+  },
+  "is_improvement": true
+}

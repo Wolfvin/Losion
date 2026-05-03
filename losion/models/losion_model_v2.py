@@ -275,6 +275,36 @@ def _build_attention(config: LosionConfig) -> nn.Module:
     d_model = config.d_model
 
     try:
+        # v0.10: MoSA — Mixture of Sparse Attention (NeurIPS '25)
+        if config.mosa.enabled:
+            from losion.core.attention.mosa import MoSAAttention, MoSAConfig as _MoSACfg
+            mosa_cfg = _MoSACfg(
+                d_model=d_model,
+                n_heads=attn_cfg.n_heads,
+                d_kv=attn_cfg.d_kv,
+                num_sparse_experts=config.mosa.num_sparse_experts,
+                top_k_experts=config.mosa.top_k_experts,
+                sparsity_ratio=config.mosa.sparsity_ratio,
+                use_mla=True,
+                mla_latent_dim=attn_cfg.mla_latent_dim,
+            )
+            return MoSAAttention(mosa_cfg)
+
+        # v0.10: Sliding Window Attention (RATTENTION-inspired)
+        if config.sliding_window.enabled:
+            from losion.core.attention.sliding_window import SlidingWindowAttention, SlidingWindowConfig as _SWCfg
+            sw_cfg = _SWCfg(
+                d_model=d_model,
+                n_heads=attn_cfg.n_heads,
+                d_kv=attn_cfg.d_kv,
+                window_size=config.sliding_window.window_size,
+                use_token_sink=config.sliding_window.use_token_sink,
+                num_sink_tokens=config.sliding_window.num_sink_tokens,
+                use_mla=True,
+                mla_latent_dim=attn_cfg.mla_latent_dim,
+            )
+            return SlidingWindowAttention(sw_cfg)
+
         # v0.9: Child-3W (MoE at QKV level, replaces standard attention)
         if config.child_3w.enabled:
             from losion.core.attention.child_3w import Child3WAttention, Child3WConfig as _Child3WCfg

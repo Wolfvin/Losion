@@ -339,6 +339,101 @@ class AnchoredDecoderConfig:
 
 
 @dataclass
+class SlidingWindowConfig:
+    """Configuration for Sliding Window Attention (v0.10, RATTENTION-inspired).
+
+    Limits KV cache to a fixed window size, reducing memory from O(N) to O(W).
+    RATTENTION (Apple, Sep 2025) shows window size as small as 512 matches
+    full-attention quality when combined with global token sinks.
+
+    Attributes:
+        enabled: Whether to enable sliding window attention.
+        window_size: Sliding window size (number of tokens to cache).
+        use_token_sink: Whether to add global "sink" tokens for distant context.
+        num_sink_tokens: Number of sink tokens (default 1, StreamingLLM-style).
+    """
+    enabled: bool = False
+    window_size: int = 512
+    use_token_sink: bool = True
+    num_sink_tokens: int = 1
+
+
+@dataclass
+class MoSAConfig:
+    """Configuration for MoSA — Mixture of Sparse Attention (v0.10, NeurIPS '25).
+
+    MoE-inspired content-based learnable sparse attention. Dynamically selects
+    tokens for each attention head using expert-choice routing.
+
+    Attributes:
+        enabled: Whether to enable MoSA sparse attention.
+        num_sparse_experts: Number of sparse attention pattern experts.
+        top_k_experts: Active experts per token.
+        sparsity_ratio: Target sparsity ratio (0.5 = keep 50% of tokens).
+    """
+    enabled: bool = False
+    num_sparse_experts: int = 4
+    top_k_experts: int = 2
+    sparsity_ratio: float = 0.5
+
+
+@dataclass
+class KVQuantConfig:
+    """Configuration for KV Cache Quantization (v0.10, TurboQuant-inspired).
+
+    Stores KV pairs in reduced precision (int8/int4) instead of fp16.
+    TurboQuant (Google, 2025/2026) approaches information-theoretic limit.
+
+    Attributes:
+        enabled: Whether to enable KV cache quantization.
+        mode: Quantization mode ("fp16", "int8", "int4", "nf4").
+        group_size: Group size for group-wise quantization (int4/nf4).
+    """
+    enabled: bool = False
+    mode: str = "int8"
+    group_size: int = 64
+
+
+@dataclass
+class DMSConfig:
+    """Configuration for Dynamic Memory Sparsification (v0.10, NeurIPS '25).
+
+    Inference-time KV cache sparsification for hyper-scaling.
+    Enables longer generation within the same memory budget.
+
+    Attributes:
+        enabled: Whether to enable DMS.
+        target_cache_ratio: Target KV cache ratio (0.5 = keep 50%).
+        eviction_strategy: How to select tokens for eviction.
+        update_frequency: How often to run eviction (every N tokens).
+        min_tokens_to_keep: Minimum tokens to keep in cache.
+    """
+    enabled: bool = False
+    target_cache_ratio: float = 0.5
+    eviction_strategy: str = "importance"
+    update_frequency: int = 64
+    min_tokens_to_keep: int = 32
+
+
+@dataclass
+class ParallelHeadConfig:
+    """Configuration for Parallel Hybrid Head (v0.10, Hymba-inspired).
+
+    Processes input through SSM and Attention simultaneously (parallel),
+    then combines outputs. NVIDIA Hymba (ICLR 2025) shows this is superior
+    for small-to-medium models.
+
+    Attributes:
+        enabled: Whether to use parallel head instead of sequential.
+        num_meta_tokens: Number of meta tokens for cross-layer info.
+        use_gated_fusion: Whether to use learned gating for fusion.
+    """
+    enabled: bool = False
+    num_meta_tokens: int = 4
+    use_gated_fusion: bool = True
+
+
+@dataclass
 class DualMemoryConfig:
     """Configuration for Two-Level Memory System (v0.9).
 
@@ -680,6 +775,12 @@ class LosionConfig:
     child_3w: Child3WConfig = field(default_factory=Child3WConfig)
     anchored_decoder: AnchoredDecoderConfig = field(default_factory=AnchoredDecoderConfig)
     dual_memory: DualMemoryConfig = field(default_factory=DualMemoryConfig)
+    # v0.10 additions — Memory Efficiency (RATTENTION, TurboQuant, MoSA, DMS, Hymba)
+    sliding_window: SlidingWindowConfig = field(default_factory=SlidingWindowConfig)
+    mosa: MoSAConfig = field(default_factory=MoSAConfig)
+    kv_quant: KVQuantConfig = field(default_factory=KVQuantConfig)
+    dms: DMSConfig = field(default_factory=DMSConfig)
+    parallel_head: ParallelHeadConfig = field(default_factory=ParallelHeadConfig)
 
     def __post_init__(self) -> None:
         """Validate configuration after initialization."""

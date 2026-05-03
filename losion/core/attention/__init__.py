@@ -88,6 +88,15 @@ from losion.core.attention.child_3w import (
     Child3WRouter,
     Child3WAttention,
 )
+from losion.core.attention.sliding_window import (
+    SlidingWindowConfig,
+    SlidingWindowAttention,
+)
+from losion.core.attention.mosa import (
+    MoSAConfig,
+    MoSAAttention,
+    SparseAttentionExpert,
+)
 
 __all__ = [
     "InterleavedRoPE",
@@ -121,4 +130,10 @@ __all__ = [
     "Child3WSet",
     "Child3WRouter",
     "Child3WAttention",
+    # v0.10 Memory Efficiency
+    "SlidingWindowConfig",
+    "SlidingWindowAttention",
+    "MoSAConfig",
+    "MoSAAttention",
+    "SparseAttentionExpert",
 ]
