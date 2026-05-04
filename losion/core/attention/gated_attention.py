@@ -293,22 +293,20 @@ class GatedAttentionHead(nn.Module):
             k = self.k_norm(k)
 
         # ---- Scaled dot-product attention ----
-        # v1.6.1: Gunakan SDPA (Flash Attention / MemEff / Math) dengan fallback
-        q_attn = q.transpose(0, 1).unsqueeze(0)  # (1, seq_len, d_kv) — fake batch=1
-        k_attn = k.transpose(0, 1).unsqueeze(0)  # (1, full_len, d_kv)
-        v_attn = v.transpose(0, 1).unsqueeze(0)  # (1, full_len, d_kv)
-        # Reshape to (1, 1, seq_len, d_kv) for single-head SDPA
-        q_sdpa = q_attn.unsqueeze(1)  # (1, 1, seq_len, d_kv)
-        k_sdpa = k_attn.unsqueeze(1)  # (1, 1, full_len, d_kv)
-        v_sdpa = v_attn.unsqueeze(1)  # (1, 1, full_len, d_kv)
+        # v1.8.0: Preserve actual batch dimension instead of using fake batch=1.
+        # Before: q.transpose(0,1).unsqueeze(0) created (1, seq_len, d_kv) losing batch info.
+        # Now: reshape to (batch, 1, seq_len, d_kv) for proper batched SDPA.
+        q_sdpa = q.unsqueeze(1)  # (batch, 1, seq_len, d_kv)
+        k_sdpa = k.unsqueeze(1)  # (batch, 1, full_len, d_kv)
+        v_sdpa = v.unsqueeze(1)  # (batch, 1, full_len, d_kv)
 
         try:
             is_causal = seq_len > 1 and kv_cache is None
             attn_output = F.scaled_dot_product_attention(
                 q_sdpa, k_sdpa, v_sdpa,
                 is_causal=is_causal,
-            )  # (1, 1, seq_len, d_kv)
-            attn_output = attn_output.squeeze(1).squeeze(0)  # (seq_len, d_kv)
+            )  # (batch, 1, seq_len, d_kv)
+            attn_output = attn_output.squeeze(1)  # (batch, seq_len, d_kv)
         except (AttributeError, RuntimeError):
             # Fallback: manual matmul attention
             scale = math.sqrt(self.d_kv)

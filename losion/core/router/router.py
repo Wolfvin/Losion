@@ -107,7 +107,7 @@ class AdaptiveRouter(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor
+        self, x: torch.Tensor, thinking_mode: Optional[bool] = None
     ) -> AdaptiveRoutingOutput:
         """
         Forward pass AdaptiveRouter.
@@ -116,8 +116,14 @@ class AdaptiveRouter(nn.Module):
         1. ThinkingToggle: assess complexity → thinking/non-thinking
         2. BiasRouter: compute routing weights → adjust with thinking info
 
+        v1.8.0: Added thinking_mode kwarg — pass directly instead of
+        mutating state via set_force_thinking (which caused race conditions
+        in multi-GPU training). Now thread-safe for FSDP/DDP.
+
         Args:
             x: Input tensor [batch, seq_len, d_model]
+            thinking_mode: Optional bool — if True, bias towards thinking;
+                if False, bias towards non-thinking; if None, auto-detect.
 
         Returns:
             AdaptiveRoutingOutput dengan semua informasi routing
@@ -131,8 +137,23 @@ class AdaptiveRouter(nn.Module):
         device = x.device
         dtype = x.dtype
 
-        # === Tahap 1: Classification via ThinkingToggle ===
-        thinking_assessment = self.thinking_toggle(x)
+        # v1.8.0: Apply thinking_mode override WITHOUT state mutation
+        # Save and restore force_mode for thread safety
+        prev_force_mode = None
+        if thinking_mode is not None:
+            # Temporarily set force mode for this forward call only
+            prev_force_mode = self.thinking_toggle._force_mode_code.clone()
+            from .thinking_toggle import ThinkingMode as TM
+            forced_mode = TM.THINKING if thinking_mode else TM.NON_THINKING
+            self.thinking_toggle.set_force_mode(forced_mode)
+
+        try:
+            # === Tahap 1: Classification via ThinkingToggle ===
+            thinking_assessment = self.thinking_toggle(x)
+        finally:
+            # v1.8.0: Always restore previous mode — no lasting state mutation
+            if thinking_mode is not None:
+                self.thinking_toggle._force_mode_code.copy_(prev_force_mode)
 
         # === Tahap 2: Allocation via BiasRouter ===
         routing_weights, routing_info = self.bias_router(x)

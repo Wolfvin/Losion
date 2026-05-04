@@ -43,7 +43,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from losion.config import LosionConfig
-from losion.models.losion_decoder import LosionForCausalLM
+from losion.models.losion_model_v2 import LosionForCausalLMV2
 from losion.training.curriculum import CurriculumScheduler, TrainingPhase
 from losion.training.utils import (
     count_parameters,
@@ -174,7 +174,8 @@ class LosionTrainer:
             torch.cuda.manual_seed_all(self.trainer_config.seed)
 
         # ---- Build model ----
-        self.model = LosionForCausalLM(model_config)
+        # v1.8.0: Use LosionForCausalLMV2 (was V1 before)
+        self.model = LosionForCausalLMV2(model_config)
         self.model.to(self.device)
 
         # ---- Curriculum scheduler ----

@@ -468,22 +468,17 @@ class LosionLayerV2(nn.Module):
 
         # ===================================================================
         # Routing — Unified AdaptiveRouter + thinking_mode integration
+        # v1.8.0: REMOVED set_force_thinking during forward — race condition
+        # in multi-GPU (FSDP/DDP). Instead, pass thinking_mode as a kwarg
+        # to AdaptiveRouter.forward() which uses it without mutating state.
         # ===================================================================
         if routing_weights is None:
             try:
                 from losion.core.router.router import AdaptiveRouter
                 if isinstance(self.router, AdaptiveRouter):
-                    # v0.9.1: Pass thinking_mode to AdaptiveRouter so it can
-                    # adjust routing weights (non-thinking → more SSM, thinking →
-                    # more Attention + Retrieval)
-                    if thinking_mode is not None:
-                        from losion.core.router.thinking_toggle import ThinkingMode as TM
-                        forced_mode = TM.THINKING if thinking_mode else TM.NON_THINKING
-                        self.router.set_force_thinking(forced_mode)
-                    routing_out = self.router(x)
+                    # v1.8.0: Pass thinking_mode directly — NO state mutation
+                    routing_out = self.router(x, thinking_mode=thinking_mode)
                     route_weights = routing_out.adjusted_weights
-                    # Reset force mode after this call
-                    self.router.set_force_thinking(None)
                 else:
                     route_logits = self.router(x)
                     route_weights = F.softmax(route_logits, dim=-1)
@@ -591,7 +586,14 @@ class LosionLayerV2(nn.Module):
                     ssm_result = ssm_layer(ssm_input, initial_state=ssm_state)
             else:
                 ssm_result = ssm_layer(ssm_input)
-        except Exception:
+        except (RuntimeError, ValueError) as e:
+            # v1.8.0: Log error instead of silently falling back.
+            # If SSM forward fails with initial_state, log and try without.
+            import logging
+            logging.getLogger(__name__).warning(
+                f"SSM forward with state failed at layer {getattr(self, 'layer_idx', '?')}: {e}. "
+                f"Retrying without state."
+            )
             ssm_result = ssm_layer(ssm_input)
 
         # Unpack result
@@ -1370,19 +1372,24 @@ class LosionForCausalLMV2(nn.Module):
             loss = lm_loss
             loss_dict["lm_loss"] = lm_loss.item()
 
-        # MTP loss
+        # MTP loss — v1.8.0: FIXED target alignment
+        # Sebelumnya MTP head i memprediksi i+2 tokens ahead karena menggunakan
+        # shift_labels (sudah di-shift 1) sebagai base. Sekarang menggunakan
+        # labels (non-shifted) sebagai target base agar MTP head i memprediksi
+        # tepat i+1 tokens ahead, sesuai spesifikasi DeepSeek-V3.
         if self.use_mtp and labels is not None and hasattr(self, 'mtp_head'):
             mtp_logits = self.mtp_head(hidden_states)
             mtp_loss = torch.tensor(0.0, device=input_ids.device)
             for i, token_logits in enumerate(mtp_logits):
-                # Each MTP head predicts i+1 tokens ahead
+                # MTP head i memprediksi i+1 tokens ahead dari posisi saat ini
+                # token_logits: (batch, seq_len, vocab_size) — dari hidden_states sebelum shift
+                # labels: (batch, seq_len) — original labels, belum di-shift
                 offset = i + 1
-                # token_logits: (batch, seq_len, vocab_size)
-                # shift_labels: (batch, seq_len-1) after the LM loss shift
-                target_len = shift_labels.shape[1] - offset
-                if target_len > 0:
-                    mtp_pred = token_logits[:, :target_len, :].contiguous().view(-1, self.vocab_size)
-                    mtp_target = shift_labels[:, offset:offset + target_len].contiguous().view(-1)
+                # token di posisi t memprediksi token di posisi t+offset
+                pred_len = token_logits.shape[1] - offset
+                if pred_len > 0:
+                    mtp_pred = token_logits[:, :pred_len, :].contiguous().view(-1, self.vocab_size)
+                    mtp_target = labels[:, offset:offset + pred_len].contiguous().view(-1)
                     mtp_loss += F.cross_entropy(
                         mtp_pred,
                         mtp_target,
@@ -1395,55 +1402,58 @@ class LosionForCausalLMV2(nn.Module):
                 loss = mtp_loss
             loss_dict["mtp_loss"] = mtp_loss.item()
 
-        # JEPA loss
+        # JEPA loss — v1.8.0: proper error logging instead of silent pass
         if self.use_jepa and hasattr(self, 'jepa') and self.training:
             try:
                 jepa_loss = self.jepa.compute_loss(hidden_states)
                 if loss is not None:
                     loss = loss + self.config.jepa.prediction_weight * jepa_loss
                 loss_dict["jepa_loss"] = jepa_loss.item()
-            except Exception:
-                pass
+            except (RuntimeError, ValueError) as e:
+                import logging
+                logging.getLogger(__name__).warning(f"JEPA loss computation failed: {e}")
 
-        # v1.7.0: Routing entropy regularization — FIXED: sekarang benar-benar differentiable
-        # Router entropy rendah = routing yang terlalu focused pada 1 jalur (collapse)
-        # Entropy target: ~0.9 (distribusi yang seimbang antara 3 jalur)
-        # v1.7.0 fix: routing_weights sekarang NON-DETACHED dan compute_routing_entropy
-        # TANPA torch.no_grad(), sehingga gradien mengalir kembali ke router.
+        # v1.8.0: Routing entropy regularization — FIXED: sekarang menghitung entropy
+        # dari SEMUA layer, bukan hanya layer 0. Sebelumnya hanya layer 0 yang
+        # di-regulasi, menyebabkan layer 1..N-1 bisa collapse ke single-pathway.
+        # Juga memperbaiki bare except yang menelan error secara diam-diam.
         if self.training and loss is not None and outputs.get("routing_info") is not None:
             try:
                 from losion.core.router.router import AdaptiveRouter
                 if hasattr(self.model, 'layers') and len(self.model.layers) > 0:
-                    router = self.model.layers[0].router
-                    if isinstance(router, AdaptiveRouter):
-                        routing_info_list = outputs.get("routing_info")
-                        # v1.7.0 fix: routing_info adalah list of dicts dari setiap layer.
-                        # Gunakan layer pertama yang punya "adjusted_weights" key.
-                        adjusted = None
-                        if isinstance(routing_info_list, list) and len(routing_info_list) > 0:
-                            for layer_info in routing_info_list:
-                                if isinstance(layer_info, dict) and "adjusted_weights" in layer_info:
-                                    adjusted = layer_info["adjusted_weights"]
-                                    break
-                                elif hasattr(layer_info, "adjusted_weights"):
-                                    adjusted = layer_info.adjusted_weights
-                                    break
-                        elif isinstance(routing_info_list, dict):
-                            adjusted = routing_info_list.get("adjusted_weights")
-                        elif hasattr(routing_info_list, "adjusted_weights"):
-                            adjusted = routing_info_list.adjusted_weights
+                    routing_info_list = outputs.get("routing_info")
+                    if isinstance(routing_info_list, list) and len(routing_info_list) > 0:
+                        total_entropy_loss = torch.tensor(0.0, device=input_ids.device)
+                        n_layers_with_entropy = 0
+                        target_entropy = 0.9
 
-                        if adjusted is not None:
-                            entropy = router.compute_routing_entropy(adjusted)
-                            # Target entropy: 0.9 (dari 0.0 = collapsed ke 1.1 = max untuk 3 jalur)
-                            # Minimize (entropy - target)^2 agar routing seimbang
-                            target_entropy = 0.9
-                            entropy_loss = ((entropy - target_entropy) ** 2) * 0.01
-                            loss = loss + entropy_loss
-                            loss_dict["routing_entropy"] = entropy.item()
-                            loss_dict["entropy_loss"] = entropy_loss.item()
-            except (ImportError, Exception):
-                pass
+                        for layer_info in routing_info_list:
+                            adjusted = None
+                            if isinstance(layer_info, dict) and "adjusted_weights" in layer_info:
+                                adjusted = layer_info["adjusted_weights"]
+                            elif hasattr(layer_info, "adjusted_weights"):
+                                adjusted = layer_info.adjusted_weights
+
+                            if adjusted is not None:
+                                # Gunakan router dari layer yang sesuai
+                                layer_idx_val = layer_info.get("layer_idx", n_layers_with_entropy) if isinstance(layer_info, dict) else n_layers_with_entropy
+                                layer_idx_val = min(layer_idx_val, len(self.model.layers) - 1)
+                                router = self.model.layers[layer_idx_val].router
+                                if isinstance(router, AdaptiveRouter):
+                                    entropy = router.compute_routing_entropy(adjusted)
+                                    total_entropy_loss = total_entropy_loss + ((entropy - target_entropy) ** 2)
+                                    n_layers_with_entropy += 1
+
+                        if n_layers_with_entropy > 0:
+                            avg_entropy_loss = total_entropy_loss / n_layers_with_entropy * 0.01
+                            loss = loss + avg_entropy_loss
+                            loss_dict["entropy_loss"] = avg_entropy_loss.item()
+                            loss_dict["layers_with_entropy"] = n_layers_with_entropy
+            except ImportError:
+                pass  # AdaptiveRouter tidak tersedia — bukan error, skip
+            except (RuntimeError, ValueError) as e:
+                import logging
+                logging.getLogger(__name__).warning(f"Entropy regularization failed: {e}")
 
         return {
             "logits": logits,

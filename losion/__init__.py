@@ -1,7 +1,16 @@
 """
 Losion — Hybrid AI Framework with Tri-Jalur Router Architecture.
 
-Version 1.7.0 — "Full Differentiable Gradient Flow & Loop-Free SSM"
+Version 1.8.0 — "Per-Channel Selectivity & Deep Gradient Flow"
+
+v1.8.0 Per-Channel Selectivity & Deep Gradient Flow:
+  - Mamba2SSD dt_avg/A_avg FIXED: per-channel dt dan A sekarang terjaga sepenuhnya
+  - ThinkingToggle depth_multiplier FULLY differentiable: sigmoid soft-blending menggantikan hard if/else
+  - Entropy regularization dari SEMUA layer (sebelumnya hanya layer 0)
+  - MTP target alignment FIXED: menggunakan labels (bukan shift_labels) sesuai DeepSeek-V3
+  - set_force_thinking race condition FIXED: thinking_mode sekarang passed as kwarg
+  - Bare except Exception:pass FIXED: proper error logging dengan logging.warning()
+  - SSM forward fallback sekarang log error, bukan silent pass
 
 v1.7.0 Full Differentiable Gradient Flow & Loop-Free SSM:
   - ThinkingToggle: depth_multiplier & confidence sekarang torch.Tensor (bukan Python float)
@@ -84,7 +93,7 @@ Router:  Adaptive (BiasRouter + ThinkingToggle + Symbolic-MoE), GRPO/DAPO-traine
          + Router ↔ Expert Co-Evolution (Evoformer Level 5)
 """
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 __author__ = "Losion Contributors"
 __license__ = "MIT"
 

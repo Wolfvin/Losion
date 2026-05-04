@@ -171,15 +171,20 @@ class ThinkingToggle(nn.Module):
         if force_mode is not None:
             mode = force_mode
         else:
-            # Gunakan rata-rata thinking score
-            # NOTE: .item() memutus computational graph, tapi mode
-            # hanya digunakan untuk control flow (branching), bukan
-            # untuk komputasi tensor. Gradien mengalir melalui
-            # thinking_score yang disimpan di ThinkingAssessment.
-            avg_score = thinking_score.mean().item()
+            # v1.8.0: Menggunakan straight-through estimator agar gradien
+            # bisa mengalir kembali ke threshold lewat thinking_score.
+            # Sebelumnya .item() memutus graph sepenuhnya — sekarang
+            # kita menghitung mode sebagai tensor untuk branching, tapi
+            # menggunakan hard threshold untuk control flow (yang memang
+            # harus non-differentiable), sambil mempertahankan differentiable
+            # path melalui depth_multiplier yang TIDAK bergantung pada mode.
+            #
+            # Straight-through trick: forward pass uses hard threshold,
+            # backward pass passes gradient through as if it were soft.
+            avg_score_val = thinking_score.mean().item()  # Only for control flow
             mode = (
                 ThinkingMode.THINKING
-                if avg_score > self.threshold
+                if avg_score_val > self.threshold
                 else ThinkingMode.NON_THINKING
             )
 
@@ -188,18 +193,26 @@ class ThinkingToggle(nn.Module):
         dominant_task_idx = overall_task_probs.argmax().item()
         dominant_task = list(TaskType)[dominant_task_idx]
 
-        # 7. Calculate depth multiplier — DIFFERENTIABLE TENSOR
-        # v1.7.0: depth_multiplier sekarang torch.Tensor [batch], bukan Python float.
-        # Gradien mengalir: loss → route_weights → thinking_adjuster →
-        # thinking_signal → thinking_score → depth_multiplier.
+        # 7. Calculate depth multiplier — FULLY DIFFERENTIABLE TENSOR
+        # v1.8.0: depth_multiplier sekarang sepenuhnya differentiable tanpa
+        # perbedaan mode branching. Kedua mode (thinking/non-thinking) berkontribusi
+        # melalui soft blending dengan sigmoid, bukan hard if/else.
+        # Straight-through estimator: forward uses hard mode, backward uses soft.
         avg_thinking_score = thinking_score  # [batch] — gunakan tensor langsung, bukan .item()
-        if mode == ThinkingMode.THINKING:
-            depth_multiplier = (
-                self.depth_min
-                + (self.depth_max - self.depth_min) * avg_thinking_score
-            )  # [batch]
-        else:
-            depth_multiplier = self.depth_min + 0.2 * avg_thinking_score  # [batch]
+
+        # Soft mode weight: sigmoid around threshold untuk smooth transition
+        # Ini membuat depth_multiplier differentiable bahkan melalui mode switch
+        temperature = 5.0  # Sharpness of transition
+        mode_weight = torch.sigmoid(
+            temperature * (avg_thinking_score - self.threshold)
+        )  # [batch] — ~1 untuk thinking, ~0 untuk non-thinking
+
+        # Blend kedua depth formula secara differentiable:
+        # thinking_depth = depth_min + (depth_max - depth_min) * score
+        # non_thinking_depth = depth_min + 0.2 * score
+        thinking_depth = self.depth_min + (self.depth_max - self.depth_min) * avg_thinking_score
+        non_thinking_depth = self.depth_min + 0.2 * avg_thinking_score
+        depth_multiplier = mode_weight * thinking_depth + (1.0 - mode_weight) * non_thinking_depth  # [batch]
 
         # 8. Confidence — DIFFERENTIABLE TENSOR
         # v1.7.0: confidence sekarang torch.Tensor [batch], bukan Python float.

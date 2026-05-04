@@ -46,10 +46,13 @@ def ssd_chunk_scan(
     """
     Algoritma SSD Chunk Scan — inti komputasi Mamba-2.
 
-    v1.7.0: Menggunakan cumsum-based parallel scan — TANPA Python token loop.
-    Sebelumnya menggunakan `for t in range(seq_len)` yang sequential.
-    Sekarang menggunakan log-space cumsum trick untuk parallel prefix scan
-    yang jauh lebih cepat di GPU, terutama untuk sequence panjang.
+    v1.8.0: Mendukung per-channel dt dan A — input-dependent selectivity
+    yang merupakan inti Mamba-2 sekarang terjaga sepenuhnya.
+    Sebelumnya dt_avg dan A_avg menghancurkan per-channel selectivity.
+
+    Menggunakan cumsum-based parallel scan — TANPA Python token loop.
+    Log-space cumsum trick untuk parallel prefix scan yang jauh lebih
+    cepat di GPU, terutama untuk sequence panjang.
 
     Algoritma:
     1. Diskritisasi: dA = exp(dt * A), dB = dt * B
@@ -66,11 +69,15 @@ def ssd_chunk_scan(
 
     Argumen:
         x_seq: Input sequence, bentuk (batch, seq_len, d_inner).
-        A: Diskon state transition, bentuk (batch, seq_len, d_state).
-           Nilai negatif.
+        A: State transition matrix. Salah satu bentuk:
+           - (d_inner, d_state) — per-channel, shared across batch/seq
+           - (batch, seq_len, d_state) — per-position (legacy, averaged)
+           Nilai negatif untuk stabilitas.
         B: Input matrix, bentuk (batch, seq_len, d_state).
         C: Output matrix, bentuk (batch, seq_len, d_state).
-        dt: Step size per token, bentuk (batch, seq_len).
+        dt: Step size. Salah satu bentuk:
+            - (batch, seq_len, d_inner) — per-channel selectivity (RECOMMENDED)
+            - (batch, seq_len) — scalar per position (legacy, averaged)
         chunk_size: Ukuran chunk untuk komputasi paralel (tidak digunakan
             di fungsi ini, tapi dipertahankan untuk kompatibilitas API).
         initial_state: State awal opsional, bentuk (batch, d_inner, d_state).
@@ -92,16 +99,56 @@ def ssd_chunk_scan(
     else:
         h0 = initial_state
 
-    # ---- Discretisasi ----
-    # dA = exp(dt * A) — transition diskret per (batch, seq_len, d_state)
-    # dB = dt * B — input diskret per (batch, seq_len, d_state)
-    dA = torch.exp(dt.unsqueeze(-1) * A)  # (batch, seq_len, d_state)
-    dB = dt.unsqueeze(-1) * B  # (batch, seq_len, d_state)
+    # ---- Discretisasi with per-channel dt support ----
+    # v1.8.0: Handle both per-channel dt (batch, seq_len, d_inner) and
+    # scalar dt (batch, seq_len) for backward compatibility.
+    #
+    # A can be (d_inner, d_state) or (batch, seq_len, d_state).
+    #
+    # Per-channel dt * A:
+    #   dt: (batch, seq_len, d_inner) -> unsqueeze -> (batch, seq_len, d_inner, 1)
+    #   A:  (d_inner, d_state) -> broadcast -> (1, 1, d_inner, d_state)
+    #   dt*A: (batch, seq_len, d_inner, d_state)
+    #
+    # Scalar dt * A (legacy):
+    #   dt: (batch, seq_len) -> unsqueeze -> (batch, seq_len, 1, 1)
+    #   A:  (batch, seq_len, d_state) -> unsqueeze -> (batch, seq_len, 1, d_state)
+    #   dt*A: (batch, seq_len, 1, d_state)
+
+    if dt.dim() == 3:
+        # Per-channel dt: (batch, seq_len, d_inner)
+        # A: (d_inner, d_state) — per-channel shared transition
+        dt_expanded = dt.unsqueeze(-1)  # (batch, seq_len, d_inner, 1)
+        if A.dim() == 2:
+            # A is (d_inner, d_state) — per-channel
+            A_broadcast = A.unsqueeze(0).unsqueeze(0)  # (1, 1, d_inner, d_state)
+        else:
+            # A is (batch, seq_len, d_state) — expand for per-channel
+            A_broadcast = A.unsqueeze(2)  # (batch, seq_len, 1, d_state)
+            A_broadcast = A_broadcast.expand(-1, -1, d_inner, -1)  # (batch, seq_len, d_inner, d_state)
+
+        # dA: (batch, seq_len, d_inner, d_state) — per-channel!
+        dt_A = dt_expanded * A_broadcast  # (batch, seq_len, d_inner, d_state)
+        dt_A = dt_A.clamp(max=20.0)  # numerical stability
+        dA = torch.exp(dt_A)  # (batch, seq_len, d_inner, d_state)
+
+        # dB: dt * B, expanded per-channel
+        # dt: (batch, seq_len, d_inner) -> (batch, seq_len, d_inner, 1)
+        # B: (batch, seq_len, d_state) -> (batch, seq_len, 1, d_state)
+        dB = dt.unsqueeze(-1) * B.unsqueeze(2)  # (batch, seq_len, d_inner, d_state)
+
+    else:
+        # Legacy scalar dt: (batch, seq_len)
+        # A: (batch, seq_len, d_state) — already expanded
+        dA = torch.exp(dt.unsqueeze(-1) * A)  # (batch, seq_len, d_state)
+        dB = dt.unsqueeze(-1) * B  # (batch, seq_len, d_state)
+        # Will expand dA to per-channel below
+        dA = dA.unsqueeze(2).expand(batch, seq_len, d_inner, d_state)
+        dB = dB.unsqueeze(2).expand(batch, seq_len, d_inner, d_state)
 
     # ---- Compute xB: input contribution per token ----
-    # x_seq: (batch, seq_len, d_inner), dB: (batch, seq_len, d_state)
-    # xB: (batch, seq_len, d_inner, d_state) = outer product per token
-    xB = x_seq.unsqueeze(-1) * dB.unsqueeze(2)  # (batch, seq_len, d_inner, d_state)
+    # x_seq: (batch, seq_len, d_inner), dB: (batch, seq_len, d_inner, d_state)
+    xB = x_seq.unsqueeze(-1) * dB  # (batch, seq_len, d_inner, d_state)
 
     # ---- Parallel scan via log-space cumsum trick ----
     # SSM recurrence: h_t = dA_t * h_{t-1} + xB_t
@@ -114,12 +161,8 @@ def ssd_chunk_scan(
     #   cumprod_dA = exp(log_cumprod_dA)
     #   h = cumsum(xB / cumprod_dA) * cumprod_dA
 
-    # Expand dA from (batch, seq_len, d_state) to (batch, seq_len, d_inner, d_state)
-    # dA is shared across d_inner channels
-    dA_expanded = dA.unsqueeze(2).expand_as(xB)  # (batch, seq_len, d_inner, d_state)
-
     # Log-space parallel scan
-    log_dA = torch.log(dA_expanded.clamp(min=1e-20))  # (batch, seq_len, d_inner, d_state)
+    log_dA = torch.log(dA.clamp(min=1e-20))  # (batch, seq_len, d_inner, d_state)
     cum_log_dA = torch.cumsum(log_dA, dim=1)  # accumulate along seq dim
     running_prod = torch.exp(cum_log_dA)  # cumprod of dA
 
@@ -156,9 +199,9 @@ class Mamba2SSD(nn.Module):
     Mamba-2 Structured State Space Duality layer.
 
     Fitur utama:
-    - v1.7.0: ssd_chunk_scan menggunakan cumsum-based parallel scan — TANPA Python token loop
+    - v1.8.0: ssd_chunk_scan mendukung per-channel dt dan A (FIXED — sebelumnya dt_avg/A_avg menghancurkan selectivity)
     - chunk_parallel_scan dari ssm_kernels.py untuk sequence panjang
-    - Per-channel dt dan A terjaga (tidak di-average) — input-dependent selectivity
+    - Per-channel dt dan A terjaga sepenuhnya — input-dependent selectivity
     - Gating bergantung pada input (selektivitas)
     - Desain GPU-aware dengan parallel scan menggantikan sequential loop
     - d_state: dimensi state (default 128)
@@ -357,18 +400,17 @@ class Mamba2SSD(nn.Module):
             )
             # y: (batch, seq_len, d_inner), final_state: (batch, d_inner, d_state)
         else:
-            # v1.7.0: ssd_chunk_scan sekarang menggunakan cumsum-based parallel
-            # scan — TANPA Python token loop. Ini sama cepatnya dengan
-            # chunk_parallel_scan untuk sequence pendek.
-            # Per-channel dt untuk selectivity, bukan averaged
-            dt_avg = dt_full.mean(dim=-1)  # (batch, seq_len)
-            A_avg = A.mean(dim=0)  # (d_state,)
+            # v1.8.0: ssd_chunk_scan sekarang menerima per-channel dt
+            # (batch, seq_len, d_inner) dan A (d_inner, d_state) — TANPA
+            # averaging yang menghancurkan input-dependent selectivity.
+            # Sebelumnya dt_avg dan A_avg merusak inti Mamba-2 selectivity.
+            # Sekarang dt_full langsung digunakan per-channel.
             y, final_state = ssd_chunk_scan(
                 x_seq=x_conv,
-                A=A_avg.unsqueeze(0).unsqueeze(0).expand(batch, seq_len, -1),
+                A=A,  # (d_inner, d_state) — per-channel, NOT averaged
                 B=B,
                 C=C,
-                dt=dt_avg,
+                dt=dt_full,  # (batch, seq_len, d_inner) — per-channel, NOT averaged
                 chunk_size=self.chunk_size,
                 initial_state=initial_state,
             )
