@@ -4,7 +4,7 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "losion"
-version = "1.5.0"
+version = "1.6.0"
 description = "Losion — Hybrid AI Framework with Tri-Jalur Router Architecture"
 readme = "README.md"
 license = {text = "MIT"}
@@ -40,6 +40,7 @@ training = [
     "tokenizers>=0.14.0",
     "transformers>=4.35.0",
     "torchao>=0.4.0",
+    "bitsandbytes>=0.41.0",
 ]
 eval = [
     "lm-eval>=0.4.0",
@@ -54,8 +55,11 @@ dev = [
 fp8 = [
     "torchao>=0.4.0",
 ]
+lora = [
+    "bitsandbytes>=0.41.0",
+]
 all = [
-    "losion[training,eval,dev,fp8]",
+    "losion[training,eval,dev,fp8,lora]",
 ]
 
 [project.urls]

@@ -1,24 +1,40 @@
 """
 Losion — Hybrid AI Framework with Tri-Jalur Router Architecture.
 
-Version 1.5.0 — "Training Optimized & Kernel Complete"
+Version 1.6.0 — "Training & Pretraining Fully Optimized"
 
-v1.5.0 Training & Kernel Optimization:
-  - SDPA / Flash Attention with 3-tier fallback (flash_attn → SDPA → manual)
-  - RWKV-7 parallel WKV scan (cumsum-based, no Python token loop)
+v1.6.0 Training & Pretraining Fully Optimized:
+  - RWKV-7 FULLY parallel WKV scan (cumsum-based, ZERO Python token loop)
   - Mamba-2/3 cumsum-based parallel scan (no Python token loop)
+  - SDPA / Flash Attention with 3-tier fallback (flash_attn → SDPA → manual)
+  - Activation Offloading: CPU/GPU offload with async prefetching
+  - Memory-Aware Batch Scheduler: dynamic batch size based on VRAM
+  - 8-bit Optimizer: bitsandbytes/torchao Adam with 75% memory reduction
+  - LoRA / QLoRA: parameter-efficient fine-tuning (0.1-1% parameters)
+  - Progressive Sequence Length: gradual seq_len increase for faster training
+  - Communication-Computation Overlap: async AllReduce with gradient bucketing
+  - Selective Gradient Checkpointing: per-op checkpointing (cheap vs expensive ops)
+  - Dynamic Loss Scaler: adaptive scaling for mixed-precision training
+  - FSDP2 / fully_shard API with LosionLayerV2 per-layer sharding
   - Per-jalur gradient checkpointing with selective recomputation
   - CPU offload for optimizer states (ZeRO-Offload style)
-  - FSDP2 / fully_shard API integration
   - FP8 training via torchao (optional, simulated fallback)
   - PathwayEarlyExit with adaptive thresholds
   - PagedKVCacheManager with INT4 quantization
   - torch.compile(mode="reduce-overhead") integration
-  - Gradient compression for distributed training
+  - Gradient compression for distributed training (PowerSGD)
   - Context parallelism (ring attention + SSM state propagation)
   - Expert parallelism with AllToAll dispatcher
   - CI/CD with version sync check
   - LosionForCausalLMV2 as primary export
+
+v1.5.0 Training & Kernel Optimization:
+  - SDPA / Flash Attention with 3-tier fallback
+  - RWKV-7 parallel WKV scan
+  - Per-jalur gradient checkpointing
+  - CPU offload, FSDP2, FP8 training
+  - PagedKVCacheManager, EarlyExit
+  - CI/CD with version sync
 
 v1.0.0 End-to-End Verified:
   All 40+ components tested with forward+backward passes.
@@ -43,7 +59,7 @@ Router:  Adaptive (BiasRouter + ThinkingToggle + Symbolic-MoE), GRPO/DAPO-traine
          + Router ↔ Expert Co-Evolution (Evoformer Level 5)
 """
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 __author__ = "Losion Contributors"
 __license__ = "MIT"
 
@@ -141,6 +157,22 @@ try:
 except ImportError:
     pass
 
+# --- Advanced Training Optimizations (v1.6.0) ---
+try:
+    from losion.core.kernel.advanced_training import (
+        ActivationOffloader,
+        MemoryAwareBatchScheduler,
+        EightBitOptimizer,
+        LoRAAdapter,
+        LoRALayer,
+        ProgressiveSequenceScheduler,
+        CommComputeOverlap,
+        SelectiveGradientCheckpointing,
+        DynamicLossScaler,
+    )
+except ImportError:
+    pass
+
 # --- Distributed ---
 try:
     from losion.distributed.parallel import (
@@ -212,6 +244,16 @@ __all__ = [
     "CPUOffloadOptimizer",
     "FP8TrainingWrapper",
     "has_fp8_support",
+    # Advanced Training (v1.6.0)
+    "ActivationOffloader",
+    "MemoryAwareBatchScheduler",
+    "EightBitOptimizer",
+    "LoRAAdapter",
+    "LoRALayer",
+    "ProgressiveSequenceScheduler",
+    "CommComputeOverlap",
+    "SelectiveGradientCheckpointing",
+    "DynamicLossScaler",
     # Distributed
     "ParallelismConfig",
     "LosionFSDPWrapper",

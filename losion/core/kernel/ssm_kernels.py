@@ -311,17 +311,25 @@ def rwkv7_parallel_wkv(
     u: torch.Tensor,
     initial_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """Vectorized WKV computation for RWKV-7.
+    """Fully parallel WKV computation for RWKV-7 — NO Python token loop.
 
-    Uses a batch-vectorized sequential scan that processes all batch
-    elements and head dimensions in parallel via PyTorch tensor ops.
-    The inner loop iterates only over the sequence dimension, but
-    each step operates on the entire (batch, d_head) slice at once,
-    making it much faster than per-token Python loops.
+    Uses a cumsum-based parallel scan that eliminates the sequential Python
+    loop over the sequence dimension. The key insight is that the WKV
+    recurrence can be decomposed into two independent prefix-sum operations:
 
-    For GPU acceleration, a Triton kernel can replace this function
-    with true O(log n) parallel prefix scan. This implementation
-    provides correct, numerically stable results as the reference.
+    1. wkv_state prefix: cumsum with multiplicative decay
+       wkv_state_t = sum_{i=0}^{t} (k_i * v_i * prod_{j=i+1}^{t} decay_j)
+
+    2. sum_state prefix: same structure but with k^2 instead of k*v
+       sum_state_t = sum_{i=0}^{t} (k_i^2 * prod_{j=i+1}^{t} decay_j)
+
+    Both can be computed via the standard parallel scan trick:
+       cumprod(decay) gives the running product of decay factors
+       cumsum(kv / cumprod(decay)) * cumprod(decay) gives the prefix sum
+
+    This achieves O(1) Python loop iterations (just cumsum operations)
+    with O(n) parallel depth, making it significantly faster than the
+    sequential scan for long sequences on GPU.
 
     The WKV recurrence is:
         wkv_state_t = exp(w_t) * wkv_state_{t-1} + k_t * v_t
@@ -347,55 +355,87 @@ def rwkv7_parallel_wkv(
     batch, seq_len, d_inner = r.shape
     d_head = k.shape[-1]
 
-    # Initialize state
+    # Pre-compute all per-token values (vectorized, no loop)
+    decay = torch.exp(w)          # (batch, seq_len, d_head)
+    kv = k * v                    # (batch, seq_len, d_head)
+    k_sq = k * k                  # (batch, seq_len, d_head)
+    u_expanded = u.unsqueeze(0)   # (1, d_head)
+
+    # ==================================================================
+    # Parallel scan: prefix sum with multiplicative decay
+    # y_t = decay_t * y_{t-1} + b_t
+    # Using the log-space cumsum trick:
+    #   cumprod(decay) = running product of decay factors
+    #   prefix_sum = cumsum(b / cumprod(decay)) * cumprod(decay)
+    # ==================================================================
+
+    # Compute running product of decay factors: D_t = prod_{j=0}^{t} decay_j
+    # In log space: log_D_t = cumsum(log(decay_t))
+    log_decay = torch.log(torch.clamp(decay, min=1e-20))  # (batch, seq_len, d_head)
+    cum_log_decay = torch.cumsum(log_decay, dim=1)          # (batch, seq_len, d_head)
+    running_decay_prod = torch.exp(cum_log_decay)            # (batch, seq_len, d_head)
+
+    # Inverse of running product for the weighted cumsum
+    inv_running_prod = 1.0 / torch.clamp(running_decay_prod, min=1e-20)
+
+    # --- wkv_state parallel scan ---
+    # wkv_state_t = sum_{i=0}^{t} kv_i * prod_{j=i+1}^{t} decay_j
+    #            = cumsum(kv * inv_running_prod) * running_decay_prod
+    # But we need the "before-add" state: wkv_before_t = wkv_state_t - kv_t
+    weighted_kv = kv * inv_running_prod                           # (batch, seq_len, d_head)
+    cumsum_weighted_kv = torch.cumsum(weighted_kv, dim=1)         # (batch, seq_len, d_head)
+    wkv_state_prefix = cumsum_weighted_kv * running_decay_prod    # (batch, seq_len, d_head)
+
+    # wkv_state at position t BEFORE adding current kv (i.e., after decay but before update)
+    # wkv_before_t = decay_t * wkv_{t-1} = wkv_prefix_t - kv_t
+    # But the decay is already factored into the prefix, so:
+    # wkv_before_t = (cumsum up to t-1, decayed) = wkv_prefix_t - kv_t
+    wkv_before = wkv_state_prefix - kv                            # (batch, seq_len, d_head)
+
+    # --- sum_state parallel scan ---
+    weighted_k_sq = k_sq * inv_running_prod                       # (batch, seq_len, d_head)
+    cumsum_weighted_k_sq = torch.cumsum(weighted_k_sq, dim=1)     # (batch, seq_len, d_head)
+    sum_state_prefix = cumsum_weighted_k_sq * running_decay_prod  # (batch, seq_len, d_head)
+
+    # sum_state at position t BEFORE adding current k_sq
+    sum_before = sum_state_prefix - k_sq                          # (batch, seq_len, d_head)
+
+    # --- Incorporate initial state ---
     if initial_state is not None:
-        wkv_state, sum_state = initial_state[0].clone(), initial_state[1].clone()
+        init_wkv, init_sum = initial_state
+        # The initial state needs to be decayed by the product of all decays up to each position
+        # init contribution at position t: init_state * prod_{j=0}^{t} decay_j
+        init_wkv_contrib = init_wkv.unsqueeze(1) * running_decay_prod  # (batch, seq_len, d_head)
+        init_sum_contrib = init_sum.unsqueeze(1) * running_decay_prod  # (batch, seq_len, d_head)
+        wkv_before = wkv_before + init_wkv_contrib
+        sum_before = sum_before + init_sum_contrib
+
+    # --- Compute WKV value ---
+    numerator = wkv_before + u_expanded.unsqueeze(1) * kv         # (batch, seq_len, d_head)
+    denominator = sum_before + u_expanded.unsqueeze(1) * k_sq + 1e-8  # (batch, seq_len, d_head)
+    wkv_val = numerator / denominator                              # (batch, seq_len, d_head)
+
+    # --- Compute output ---
+    if d_inner == d_head:
+        output = r * wkv_val                                       # (batch, seq_len, d_inner)
+    elif d_head > d_inner:
+        output = r * wkv_val[..., :d_inner]
     else:
-        wkv_state = torch.zeros(batch, d_head, dtype=r.dtype, device=r.device)
-        sum_state = torch.zeros(batch, d_head, dtype=r.dtype, device=r.device)
+        wkv_padded = F.pad(wkv_val, (0, d_inner - d_head))
+        output = r * wkv_padded                                   # (batch, seq_len, d_inner)
 
-    # Pre-compute all per-token values
-    decay = torch.exp(w)  # (batch, seq_len, d_head)
-    kv = k * v  # (batch, seq_len, d_head)
-    k_sq = k * k  # (batch, seq_len, d_head)
-    u_expanded = u.unsqueeze(0)  # (1, d_head)
+    # --- Compute final state for next chunk ---
+    final_wkv_state = wkv_state_prefix[:, -1, :]                  # (batch, d_head)
+    final_sum_state = sum_state_prefix[:, -1, :]                  # (batch, d_head)
 
-    # Vectorized scan over sequence dimension
-    # Each step processes the full (batch, d_head) slice — no Python per-batch loop
-    outputs = []
-    for t in range(seq_len):
-        d_t = decay[:, t, :]    # (batch, d_head)
-        kv_t = kv[:, t, :]      # (batch, d_head)
-        k_sq_t = k_sq[:, t, :]  # (batch, d_head)
-        r_t = r[:, t, :]        # (batch, d_inner)
+    if initial_state is not None:
+        init_wkv, init_sum = initial_state
+        # Total decay from initial state to end of sequence
+        total_decay = running_decay_prod[:, -1, :]                # (batch, d_head)
+        final_wkv_state = final_wkv_state + init_wkv * total_decay
+        final_sum_state = final_sum_state + init_sum * total_decay
 
-        # Decay state
-        wkv_state = wkv_state * d_t
-        sum_state = sum_state * d_t
-
-        # Compute WKV with position bonus u
-        # state is BEFORE adding kv_t (decayed but not yet updated)
-        numerator = wkv_state + u_expanded * kv_t
-        denominator = sum_state + u_expanded * k_sq_t + 1e-8
-        wkv_val = numerator / denominator
-
-        # Output
-        if d_inner == d_head:
-            y_t = r_t * wkv_val
-        elif d_head > d_inner:
-            y_t = r_t * wkv_val[..., :d_inner]
-        else:
-            wkv_padded = F.pad(wkv_val, (0, d_inner - d_head))
-            y_t = r_t * wkv_padded
-
-        outputs.append(y_t)
-
-        # Update state AFTER computing output
-        wkv_state = wkv_state + kv_t
-        sum_state = sum_state + k_sq_t
-
-    output = torch.stack(outputs, dim=1)  # (batch, seq_len, d_inner)
-    final_state = (wkv_state, sum_state)
+    final_state = (final_wkv_state, final_sum_state)
 
     return output, final_state
 

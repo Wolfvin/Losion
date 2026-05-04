@@ -4,10 +4,11 @@ RWKV-7 WKV (Weighted Key-Value) Implementation untuk Losion Framework.
 Implementasi layer RWKV-7 WKV berbasis pure PyTorch.
 Mendukung mode training (paralel) dan inference (sekuensial O(1) per token).
 
-v1.5.0: wkv_forward_parallel sekarang menggunakan cumsum-based parallel scan
-dari losion.core.kernel.ssm_kernels.rwkv7_parallel_wkv, menghilangkan
-Python token loop sepenuhnya. Fallback ke sequential scan jika kernel
-module tidak tersedia.
+v1.6.0: wkv_forward_parallel menggunakan cumsum-based parallel scan
+dari losion.core.kernel.ssm_kernels.rwkv7_parallel_wkv. Implementasi
+parallel scan sepenuhnya tanpa Python token loop — menggunakan
+log-space cumsum trick untuk prefix sum dengan multiplicative decay.
+Fallback ke sequential scan jika kernel module tidak tersedia.
 
 Referensi:
 - Peng, B. et al., "RWKV-7: The Next Generation RWKV Architecture" (2025)

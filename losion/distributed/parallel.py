@@ -142,10 +142,15 @@ class ParallelismConfig:
 
 
 class LosionFSDPWrapper:
-    """Wraps LosionModel with PyTorch FSDP (Fully Sharded Data Parallel).
+    """Wraps LosionModel with PyTorch FSDP2/FSDP (Fully Sharded Data Parallel).
 
-    Provides configurable sharding strategies and mixed precision support
-    for training large Losion models across multiple GPUs.
+    v1.6.0: Supports both FSDP2 (fully_shard API from PyTorch 2.5+) and
+    legacy FSDP1. FSDP2 provides better memory efficiency and supports
+    per-parameter sharding. Falls back to FSDP1 and then DDP if needed.
+
+    For LosionModelV2, automatically creates a layer-based wrap policy
+    that shards each LosionLayerV2 independently for optimal memory
+    efficiency with the Tri-Jalur architecture.
 
     Args:
         config: ParallelismConfig with FSDP parameters.
@@ -153,11 +158,21 @@ class LosionFSDPWrapper:
 
     def __init__(self, config: ParallelismConfig) -> None:
         self.config = config
-        self._fsdp_available = self._check_fsdp_available()
+        self._fsdp2_available = self._check_fsdp2_available()
+        self._fsdp1_available = self._check_fsdp1_available()
 
     @staticmethod
-    def _check_fsdp_available() -> bool:
-        """Check if PyTorch FSDP is available."""
+    def _check_fsdp2_available() -> bool:
+        """Check if PyTorch FSDP2 (fully_shard) is available."""
+        try:
+            from torch.distributed.fsdp import fully_shard
+            return True
+        except ImportError:
+            return False
+
+    @staticmethod
+    def _check_fsdp1_available() -> bool:
+        """Check if PyTorch FSDP1 is available."""
         try:
             from torch.distributed.fsdp import FullyShardedDataParallel
             return True
@@ -173,23 +188,109 @@ class LosionFSDPWrapper:
         model: nn.Module,
         auto_wrap_policy: Optional[Any] = None,
     ) -> nn.Module:
-        """Wrap a LosionModel with FSDP.
+        """Wrap a LosionModel with FSDP2 or FSDP1.
 
-        Configures sharding strategy and mixed precision based on
-        ParallelismConfig, then wraps the model.
+        v1.6.0: Prefers FSDP2 (fully_shard) for better memory efficiency
+        and per-parameter sharding. Falls back to FSDP1, then DDP.
+
+        For LosionModelV2, each LosionLayerV2 is sharded independently,
+        and then the entire model is sharded. This two-level sharding
+        provides optimal memory efficiency with the Tri-Jalur architecture.
 
         Args:
             model: LosionModel to wrap.
-            auto_wrap_policy: Optional FSDP auto wrap policy.
+            auto_wrap_policy: Optional FSDP1 auto wrap policy.
                 If None, uses a transformer-layer-based policy.
 
         Returns:
             FSDP-wrapped model (or DDP-wrapped if FSDP unavailable).
         """
-        if not self._fsdp_available or not torch.distributed.is_initialized():
-            logger.info("FSDP not available or distributed not initialized. Using DDP fallback.")
-            return self._wrap_ddp(model)
+        if not torch.distributed.is_initialized():
+            logger.info("Distributed not initialized. Using unwrapped model.")
+            return model
 
+        # Try FSDP2 first
+        if self._fsdp2_available:
+            return self._wrap_fsdp2(model)
+
+        # Fall back to FSDP1
+        if self._fsdp1_available:
+            return self._wrap_fsdp1(model, auto_wrap_policy)
+
+        # Last resort: DDP
+        return self._wrap_ddp(model)
+
+    def _wrap_fsdp2(self, model: nn.Module) -> nn.Module:
+        """Wrap model with FSDP2 (fully_shard API).
+
+        FSDP2 shards parameters at the module level, providing better
+        memory efficiency than FSDP1. For LosionModelV2, we shard
+        each LosionLayerV2 independently, then shard the full model.
+
+        Args:
+            model: Model to wrap.
+
+        Returns:
+            FSDP2-wrapped model.
+        """
+        try:
+            from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+
+            # Configure mixed precision
+            mp_policy = self._get_fsdp2_mp_policy()
+
+            # Shard each LosionLayerV2 independently for per-layer efficiency
+            try:
+                from losion.models.losion_model_v2 import LosionLayerV2
+                for module in model.modules():
+                    if isinstance(module, LosionLayerV2):
+                        fully_shard(module, mp_policy=mp_policy)
+            except (ImportError, Exception):
+                pass
+
+            # Shard the full model
+            fully_shard(model, mp_policy=mp_policy)
+
+            logger.info(
+                f"Model wrapped with FSDP2 (fully_shard): "
+                f"mixed_precision={self.config.mixed_precision}"
+            )
+            return model
+
+        except Exception as e:
+            logger.warning(f"FSDP2 wrapping failed: {e}. Falling back to FSDP1.")
+            return self._wrap_fsdp1(model)
+
+    def _get_fsdp2_mp_policy(self) -> Any:
+        """Get FSDP2 mixed precision policy."""
+        try:
+            from torch.distributed.fsdp import MixedPrecisionPolicy
+            dtype_map = {
+                "bf16": torch.bfloat16,
+                "fp16": torch.float16,
+                "fp32": torch.float32,
+            }
+            compute_dtype = dtype_map.get(self.config.mixed_precision, torch.bfloat16)
+            if self.config.mixed_precision == "fp32":
+                return None
+            return MixedPrecisionPolicy(param_dtype=compute_dtype, reduce_dtype=compute_dtype)
+        except ImportError:
+            return None
+
+    def _wrap_fsdp1(
+        self,
+        model: nn.Module,
+        auto_wrap_policy: Optional[Any] = None,
+    ) -> nn.Module:
+        """Wrap model with FSDP1 (legacy FullyShardedDataParallel).
+
+        Args:
+            model: Model to wrap.
+            auto_wrap_policy: Optional FSDP1 auto wrap policy.
+
+        Returns:
+            FSDP1-wrapped model.
+        """
         from torch.distributed.fsdp import (
             FullyShardedDataParallel,
             MixedPrecision,
@@ -222,7 +323,7 @@ class LosionFSDPWrapper:
         )
 
         logger.info(
-            f"Model wrapped with FSDP: strategy={self.config.fsdp_sharding_strategy}, "
+            f"Model wrapped with FSDP1: strategy={self.config.fsdp_sharding_strategy}, "
             f"mixed_precision={self.config.mixed_precision}"
         )
 
