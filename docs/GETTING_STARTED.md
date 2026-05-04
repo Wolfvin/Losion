@@ -3,7 +3,7 @@
 > Panduan cepat untuk memulai menggunakan framework Losion, dari instalasi
 > hingga training pertama Anda, termasuk Reasoning Engine dan Elastic Inference.
 >
-> **Fitur utama v1.9.0**: DAPO (menggantikan GRPO di Phase 3 untuk eksplorasi
+> **Fitur utama v2.0.0**: DAPO (menggantikan GRPO di Phase 3 untuk eksplorasi
 > yang lebih baik), RLVR (verifiable rewards untuk RL training), dan LLM-JEPA
 > (joint embedding predictive architecture untuk auxiliary loss).
 
@@ -150,7 +150,7 @@ pip install -e ".[dev]"
 
 ```python
 python -c "import losion; print(f'Losion version: {losion.__version__}')"
-# Output: Losion version: 1.9.0
+# Output: Losion version: 2.0.0
 ```
 
 ### Langkah 2: Cek Hardware
@@ -943,4 +943,4 @@ Lihat [SECURITY.md](../SECURITY.md) untuk panduan vulnerability reporting.
 
 ---
 
-*Dokumentasi ini ditulis untuk Losion v1.9.0. Jika mengalami masalah, silakan buka issue di repository GitHub.*
+*Dokumentasi ini ditulis untuk Losion v2.0.0. Jika mengalami masalah, silakan buka issue di repository GitHub.*

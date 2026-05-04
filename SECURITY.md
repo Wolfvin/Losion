@@ -22,9 +22,9 @@ community to resolve security issues promptly and transparently.
 
 | Version | Branch / Tag        | Status       | Support Ends |
 |---------|---------------------|--------------|--------------|
-| 1.x     | `main`              | ✅ Active    | Next major   |
-| 0.9.x   | `v0.9.x`            | ⚠️ Patch-only| EOL on 2.0   |
-| ≤ 0.8   | —                   | ❌ End-of-life| —            |
+| 2.x     | `main`              | ✅ Active    | Next major   |
+| 1.9.x   | `v1.9.x`            | ⚠️ Patch-only| EOL on 3.0   |
+| ≤ 1.8   | —                   | ❌ End-of-life| —            |
 
 > **Note:** Only the latest minor release on `main` receives active feature and
 > security updates. Prior minor versions receive critical patches only for 30

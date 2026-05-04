@@ -1041,4 +1041,4 @@ DataLoader(dataset, num_workers=8, pin_memory=True, persistent_workers=True)
 
 ---
 
-*Dokumentasi ini ditulis untuk Losion v1.9.0. Performa dapat bervariasi tergantung driver, firmware, dan versi software.*
+*Dokumentasi ini ditulis untuk Losion v2.0.0. Performa dapat bervariasi tergantung driver, firmware, dan versi software.*

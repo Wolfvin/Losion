@@ -1,11 +1,11 @@
-# Losion Architecture — Tri-Jalur Router v1.9.0
+# Losion Architecture — Tri-Jalur Router v2.0.0
 
 > **Comprehensive technical reference** for the Losion open-source AI framework.
 > This document covers every component in detail, with mathematical foundations,
 > implementation specifics, and design rationale — written for both human
 > researchers and AI agents.
 >
-> **Version**: v1.9.0 — Complete Gradient Flow & Vectorized Attention
+> **Version**: v2.0.0 — Alive Gradients & Production Ready
 
 ---
 
@@ -34,6 +34,31 @@
 ## 1. Overview
 
 Losion is a generative AI architecture built on the **Tri-Jalur Router** paradigm — three complementary computational pathways whose contributions are dynamically weighted per-token by an adaptive router. The name *Tri-Jalur* (Indonesian: "Three Pathways") reflects the core insight that no single computational primitive — whether attention, state-space modeling, or retrieval — is optimal for all tokens in all contexts.
+
+### v2.0.0 — Alive Gradients & Production Ready
+
+Version 2.0.0 fixes the last remaining dead gradient path: the AuxFreeMoE MTP loss.
+
+#### AuxFreeMoE: MTP Loss Propagation
+
+**Before**: `MTPMoEHead` inside `AuxFreeMoE` computed `mtp_loss` during forward pass and stored it in `auxiliary_losses["mtp_loss"]`. However, `LosionForCausalLMV2.forward()` never extracted this loss from the routing info and added it to the model's total loss. This meant that **32.2% of model parameters** (all `MTPMoEHead.pred_heads` tensors) received zero gradient — they were computed but never learned.
+
+**After**: `LosionForCausalLMV2.forward()` now iterates over all layers' `routing_info["retrieval_aux"]` dicts, extracts `"mtp_loss"` tensors with `requires_grad=True`, averages them, and adds them to the total loss:
+
+```python
+# v2.0.0: Propagate AuxFreeMoE MTP loss to total loss
+for layer_info in routing_info_list:
+    ret_aux = layer_info.get("retrieval_aux")
+    if isinstance(ret_aux, dict) and "mtp_loss" in ret_aux:
+        mtp_l = ret_aux["mtp_loss"]
+        if mtp_l.requires_grad:
+            moe_mtp_loss += mtp_l
+            n_moe_mtp += 1
+if n_moe_mtp > 0:
+    loss += moe_mtp_loss / n_moe_mtp
+```
+
+This ensures that every parameter in the model — including the MTPMoEHead prediction heads that provide complementary training signal for expert specialization — now receives training gradients.
 
 ### v1.9.0 — Complete Gradient Flow & Vectorized Attention
 

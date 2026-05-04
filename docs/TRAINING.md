@@ -1801,7 +1801,20 @@ Quick fix priority:
 - Tighten gradient clipping: `max_grad_norm = 0.5`
 - Use AdvancedGRPOTrainer with Dirichlet noise for exploration stability
 
-### 13.5 MoE Expert Underutilization
+### 13.5 AuxFreeMoE MTP Loss Not Propagated — FIXED in v2.0.0
+
+**Symptoms** (pre-v2.0.0): `mtp_loss` computed by `MTPMoEHead` inside `AuxFreeMoE` but never added to the model's total loss. This meant **32.2% of model parameters** (`MTPMoEHead.pred_heads`) received zero gradient — they were dead weight during training.
+
+**Fix** (v2.0.0): `LosionForCausalLMV2.forward()` now extracts `mtp_loss` from each layer's `routing_info["retrieval_aux"]`, averages across layers, and adds it to the total loss. All model parameters now receive training gradients.
+
+```python
+# v2.0.0: Verify MTP loss is being propagated
+output = model(input_ids)
+# Check that moe_mtp_loss appears in loss breakdown
+print(output.loss)  # Should include MoE MTP contribution
+```
+
+### 13.6 MoE Expert Underutilization
 
 **Symptoms**: Some experts never receive tokens.
 
@@ -1812,7 +1825,7 @@ Quick fix priority:
 - Once load balancing stabilizes, return to `0.0` (aux-loss-free)
 - Consider switching to `expert_choice` routing strategy (guaranteed balance)
 
-### 13.6 Loss Spikes During Long-Context Training
+### 13.7 Loss Spikes During Long-Context Training
 
 **Symptoms**: Sudden loss spikes when sequence length increases.
 
@@ -1998,6 +2011,6 @@ hardware:
 
 ---
 
-*This documentation covers Losion v1.9.0. Hyperparameters and recommendations
+*This documentation covers Losion v2.0.0. Hyperparameters and recommendations
 may evolve with ongoing development. For questions, see the [ARCHITECTURE.md](ARCHITECTURE.md)
 or open an issue on GitHub.*

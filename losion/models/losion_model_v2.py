@@ -1418,6 +1418,32 @@ class LosionForCausalLMV2(nn.Module):
                 import logging
                 logging.getLogger(__name__).warning(f"JEPA loss computation failed: {e}")
 
+        # v2.0.0: Propagate AuxFreeMoE MTP loss from each layer to total loss.
+        # Previously, MTPMoEHead computed mtp_loss inside AuxFreeMoE but it was
+        # stored in routing_info["retrieval_aux"] and NEVER added to the model's
+        # total loss — making ~32% of model params dead weight with zero gradient.
+        # Now we extract and accumulate the MTP loss from every MoE layer.
+        if self.training and loss is not None and outputs.get("routing_info") is not None:
+            routing_info_list = outputs.get("routing_info")
+            if isinstance(routing_info_list, list):
+                moe_mtp_loss = torch.tensor(0.0, device=input_ids.device)
+                n_moe_mtp = 0
+                for layer_info in routing_info_list:
+                    if not isinstance(layer_info, dict):
+                        continue
+                    ret_aux = layer_info.get("retrieval_aux")
+                    if isinstance(ret_aux, dict) and "mtp_loss" in ret_aux:
+                        mtp_l = ret_aux["mtp_loss"]
+                        if isinstance(mtp_l, torch.Tensor) and mtp_l.requires_grad:
+                            moe_mtp_loss = moe_mtp_loss + mtp_l
+                            n_moe_mtp += 1
+                if n_moe_mtp > 0:
+                    # Average across layers, weighted by 0.1 (same as top-level MTP)
+                    avg_moe_mtp_loss = moe_mtp_loss / n_moe_mtp
+                    loss = loss + avg_moe_mtp_loss
+                    loss_dict["moe_mtp_loss"] = avg_moe_mtp_loss.item()
+                    loss_dict["moe_mtp_layers"] = n_moe_mtp
+
         # v1.8.0: Routing entropy regularization — FIXED: sekarang menghitung entropy
         # dari SEMUA layer, bukan hanya layer 0. Sebelumnya hanya layer 0 yang
         # di-regulasi, menyebabkan layer 1..N-1 bisa collapse ke single-pathway.

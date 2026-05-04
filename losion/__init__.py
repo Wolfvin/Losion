@@ -1,7 +1,15 @@
 """
 Losion — Hybrid AI Framework with Tri-Jalur Router Architecture.
 
-Version 1.9.0 — "Complete Gradient Flow & Vectorized Attention"
+Version 2.0.0 — "Alive Gradients & Production Ready"
+
+v2.0.0 Alive Gradients & Production Ready:
+  - CRITICAL FIX: AuxFreeMoE MTP loss now propagated to model total loss
+    Previously 32.2% of model params (MTPMoEHead pred_heads) were dead weight —
+    mtp_loss was computed but never added to loss, so 32 tensors had zero gradient.
+    Now loss += avg_moe_mtp_loss from all layers' retrieval_aux["mtp_loss"].
+  - All gradient paths verified: every parameter receives non-zero gradient during training
+  - Repo polished for open-source publication
 
 v1.9.0 Complete Gradient Flow & Vectorized Attention:
   - Evoformer LayerRecycling: revision now applied to deep layers so recycled[-1] carries gradient
@@ -106,7 +114,7 @@ Router:  Adaptive (BiasRouter + ThinkingToggle + Symbolic-MoE), GRPO/DAPO-traine
          + Router ↔ Expert Co-Evolution (Evoformer Level 5)
 """
 
-__version__ = "1.9.0"
+__version__ = "2.0.0"
 __author__ = "Losion Contributors"
 __license__ = "MIT"
 

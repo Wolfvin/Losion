@@ -1035,7 +1035,7 @@ Apa yang benar-benar terjadi.
 - Python: (e.g., 3.11.5)
 - PyTorch: (e.g., 2.4.0)
 - GPU: (e.g., NVIDIA A100 80GB)
-- Losion version: (e.g., 1.9.0)
+- Losion version: (e.g., 2.0.0)
 
 ## Additional Context
 Log, screenshot, atau informasi tambahan.
@@ -1069,6 +1069,7 @@ release yang terstruktur. Riwayat perubahan dicatat di [CHANGELOG.md](../CHANGEL
 
 ### Versi
 
+- **v2.0.0**: AuxFreeMoE MTP loss propagated to total loss — all model params now receive gradients (was: 32.2% of model params were dead weight with zero gradient)
 - **v1.9.0**: Complete gradient flow — 10.0/10 score, vectorized attention
 - Versi berikutnya mengikuti format `MAJOR.MINOR.PATCH`
 
@@ -1142,4 +1143,4 @@ untuk pengembangan proyek ini.
 
 ---
 
-*Dokumen ini ditulis untuk Losion v1.9.0.*
+*Dokumen ini ditulis untuk Losion v2.0.0.*

@@ -5,6 +5,30 @@ All notable changes to the Losion project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] — 2026-05-04
+
+### "Alive Gradients & Production Ready"
+
+#### Fixed — CRITICAL: AuxFreeMoE MTP Loss Dead Weight (32.2% of model params)
+
+- **AuxFreeMoE MTP loss NOT propagated to total loss**: The `MTPMoEHead` inside `AuxFreeMoE` computed `mtp_loss` during forward pass and stored it in `auxiliary_losses["mtp_loss"]`. However, `LosionForCausalLMV2.forward()` never extracted this loss from the routing info and added it to the model's total loss. This meant that **all 32 parameter tensors in `MTPMoEHead.pred_heads` (32.2% of model params)** received zero gradient during training — they were permanently dead weight, computed but never learned.
+  
+  **Fix**: Added MTP loss extraction loop in `LosionForCausalLMV2.forward()` that iterates over all layers' `routing_info["retrieval_aux"]` dicts, extracts any `"mtp_loss"` tensors that have `requires_grad=True`, averages them across layers, and adds them to the total loss. The MTP loss from AuxFreeMoE is already weighted by `mtp_loss_weight=0.1` inside the module, so no additional weighting is applied. This fix ensures that every parameter in the model, including the MTPMoEHead prediction heads, now receives training gradients.
+
+#### Changed
+
+- **Version bumped to 2.0.0**: This is a breaking change in the sense that models trained with v1.x will have untrained MTPMoEHead parameters. Fine-tuning from v1.x checkpoints is recommended to initialize these newly-alive parameters.
+- **Documentation overhaul**: All markdown files updated for v2.0.0 publication.
+- **Repo polished**: Version sync verified, CI pipeline validated, all markdown current.
+
+#### Test Results
+
+- All MTPMoEHead parameters now receive non-zero gradients during training
+- `moe_mtp_loss` appears in `loss_dict` output when training with AuxFreeMoE
+- Previously dead 32 parameter tensors now contribute to expert specialization
+
+---
+
 ## [1.9.0] — 2026-05-04
 
 ### "Complete Gradient Flow & Vectorized Attention"

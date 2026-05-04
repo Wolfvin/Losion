@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/Wolfvin/Losion/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"/></a>
-  <a href="https://github.com/Wolfvin/Losion/releases"><img src="https://img.shields.io/badge/version-1.9.0-brightgreen.svg" alt="Version 1.9.0"/></a>
+  <a href="https://github.com/Wolfvin/Losion/releases"><img src="https://img.shields.io/badge/version-2.0.0-brightgreen.svg" alt="Version 2.0.0"/></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"/></a>
   <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.1%2B-red.svg" alt="PyTorch"/></a>
 </p>
@@ -286,7 +286,8 @@ The router learns to allocate compute where it matters most, achieving both effi
 | **v1.6.1** | Gradient Repair | Critical bug fixes, gradient flow repair, SDPA connected | 3 |
 | **v1.7.0** | Differentiable Thinking | Differentiable ThinkingToggle, loop-free SSM, entropy regularization | 3 |
 | **v1.8.0** | Per-Channel Selectivity | Per-channel selectivity, ThinkingToggle soft-blending, entropy from all layers | 3 |
-| **v1.9.0** | Complete Gradient Flow | Complete gradient flow, vectorized attention, 10.0/10 score | 3 |
+| **v1.9.0** | Complete Gradient Flow | Evoformer+DualMemory gradient fix, vectorized attention, 10.0/10 score | 3 |
+| **v2.0.0** | Alive Gradients | AuxFreeMoE MTP loss propagated (was 32.2% dead params), production ready | 1 |
 
 ---
 
