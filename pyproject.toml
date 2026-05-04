@@ -63,10 +63,10 @@ all = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/losion/losion"
-Documentation = "https://losion.readthedocs.io"
-Repository = "https://github.com/losion/losion"
-Issues = "https://github.com/losion/issues"
+Homepage = "https://github.com/Wolfvin/Losion"
+Documentation = "https://github.com/Wolfvin/Losion#readme"
+Repository = "https://github.com/Wolfvin/Losion"
+Issues = "https://github.com/Wolfvin/Losion/issues"
 
 [tool.setuptools.packages.find]
 include = ["losion*"]

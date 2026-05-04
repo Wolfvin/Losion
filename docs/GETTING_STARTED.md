@@ -74,8 +74,8 @@ Dependencies tambahan akan diinstal otomatis oleh pip.
 
 ```bash
 # Clone repository
-git clone https://github.com/losion/losion.git
-cd losion
+git clone https://github.com/Wolfvin/Losion.git
+cd Losion
 
 # Buat virtual environment
 python -m venv venv
@@ -115,7 +115,7 @@ python -c "import torch; print(f'ROCm: {torch.cuda.is_available()}')"
 # NVIDIA
 docker run --gpus all -it pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel
 # Di dalam container:
-git clone https://github.com/losion/losion.git && cd losion
+git clone https://github.com/Wolfvin/Losion.git && cd Losion
 pip install -e .
 
 # AMD
@@ -123,7 +123,7 @@ docker run -it --device=/dev/kfd --device=/dev/dri \
     --group-add=video --ipc=host \
     rocm/pytorch:latest
 # Di dalam container:
-git clone https://github.com/losion/losion.git && cd losion
+git clone https://github.com/Wolfvin/Losion.git && cd Losion
 pip install -e .
 ```
 

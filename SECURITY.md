@@ -41,7 +41,7 @@ we can fix the issue before it becomes publicly known.
 
 | Method                        | Details                                            |
 |-------------------------------|----------------------------------------------------|
-| **GitHub Security Advisory**  | [Open a private advisory](https://github.com/losion/losion/security/advisories/new) |
+| **GitHub Security Advisory**  | [Open a private advisory](https://github.com/Wolfvin/Losion/security/advisories/new) |
 | **Email**                     | security@losion.dev                                |
 
 Please **do not** file security vulnerabilities as public GitHub issues.

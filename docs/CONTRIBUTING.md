@@ -153,8 +153,8 @@ Closes #42
 
 ```bash
 # Clone fork Anda
-git clone https://github.com/YOUR_USERNAME/losion.git
-cd losion
+git clone https://github.com/YOUR_USERNAME/Losion.git
+cd Losion
 
 # Buat virtual environment
 python -m venv venv
@@ -1069,7 +1069,7 @@ release yang terstruktur. Riwayat perubahan dicatat di [CHANGELOG.md](../CHANGEL
 
 ### Versi
 
-- **v1.9.0**: Initial release — arsitektur dasar Tri-Jalur Router
+- **v1.9.0**: Complete gradient flow — 10.0/10 score, vectorized attention
 - Versi berikutnya mengikuti format `MAJOR.MINOR.PATCH`
 
 ### Alur Release

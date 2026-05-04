@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="docs/assets/losion-logo.png" alt="Losion" width="200"/>
-</p>
-
 <h1 align="center">Losion</h1>
 
 <p align="center">
@@ -9,8 +5,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/losion/losion/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"/></a>
-  <a href="https://github.com/losion/losion/releases"><img src="https://img.shields.io/badge/version-1.9.0-brightgreen.svg" alt="Version 1.9.0"/></a>
+  <a href="https://github.com/Wolfvin/Losion/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"/></a>
+  <a href="https://github.com/Wolfvin/Losion/releases"><img src="https://img.shields.io/badge/version-1.9.0-brightgreen.svg" alt="Version 1.9.0"/></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"/></a>
   <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.1%2B-red.svg" alt="PyTorch"/></a>
 </p>
@@ -299,8 +295,8 @@ The router learns to allocate compute where it matters most, achieving both effi
 ### From Source (Recommended)
 
 ```bash
-git clone https://github.com/losion/losion.git
-cd losion
+git clone https://github.com/Wolfvin/Losion.git
+cd Losion
 pip install -e ".[all]"
 ```
 
@@ -684,7 +680,7 @@ losion/
 
 We welcome contributions! Please see [CONTRIBUTING.md](docs/CONTRIBUTING.md) for guidelines.
 
-1. Fork the repository
+1. Fork the repository at [github.com/Wolfvin/Losion](https://github.com/Wolfvin/Losion)
 2. Create a feature branch (`git checkout -b feature/amazing-feature`)
 3. Commit your changes (`git commit -m 'Add amazing feature'`)
 4. Push to the branch (`git push origin feature/amazing-feature`)
