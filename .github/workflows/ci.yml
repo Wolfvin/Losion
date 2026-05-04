@@ -21,7 +21,7 @@ jobs:
       - name: Ruff check
         run: ruff check losion/ --output-format=github
       - name: MyPy check
-        run: mypy losion/ --ignore-missing-imports || true
+        run: mypy losion/ --ignore-missing-imports
 
   version-sync:
     runs-on: ubuntu-latest

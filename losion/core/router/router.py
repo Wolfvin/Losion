@@ -26,13 +26,16 @@ from .thinking_toggle import (
 
 @dataclass
 class AdaptiveRoutingOutput:
-    """Output lengkap dari AdaptiveRouter."""
+    """Output lengkap dari AdaptiveRouter.
+
+    v1.7.0: depth_multiplier sekarang torch.Tensor [batch] (bukan float).
+    """
 
     routing_weights: torch.Tensor  # [batch, seq, 3] — bobot per jalur
     routing_info: PathwayRoutingInfo  # Detail routing dari BiasRouter
     thinking_assessment: ThinkingAssessment  # Assessment dari ThinkingToggle
     adjusted_weights: torch.Tensor  # [batch, seq, 3] — weights setelah thinking adjustment
-    depth_multiplier: float  # Depth multiplier dari thinking toggle
+    depth_multiplier: torch.Tensor  # [batch] — differentiable! Depth multiplier dari thinking toggle
     pathway_labels: list  # Label jalur: ["sequential", "reasoning", "factual"]
 
 
@@ -139,8 +142,10 @@ class AdaptiveRouter(nn.Module):
             routing_weights, thinking_assessment
         )
 
-        # === Hitung depth multiplier ===
+        # === Hitung depth multiplier (tensor sekarang, bukan float) ===
         depth_multiplier = thinking_assessment.depth_multiplier
+        # v1.7.0: depth_multiplier adalah tensor [batch]. Untuk AdaptiveRoutingOutput
+        # yang menyimpan scalar, ambil mean. Untuk routing langsung, gunakan tensor.
 
         return AdaptiveRoutingOutput(
             routing_weights=routing_weights,
@@ -265,6 +270,8 @@ class AdaptiveRouter(nn.Module):
         """
         Ringkasan distribusi routing untuk monitoring.
 
+        v1.7.0: Handles tensor depth_multiplier and confidence.
+
         Args:
             output: Output dari forward
 
@@ -275,6 +282,12 @@ class AdaptiveRouter(nn.Module):
             adjusted = output.adjusted_weights  # [batch, seq, 3]
             mean_weights = adjusted.mean(dim=(0, 1))  # [3]
 
+            # Handle tensor depth_multiplier and confidence
+            dm = output.depth_multiplier
+            conf = output.thinking_assessment.confidence
+            dm_val = dm.mean().item() if isinstance(dm, torch.Tensor) else dm
+            conf_val = conf.mean().item() if isinstance(conf, torch.Tensor) else conf
+
             return {
                 "pathway_labels": self.PATHWAY_LABELS,
                 "mean_weights": {
@@ -283,8 +296,8 @@ class AdaptiveRouter(nn.Module):
                 },
                 "thinking_mode": output.thinking_assessment.mode.value,
                 "dominant_task": output.thinking_assessment.dominant_task.value,
-                "depth_multiplier": output.depth_multiplier,
-                "thinking_confidence": output.thinking_assessment.confidence,
+                "depth_multiplier": dm_val,
+                "thinking_confidence": conf_val,
                 "complexity_mean": output.thinking_assessment.complexity_score.mean().item(),
             }
 
@@ -297,19 +310,22 @@ class AdaptiveRouter(nn.Module):
         Entropy rendah = routing yang focused (1-2 jalur dominan)
         Entropy tinggi = routing yang merata (semua jalur aktif)
 
+        v1.7.0: TANPA torch.no_grad() agar gradien mengalir kembali
+        ke router weights melalui entropy loss. Ini memungkinkan
+        entropy regularization benar-benar melatih router.
+
         Args:
             routing_weights: [batch, seq, num_pathways]
 
         Returns:
-            Mean entropy scalar
+            Mean entropy scalar (differentiable!)
         """
-        with torch.no_grad():
-            # Hindari log(0)
-            clamped = routing_weights.clamp(min=1e-8)
-            entropy = -(clamped * clamped.log()).sum(dim=-1)  # [batch, seq]
-            max_entropy = torch.log(
-                torch.tensor(self.num_pathways, dtype=routing_weights.dtype)
-            )
-            # Normalize ke [0, 1]
-            normalized_entropy = entropy / max_entropy
-            return normalized_entropy.mean()
+        # Hindari log(0) dengan soft clamp
+        clamped = routing_weights.clamp(min=1e-8)
+        entropy = -(clamped * clamped.log()).sum(dim=-1)  # [batch, seq]
+        max_entropy = torch.log(
+            torch.tensor(self.num_pathways, dtype=routing_weights.dtype, device=routing_weights.device)
+        )
+        # Normalize ke [0, 1]
+        normalized_entropy = entropy / max_entropy
+        return normalized_entropy.mean()

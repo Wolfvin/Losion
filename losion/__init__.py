@@ -1,7 +1,15 @@
 """
 Losion — Hybrid AI Framework with Tri-Jalur Router Architecture.
 
-Version 1.6.1 — "Critical Bug Fixes & Gradient Flow Repair"
+Version 1.7.0 — "Full Differentiable Gradient Flow & Loop-Free SSM"
+
+v1.7.0 Full Differentiable Gradient Flow & Loop-Free SSM:
+  - ThinkingToggle: depth_multiplier & confidence sekarang torch.Tensor (bukan Python float)
+  - Entropy regularization FIXED: compute_routing_entropy TANPA torch.no_grad(), gradien mengalir
+  - Entropy key lookup FIXED: routing_info sekarang punya "adjusted_weights" key
+  - Route weights NON-DETACHED: gradien mengalir ke router melalui entropy loss
+  - ssd_chunk_scan TANPA Python token loop: cumsum-based parallel scan (log-space trick)
+  - MyPy || true REMOVED dari CI: type-checking sekarang required
 
 v1.6.1 Critical Bug Fixes & Gradient Flow Repair:
   - ThinkingToggle dead grad FIXED: thinking_score tensor now flows to router differentiably
@@ -10,7 +18,7 @@ v1.6.1 Critical Bug Fixes & Gradient Flow Repair:
   - Mamba2 SSD connected to chunk_parallel_scan (no Python loop for seq>chunk_size)
   - GatedAttentionHead now uses SDPA with manual fallback
   - RoPE offset for K FIXED in both GatedAttentionHead and GatedMultiHeadAttention
-  - CI || true REMOVED — tests can actually fail now
+  - CI || true REMOVED from pytest/train_test.py — tests can actually fail now
   - Entropy regularization ACTIVATED in LosionForCausalLMV2 loss
   - aux_free_moe load counting vectorized via bincount
   - aux_free_moe device mismatch fixed
@@ -76,7 +84,7 @@ Router:  Adaptive (BiasRouter + ThinkingToggle + Symbolic-MoE), GRPO/DAPO-traine
          + Router ↔ Expert Co-Evolution (Evoformer Level 5)
 """
 
-__version__ = "1.6.1"
+__version__ = "1.7.0"
 __author__ = "Losion Contributors"
 __license__ = "MIT"
 

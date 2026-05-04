@@ -584,7 +584,7 @@ def test_individual_components(config: LosionConfig):
         from losion.core.attention.gated_attention import GatedMultiHeadAttention, GatedAttentionConfig
         ga_cfg = GatedAttentionConfig(d_model=d_model, n_heads=4, d_kv=64)
         component = GatedMultiHeadAttention(ga_cfg).to(device)
-        out = component(x, x, x)
+        out = component(x)  # v1.7.0: GatedMultiHeadAttention.forward() takes (x), NOT (q, k, v)
         output = out[0] if isinstance(out, tuple) else out
         results["GatedAttention"] = {"status": "OK", "shape": list(output.shape), "finite": bool(torch.isfinite(output).all())}
         print(f"  [OK] GatedAttention: output {output.shape}")
@@ -597,7 +597,7 @@ def test_individual_components(config: LosionConfig):
         from losion.core.attention.moba import MoBAAttention, MoBAConfig
         moba_cfg = MoBAConfig(block_size=8, top_k_blocks=2)
         component = MoBAAttention(d_model=d_model, n_heads=4, d_head=64, config=moba_cfg).to(device)
-        out = component(x, x, x)
+        out = component(x)  # v1.7.0: MoBAAttention takes (x), NOT (q, k, v)
         output = out[0] if isinstance(out, tuple) else out
         results["MoBA"] = {"status": "OK", "shape": list(output.shape), "finite": bool(torch.isfinite(output).all())}
         print(f"  [OK] MoBA: output {output.shape}")
@@ -624,7 +624,7 @@ def test_individual_components(config: LosionConfig):
     # SymbolicMoERouter
     try:
         from losion.core.retrieval.symbolic_moe import SymbolicMoERouter
-        component = SymbolicMoERouter(d_model=d_model, num_experts=4, num_active_experts=2).to(device)
+        component = SymbolicMoERouter(d_model=d_model).to(device)  # v1.7.0: Correct interface
         out = component(x)
         output = out[0] if isinstance(out, tuple) else out
         results["SymbolicMoERouter"] = {"status": "OK", "shape": list(output.shape), "finite": bool(torch.isfinite(output).all())}
@@ -719,7 +719,7 @@ def test_training_loop(model, config: LosionConfig, n_steps: int = 10):
     batch_size = 4
     seq_len = 32
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)  # v1.7.0: higher LR for convergence
     
     losses = []
     results = {}

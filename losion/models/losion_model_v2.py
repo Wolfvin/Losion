@@ -546,7 +546,8 @@ class LosionLayerV2(nn.Module):
 
         routing_info = {
             "layer_idx": self.layer_idx,
-            "route_weights": route_weights.detach(),
+            "route_weights": route_weights,  # v1.7.0: NO .detach() — gradien mengalir untuk entropy regularization
+            "adjusted_weights": route_weights,  # v1.7.0: Alias untuk entropy regularization lookup
             "ssm_state": ssm_state_new,
             "ssm_aux_loss": ssm_aux_loss,
             "retrieval_aux": ret_aux,
@@ -1404,23 +1405,33 @@ class LosionForCausalLMV2(nn.Module):
             except Exception:
                 pass
 
-        # v1.6.1: Routing entropy regularization — aktifkan entropy regularization
-        # dari AdaptiveRouter untuk mencegah router collapse.
-        # Router entropy rendah = routing yang terlalu focused pada 1 jalur
-        # Entropy target: ~0.9-1.0 (distribusi yang seimbang antara 3 jalur)
+        # v1.7.0: Routing entropy regularization — FIXED: sekarang benar-benar differentiable
+        # Router entropy rendah = routing yang terlalu focused pada 1 jalur (collapse)
+        # Entropy target: ~0.9 (distribusi yang seimbang antara 3 jalur)
+        # v1.7.0 fix: routing_weights sekarang NON-DETACHED dan compute_routing_entropy
+        # TANPA torch.no_grad(), sehingga gradien mengalir kembali ke router.
         if self.training and loss is not None and outputs.get("routing_info") is not None:
             try:
                 from losion.core.router.router import AdaptiveRouter
                 if hasattr(self.model, 'layers') and len(self.model.layers) > 0:
                     router = self.model.layers[0].router
                     if isinstance(router, AdaptiveRouter):
-                        routing_weights = outputs.get("routing_info")
-                        if isinstance(routing_weights, dict) and "adjusted_weights" in routing_weights:
-                            adjusted = routing_weights["adjusted_weights"]
-                        elif hasattr(routing_weights, "adjusted_weights"):
-                            adjusted = routing_weights.adjusted_weights
-                        else:
-                            adjusted = None
+                        routing_info_list = outputs.get("routing_info")
+                        # v1.7.0 fix: routing_info adalah list of dicts dari setiap layer.
+                        # Gunakan layer pertama yang punya "adjusted_weights" key.
+                        adjusted = None
+                        if isinstance(routing_info_list, list) and len(routing_info_list) > 0:
+                            for layer_info in routing_info_list:
+                                if isinstance(layer_info, dict) and "adjusted_weights" in layer_info:
+                                    adjusted = layer_info["adjusted_weights"]
+                                    break
+                                elif hasattr(layer_info, "adjusted_weights"):
+                                    adjusted = layer_info.adjusted_weights
+                                    break
+                        elif isinstance(routing_info_list, dict):
+                            adjusted = routing_info_list.get("adjusted_weights")
+                        elif hasattr(routing_info_list, "adjusted_weights"):
+                            adjusted = routing_info_list.adjusted_weights
 
                         if adjusted is not None:
                             entropy = router.compute_routing_entropy(adjusted)

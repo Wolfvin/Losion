@@ -36,14 +36,19 @@ class TaskType(Enum):
 
 @dataclass
 class ThinkingAssessment:
-    """Hasil assessment thinking/non-thinking."""
+    """Hasil assessment thinking/non-thinking.
+
+    v1.7.0: depth_multiplier dan confidence sekarang torch.Tensor
+    (bukan Python float) agar gradien mengalir kembali ke
+    context_integrator dan task_classifier.
+    """
 
     mode: ThinkingMode
     complexity_score: torch.Tensor  # [batch, seq] — skor kompleksitas
     task_type_probs: torch.Tensor  # [batch, seq, num_task_types]
     dominant_task: TaskType
-    depth_multiplier: float  # Berapa kali lipat depth untuk Jalur 2+3
-    confidence: float  # Confidence dalam assessment
+    depth_multiplier: torch.Tensor  # [batch] — differentiable! Berapa kali lipat depth untuk Jalur 2+3
+    confidence: torch.Tensor  # [batch] — differentiable! Confidence dalam assessment
     thinking_score: torch.Tensor = None  # [batch] — differentiable thinking score dari context_integrator
 
 
@@ -183,33 +188,33 @@ class ThinkingToggle(nn.Module):
         dominant_task_idx = overall_task_probs.argmax().item()
         dominant_task = list(TaskType)[dominant_task_idx]
 
-        # 7. Calculate depth multiplier
-        # NOTE: depth_multiplier adalah Python float untuk logging/monitoring.
-        # Gradien mengalir melalui thinking_score tensor yang disimpan
-        # di ThinkingAssessment dan digunakan secara differentiable
-        # oleh AdaptiveRouter._adjust_for_thinking().
-        avg_thinking_score = thinking_score.mean().item()
+        # 7. Calculate depth multiplier — DIFFERENTIABLE TENSOR
+        # v1.7.0: depth_multiplier sekarang torch.Tensor [batch], bukan Python float.
+        # Gradien mengalir: loss → route_weights → thinking_adjuster →
+        # thinking_signal → thinking_score → depth_multiplier.
+        avg_thinking_score = thinking_score  # [batch] — gunakan tensor langsung, bukan .item()
         if mode == ThinkingMode.THINKING:
             depth_multiplier = (
                 self.depth_min
                 + (self.depth_max - self.depth_min) * avg_thinking_score
-            )
+            )  # [batch]
         else:
-            depth_multiplier = self.depth_min + 0.2 * avg_thinking_score
+            depth_multiplier = self.depth_min + 0.2 * avg_thinking_score  # [batch]
 
-        # 8. Confidence
-        confidence = 1.0 - abs(avg_thinking_score - self.threshold) / max(
+        # 8. Confidence — DIFFERENTIABLE TENSOR
+        # v1.7.0: confidence sekarang torch.Tensor [batch], bukan Python float.
+        confidence = 1.0 - (avg_thinking_score - self.threshold).abs() / max(
             self.threshold, 1.0 - self.threshold
         )
-        confidence = min(max(confidence, 0.0), 1.0)
+        confidence = confidence.clamp(0.0, 1.0)  # [batch]
 
         return ThinkingAssessment(
             mode=mode,
             complexity_score=complexity,
             task_type_probs=task_probs,
             dominant_task=dominant_task,
-            depth_multiplier=depth_multiplier,
-            confidence=confidence,
+            depth_multiplier=depth_multiplier,  # [batch] — differentiable!
+            confidence=confidence,  # [batch] — differentiable!
             thinking_score=thinking_score,  # [batch] — differentiable!
         )
 
