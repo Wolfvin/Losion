@@ -1,33 +1,28 @@
 """
 Losion — Hybrid AI Framework with Tri-Jalur Router Architecture.
 
-Version 1.0.0 — "Verified & Alive"
+Version 1.5.0 — "Training Optimized & Kernel Complete"
+
+v1.5.0 Training & Kernel Optimization:
+  - SDPA / Flash Attention with 3-tier fallback (flash_attn → SDPA → manual)
+  - RWKV-7 parallel WKV scan (cumsum-based, no Python token loop)
+  - Mamba-2/3 cumsum-based parallel scan (no Python token loop)
+  - Per-jalur gradient checkpointing with selective recomputation
+  - CPU offload for optimizer states (ZeRO-Offload style)
+  - FSDP2 / fully_shard API integration
+  - FP8 training via torchao (optional, simulated fallback)
+  - PathwayEarlyExit with adaptive thresholds
+  - PagedKVCacheManager with INT4 quantization
+  - torch.compile(mode="reduce-overhead") integration
+  - Gradient compression for distributed training
+  - Context parallelism (ring attention + SSM state propagation)
+  - Expert parallelism with AllToAll dispatcher
+  - CI/CD with version sync check
+  - LosionForCausalLMV2 as primary export
 
 v1.0.0 End-to-End Verified:
-  All 40+ components have been tested with actual forward+backward passes.
-  A 17M-parameter model was trained for 10 steps and all pathways verified:
-  - SSM (Jalur 1): Gradient flows correctly through Mamba-3/RoutingMamba
-  - Attention (Jalur 2): GatedAttention/MoBA properly connected
-  - MoE (Jalur 3): SmoreMoE/AuxFreeMoE with proper load balancing
-  - Router: AdaptiveRouter with ThinkingToggle dynamically routes
-  - RDT: RecurrentDepthBlock with proper block wrapper
-  - Evoformer: All 5 levels wired and functional
-  - DualMemory: Write+Read cycle verified
-  - JEPA: JEPAHead loss computed and gradients flow
-  - MTP: Multi-token prediction loss correctly shaped
-  - Generation: Autoregressive generation works end-to-end
-  - Save/Load: Round-trip verified with zero difference
-
-  Critical wiring fixes in v1.0.0:
-  - MoBAAttention constructor: Fixed config vs positional arg mismatch
-  - GatedAttention config: Added d_model field to GatedAttentionConfig
-  - LLMJEPA: Replaced standalone wrapper with lightweight JEPAHead
-  - RDT: Inner block now returns (output, aux) tuple + accepts **kwargs
-  - MTP loss: Fixed shape mismatch in shifted label computation
-  - Generation: Fixed dimension mismatch in token concatenation
-  - Mamba3SSD: Fixed config object vs keyword arg constructor mismatch
-  - SymbolicMoE: Fixed fall-through that didn't return a module
-  - from_pretrained: Uses _from_dict for proper nested config loading
+  All 40+ components tested with forward+backward passes.
+  17M-parameter model trained for 10 steps, all pathways verified.
 
 Losion combines three complementary computational pathways into a single
 adaptive architecture:
@@ -48,6 +43,183 @@ Router:  Adaptive (BiasRouter + ThinkingToggle + Symbolic-MoE), GRPO/DAPO-traine
          + Router ↔ Expert Co-Evolution (Evoformer Level 5)
 """
 
-__version__ = "1.0.0"
+__version__ = "1.5.0"
 __author__ = "Losion Contributors"
 __license__ = "MIT"
+
+# ============================================================================
+# Public API — Primary Exports
+# ============================================================================
+
+# --- Configuration ---
+from losion.config import (
+    LosionConfig,
+    SSMConfig,
+    AttentionConfig,
+    RetrievalConfig,
+    RouterConfig,
+    TrainingConfig,
+    HardwareConfig,
+    RecurrentConfig,
+    JEPAConfig,
+    DAPOConfig,
+    RLVRConfig,
+    OutputConfig,
+    AttnResConfig,
+    EvoformerConfig,
+    Child3WConfig,
+    DualMemoryConfig,
+    AnchoredDecoderConfig,
+    PrefetchConfig,
+    QuantizationConfig,
+    BitNetConfig,
+    FP8Config,
+    NASConfig,
+    PrecisionType,
+    RoutingType,
+    ThinkingMode,
+)
+
+# --- Models (V2 as primary) ---
+from losion.models.losion_model_v2 import (
+    LosionModelV2,
+    LosionForCausalLMV2,
+    LosionLayerV2,
+    MTPHead,
+    RoPE,
+    RMSNorm,
+)
+
+# --- Legacy V1 models (backward compatible) ---
+from losion.models.losion_model import LosionModel, LosionLayer
+from losion.models.losion_decoder import LosionForCausalLM
+
+# --- Kernel Optimizations ---
+try:
+    from losion.core.kernel.sdpa_compat import sdpa_attention, SDPACompat
+except ImportError:
+    pass
+
+try:
+    from losion.core.kernel.early_exit import PathwayEarlyExit
+except ImportError:
+    pass
+
+try:
+    from losion.core.kernel.flash_attn import FlashAttentionWrapper, RingAttention
+except ImportError:
+    pass
+
+try:
+    from losion.core.kernel.ssm_kernels import (
+        associative_scan,
+        chunk_parallel_scan,
+        rwkv7_parallel_wkv,
+        HAS_TRITON,
+    )
+except ImportError:
+    pass
+
+try:
+    from losion.core.kernel.kv_cache import PagedKVCacheManager, INT4KVCacheQuantizer
+except ImportError:
+    pass
+
+try:
+    from losion.core.kernel.training_optim import (
+        MemoryEfficientTrainer,
+        CUDAGraphOptimizer,
+        GradientCompressor,
+        FusedAdamW,
+        CPUOffloadOptimizer,
+    )
+except ImportError:
+    pass
+
+try:
+    from losion.core.kernel.fp8_utils import FP8TrainingWrapper, has_fp8_support
+except ImportError:
+    pass
+
+# --- Distributed ---
+try:
+    from losion.distributed.parallel import (
+        ParallelismConfig,
+        LosionFSDPWrapper,
+        ContextParallel,
+        LosionDistributedTrainer,
+    )
+except ImportError:
+    pass
+
+# --- Training ---
+try:
+    from losion.training.trainer import LosionTrainer, TrainerConfig
+except ImportError:
+    pass
+
+# --- Inference ---
+try:
+    from losion.inference.kv_cache import KVCache
+except ImportError:
+    pass
+
+__all__ = [
+    # Version
+    "__version__",
+    "__author__",
+    "__license__",
+    # Config
+    "LosionConfig",
+    "SSMConfig",
+    "AttentionConfig",
+    "RetrievalConfig",
+    "RouterConfig",
+    "TrainingConfig",
+    "HardwareConfig",
+    "RecurrentConfig",
+    "JEPAConfig",
+    "DAPOConfig",
+    "RLVRConfig",
+    "OutputConfig",
+    # Models (V2 primary)
+    "LosionModelV2",
+    "LosionForCausalLMV2",
+    "LosionLayerV2",
+    "MTPHead",
+    "RoPE",
+    "RMSNorm",
+    # Legacy V1
+    "LosionModel",
+    "LosionLayer",
+    "LosionForCausalLM",
+    # Kernel
+    "PathwayEarlyExit",
+    "FlashAttentionWrapper",
+    "RingAttention",
+    "sdpa_attention",
+    "SDPACompat",
+    "associative_scan",
+    "chunk_parallel_scan",
+    "rwkv7_parallel_wkv",
+    "HAS_TRITON",
+    "PagedKVCacheManager",
+    "INT4KVCacheQuantizer",
+    "MemoryEfficientTrainer",
+    "CUDAGraphOptimizer",
+    "GradientCompressor",
+    "FusedAdamW",
+    "CPUOffloadOptimizer",
+    "FP8TrainingWrapper",
+    "has_fp8_support",
+    # Distributed
+    "ParallelismConfig",
+    "LosionFSDPWrapper",
+    "ContextParallel",
+    "LosionDistributedTrainer",
+    # Training
+    "LosionTrainer",
+    "TrainerConfig",
+    # Inference
+    "KVCache",
+]

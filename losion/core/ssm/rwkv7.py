@@ -4,8 +4,14 @@ RWKV-7 WKV (Weighted Key-Value) Implementation untuk Losion Framework.
 Implementasi layer RWKV-7 WKV berbasis pure PyTorch.
 Mendukung mode training (paralel) dan inference (sekuensial O(1) per token).
 
+v1.5.0: wkv_forward_parallel sekarang menggunakan cumsum-based parallel scan
+dari losion.core.kernel.ssm_kernels.rwkv7_parallel_wkv, menghilangkan
+Python token loop sepenuhnya. Fallback ke sequential scan jika kernel
+module tidak tersedia.
+
 Referensi:
 - Peng, B. et al., "RWKV-7: The Next Generation RWKV Architecture" (2025)
+- Parallel Scan: Blelloch, "Prefix Sums and Their Applications" (1990)
 - Mekanisme WKV menghitung recurrence data-dependent yang memungkinkan
   pemrosesan sekuensial O(1) per token saat inferensi.
 """
@@ -19,6 +25,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+
+# Try to import optimized parallel WKV from kernel module
+try:
+    from losion.core.kernel.ssm_kernels import rwkv7_parallel_wkv as _parallel_wkv
+    _HAS_PARALLEL_KERNEL = True
+except ImportError:
+    _HAS_PARALLEL_KERNEL = False
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +48,10 @@ def wkv_forward_parallel(
 ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Komputasi WKV paralel untuk training.
+
+    v1.5.0: Menggunakan cumsum-based parallel scan dari kernel module.
+    Tidak ada Python token loop — O(log n) parallel depth alih-alih O(n).
+    Fallback ke sequential scan jika kernel module tidak tersedia.
 
     Mekanisme WKV menghitung recurrence data-dependent:
     - wkv_state: akumulator weighted key-value
@@ -59,62 +76,60 @@ def wkv_forward_parallel(
         - output: bentuk (batch, seq_len, d_inner)
         - final_state: (wkv_state, sum_state) tuple
     """
+    # Use optimized parallel scan from kernel module
+    if _HAS_PARALLEL_KERNEL:
+        return _parallel_wkv(r, k, v, w, u, initial_state)
+
+    # Fallback: sequential scan (for environments without kernel module)
+    return _wkv_forward_sequential(r, k, v, w, u, initial_state)
+
+
+def _wkv_forward_sequential(
+    r: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    initial_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Sequential WKV scan — fallback when kernel module is unavailable.
+
+    This is the original sequential implementation, kept for compatibility.
+    It uses a Python for-loop over the sequence dimension, which is slow
+    for long sequences but always correct.
+    """
     batch, seq_len, d_inner = r.shape
     d_head = k.shape[-1]
 
-    # Inisialisasi state
     if initial_state is not None:
         wkv_state, sum_state = initial_state
     else:
-        wkv_state = torch.zeros(
-            batch, d_head, dtype=r.dtype, device=r.device
-        )
-        sum_state = torch.zeros(
-            batch, d_head, dtype=r.dtype, device=r.device
-        )
+        wkv_state = torch.zeros(batch, d_head, dtype=r.dtype, device=r.device)
+        sum_state = torch.zeros(batch, d_head, dtype=r.dtype, device=r.device)
 
-    # Decay: w dalam domain log, konversi ke linear
-    # w < 0, jadi decay = exp(w) ∈ (0, 1)
-    decay = torch.exp(w)  # (batch, seq_len, d_head)
-
-    # ---- Sequential WKV scan (paralel across batch) ----
+    decay = torch.exp(w)
     outputs = []
 
     for t in range(seq_len):
-        # Current token
-        r_t = r[:, t, :]  # (batch, d_inner)
-        k_t = k[:, t, :]  # (batch, d_head)
-        v_t = v[:, t, :]  # (batch, d_head)
-        d_t = decay[:, t, :]  # (batch, d_head)
+        r_t = r[:, t, :]
+        k_t = k[:, t, :]
+        v_t = v[:, t, :]
+        d_t = decay[:, t, :]
 
-        # Decay state
-        wkv_state = wkv_state * d_t  # (batch, d_head)
-        sum_state = sum_state * d_t  # (batch, d_head)
+        wkv_state = wkv_state * d_t
+        sum_state = sum_state * d_t
 
-        # WKV computation:
-        # numerator = wkv_state + u * k_t * v_t
-        # denominator = sum_state + u * k_t^2 + eps
-        # output = r_t @ (numerator / denominator)
+        kv_t = k_t * v_t
+        k_sq = k_t * k_t
 
-        # Simple linear attention style:
-        # wkv = (wkv_state + u * k_t * v_t) / (sum_state + u * k_t^2 + eps)
-        # y_t = r_t @ wkv
+        numerator = wkv_state + u.unsqueeze(0) * kv_t
+        denominator = sum_state + u.unsqueeze(0) * k_sq + 1e-8
 
-        # Untuk d_inner != d_head, gunakan proyeksi
-        # Simplifikasi: gunakan element-wise dengan broadcast
-        kv_t = k_t * v_t  # (batch, d_head)
-        k_sq = k_t * k_t  # (batch, d_head)
+        wkv_val = numerator / denominator
 
-        numerator = wkv_state + u.unsqueeze(0) * kv_t  # (batch, d_head)
-        denominator = sum_state + u.unsqueeze(0) * k_sq + 1e-8  # (batch, d_head)
-
-        wkv_val = numerator / denominator  # (batch, d_head)
-
-        # Output: y_t = r_t * wkv_val (element-wise jika d_inner == d_head)
         if d_inner == d_head:
-            y_t = r_t * wkv_val  # (batch, d_inner)
+            y_t = r_t * wkv_val
         else:
-            # Truncate atau pad wkv_val ke d_inner
             if d_head > d_inner:
                 y_t = r_t * wkv_val[..., :d_inner]
             else:
@@ -122,12 +137,10 @@ def wkv_forward_parallel(
                 y_t = r_t * wkv_padded
 
         outputs.append(y_t)
+        wkv_state = wkv_state + kv_t
+        sum_state = sum_state + k_sq
 
-        # Update state: tambahkan kontribusi token saat ini
-        wkv_state = wkv_state + kv_t  # (batch, d_head)
-        sum_state = sum_state + k_sq  # (batch, d_head)
-
-    output = torch.stack(outputs, dim=1)  # (batch, seq_len, d_inner)
+    output = torch.stack(outputs, dim=1)
     final_state = (wkv_state, sum_state)
 
     return output, final_state

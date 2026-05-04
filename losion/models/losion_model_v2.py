@@ -377,7 +377,7 @@ def _build_moe(config: LosionConfig) -> nn.Module:
             d_model=d_model,
             d_ff=d_ff,
             num_experts=num_experts,
-            num_active_experts=ret_cfg.num_active_experts,
+            top_k=ret_cfg.num_active_experts,
         )
 
     except ImportError:

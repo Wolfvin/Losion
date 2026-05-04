@@ -8,12 +8,13 @@ from setuptools import setup, find_packages
 
 setup(
     name="losion",
-    version="1.0.0",
+    version="1.5.0",
     packages=find_packages(include=["losion*"]),
     python_requires=">=3.10",
     install_requires=[
         "torch>=2.1.0",
         "numpy>=1.24.0",
         "pyyaml>=6.0",
+        "einops>=0.7.0",
     ],
 )

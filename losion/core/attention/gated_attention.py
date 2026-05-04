@@ -441,7 +441,12 @@ class GatedMultiHeadAttention(nn.Module):
         v: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute multi-head softmax attention.
+        """Compute multi-head softmax attention with SDPA dispatch.
+
+        Uses F.scaled_dot_product_attention when available (PyTorch 2.0+),
+        which auto-dispatches to Flash Attention, memory-efficient attention,
+        or math attention depending on hardware. Falls back to manual
+        matmul attention for older PyTorch versions.
 
         Args:
             q: ``(batch, n_heads, seq_len, d_kv)``.
@@ -460,7 +465,20 @@ class GatedMultiHeadAttention(nn.Module):
             q = self.q_norm(q.transpose(1, 2)).transpose(1, 2)
             k = self.k_norm(k.transpose(1, 2)).transpose(1, 2)
 
-        # Scaled dot-product
+        # Try SDPA (auto Flash/MemEff/Math dispatch)
+        try:
+            is_causal = attention_mask is None and seq_len > 1
+            dropout_p = self.config.dropout if self.training else 0.0
+            return F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attention_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+            )
+        except (AttributeError, RuntimeError):
+            pass
+
+        # Fallback: manual matmul attention
         scale = math.sqrt(d_kv)
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) / scale
 
