@@ -162,6 +162,11 @@ class AdaptiveRouter(nn.Module):
         Non-thinking: tingkatkan Jalur 1 (sequential), kurangi Jalur 2+3
         Thinking: tingkatkan Jalur 2+3, kurangi Jalur 1
 
+        v1.6.1 fix: Menggunakan thinking_score tensor secara differentiable,
+        bukan Python float. Menghapus double softmax yang melemahkan boost.
+        Gradien mengalir: context_integrator → thinking_score →
+        thinking_signal → thinking_adjuster → adjusted_weights.
+
         Args:
             routing_weights: [batch, seq, num_pathways]
             assessment: ThinkingAssessment
@@ -173,40 +178,54 @@ class AdaptiveRouter(nn.Module):
         device = routing_weights.device
         dtype = routing_weights.dtype
 
-        # Complexity score per token
-        complexity = assessment.complexity_score  # [batch, seq]
-        thinking_signal = complexity.unsqueeze(-1)  # [batch, seq, 1]
+        # Use thinking_score tensor (differentiable) instead of Python float
+        # thinking_score: [batch] — dari context_integrator
+        if assessment.thinking_score is not None:
+            # Expand ke [batch, seq, 1] untuk broadcasting
+            thinking_signal = assessment.thinking_score.unsqueeze(1).unsqueeze(2)
+            thinking_signal = thinking_signal.expand(-1, seq_len, -1)
+        else:
+            # Fallback ke complexity_score jika thinking_score tidak tersedia
+            complexity = assessment.complexity_score  # [batch, seq]
+            thinking_signal = complexity.unsqueeze(-1)  # [batch, seq, 1]
 
         # Concat routing weights + thinking signal
         adjuster_input = torch.cat(
             [routing_weights, thinking_signal], dim=-1
         )  # [batch, seq, num_pathways + 1]
 
-        # Hitung adjustment
+        # Hitung adjustment via learned MLP (differentiable)
         adjustment = self.thinking_adjuster(adjuster_input)  # [batch, seq, num_pathways]
 
         # Combine: base weights + adjustment (residual-style)
-        adjusted = routing_weights + 0.1 * adjustment  # Scale factor kecil
+        # Scale factor kecil agar adjustment tidak mendominasi
+        adjusted = routing_weights + 0.1 * adjustment
 
-        # Re-normalize agar sum = 1
+        # Re-normalize agar sum = 1 (single softmax, bukan double)
         adjusted = F.softmax(adjusted, dim=-1)
 
-        # Apply thinking mode constraints
+        # Apply thinking mode bias — menggunakan additive bias pada logits
+        # sebelum softmax akhir, bukan setelah softmax (double softmax melemahkan efek)
+        #
+        # Catatan: mode adalah Python enum (control flow), ini OK karena
+        # tidak memutus gradient. Gradien mengalir melalui thinking_signal
+        # yang digunakan oleh thinking_adjuster MLP.
         if assessment.mode == ThinkingMode.NON_THINKING:
-            # Non-thinking: tingkatkan Jalur 1 (sequential)
-            # Jalur 1 = index 0
-            jalur1_boost = torch.tensor(
+            # Non-thinking: bias ke Jalur 1 (sequential)
+            boost = torch.tensor(
                 [0.3, -0.15, -0.15], device=device, dtype=dtype
             )
-            adjusted = adjusted + jalur1_boost.unsqueeze(0).unsqueeze(0)
-            adjusted = F.softmax(adjusted, dim=-1)
+            adjusted = adjusted + boost.unsqueeze(0).unsqueeze(0)
+            # Single renormalization
+            adjusted = adjusted / (adjusted.sum(dim=-1, keepdim=True) + 1e-8)
         else:
-            # Thinking: tingkatkan Jalur 2 (reasoning) dan 3 (factual)
-            jalur23_boost = torch.tensor(
+            # Thinking: bias ke Jalur 2 (reasoning) dan 3 (factual)
+            boost = torch.tensor(
                 [-0.15, 0.15, 0.15], device=device, dtype=dtype
             )
-            adjusted = adjusted + jalur23_boost.unsqueeze(0).unsqueeze(0)
-            adjusted = F.softmax(adjusted, dim=-1)
+            adjusted = adjusted + boost.unsqueeze(0).unsqueeze(0)
+            # Single renormalization
+            adjusted = adjusted / (adjusted.sum(dim=-1, keepdim=True) + 1e-8)
 
         return adjusted
 

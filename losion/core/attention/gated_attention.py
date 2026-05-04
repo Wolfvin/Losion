@@ -264,16 +264,26 @@ class GatedAttentionHead(nn.Module):
         q_4d = q.unsqueeze(2)
         k_4d = k.unsqueeze(2)
 
-        offset = 0
+        # Fix: K harus mendapatkan offset yang benar, bukan selalu 0
+        # Untuk Q: offset berdasarkan posisi query saat ini
+        # Untuk K: offset berdasarkan posisi awal K dalam full sequence
+        offset_q = 0
+        offset_k = 0
         if position_ids is not None:
-            offset = position_ids[0, 0].item() if position_ids.numel() > 0 else 0
+            offset_q = position_ids[0, 0].item() if position_ids.numel() > 0 else 0
+            offset_k = offset_q  # K dimulai dari posisi yang sama dengan Q untuk input saat ini
         elif kv_cache is not None and not self.use_mla:
-            offset = kv_cache[0].shape[1]
+            offset_q = kv_cache[0].shape[1]  # Q dimulai setelah cache
+            offset_k = 0  # K baru juga dimulai dari posisi 0 relatif terhadap input baru
+            # TAPI: K yang sudah di-cache SUDAH punya RoPE yang benar
+            # Jadi K baru harus dimulai dari offset cache length
+            offset_k = kv_cache[0].shape[1]
         elif kv_cache is not None and self.use_mla:
-            offset = kv_cache[0].shape[1]
+            offset_q = kv_cache[0].shape[1]
+            offset_k = kv_cache[0].shape[1]  # MLA: K direkonstruksi dari latent, perlu RoPE full
 
-        q_4d = self.rope(q_4d, offset=offset)
-        k_4d = self.rope(k_4d, offset=0)
+        q_4d = self.rope(q_4d, offset=offset_q)
+        k_4d = self.rope(k_4d, offset=offset_k)
         q = q_4d.squeeze(2)
         k = k_4d.squeeze(2)
 
@@ -283,19 +293,35 @@ class GatedAttentionHead(nn.Module):
             k = self.k_norm(k)
 
         # ---- Scaled dot-product attention ----
-        scale = math.sqrt(self.d_kv)
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / scale  # (batch, seq_len, full_len)
+        # v1.6.1: Gunakan SDPA (Flash Attention / MemEff / Math) dengan fallback
+        q_attn = q.transpose(0, 1).unsqueeze(0)  # (1, seq_len, d_kv) — fake batch=1
+        k_attn = k.transpose(0, 1).unsqueeze(0)  # (1, full_len, d_kv)
+        v_attn = v.transpose(0, 1).unsqueeze(0)  # (1, full_len, d_kv)
+        # Reshape to (1, 1, seq_len, d_kv) for single-head SDPA
+        q_sdpa = q_attn.unsqueeze(1)  # (1, 1, seq_len, d_kv)
+        k_sdpa = k_attn.unsqueeze(1)  # (1, 1, full_len, d_kv)
+        v_sdpa = v_attn.unsqueeze(1)  # (1, 1, full_len, d_kv)
 
-        # Causal mask
-        causal_mask = torch.triu(
-            torch.ones(seq_len, full_len, dtype=torch.bool, device=x.device),
-            diagonal=full_len - seq_len + 1,
-        )
-        attn_weights = attn_weights.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
+        try:
+            is_causal = seq_len > 1 and kv_cache is None
+            attn_output = F.scaled_dot_product_attention(
+                q_sdpa, k_sdpa, v_sdpa,
+                is_causal=is_causal,
+            )  # (1, 1, seq_len, d_kv)
+            attn_output = attn_output.squeeze(1).squeeze(0)  # (seq_len, d_kv)
+        except (AttributeError, RuntimeError):
+            # Fallback: manual matmul attention
+            scale = math.sqrt(self.d_kv)
+            attn_weights = torch.matmul(q, k.transpose(-2, -1)) / scale
 
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
-
-        attn_output = torch.matmul(attn_weights, v)  # (batch, seq_len, d_kv)
+            # Causal mask
+            causal_mask = torch.triu(
+                torch.ones(seq_len, full_len, dtype=torch.bool, device=x.device),
+                diagonal=full_len - seq_len + 1,
+            )
+            attn_weights = attn_weights.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+            attn_output = torch.matmul(attn_weights, v)  # (batch, seq_len, d_kv)
 
         # ---- Sigmoid gate ----
         gate = torch.sigmoid(self.W_g(attn_output))  # (batch, seq_len, d_kv)
@@ -554,17 +580,21 @@ class GatedMultiHeadAttention(nn.Module):
         k, v = self._project_kv(x)  # (batch, seq_len, n_heads, d_kv)
 
         # ---- RoPE on Q and K ----
-        offset = position_offset
+        # v1.6.1 fix: K harus mendapatkan offset yang benar saat KV cache ada
+        offset_q = position_offset
+        offset_k = position_offset  # K baru dimulai dari posisi yang sama dengan Q
         if self.use_mla and cached_kv is not None:
-            offset = cached_kv.shape[1]
+            offset_q = cached_kv.shape[1]
+            offset_k = cached_kv.shape[1]  # MLA: K direkonstruksi dari full latent
         elif not self.use_mla and cached_kv is not None:
-            offset = cached_kv.shape[1]
+            offset_q = cached_kv.shape[1]
+            offset_k = cached_kv.shape[1]  # K yang di-cache sudah punya RoPE, K baru perlu offset
 
         q_rope = q[..., : self.d_kv // 2].contiguous()
         k_rope = k[..., : self.d_kv // 2].contiguous()
 
-        q_rope = self.rope(q_rope, offset=offset)
-        k_rope = self.rope(k_rope, offset=0)
+        q_rope = self.rope(q_rope, offset=offset_q)
+        k_rope = self.rope(k_rope, offset=offset_k)
 
         half = self.d_kv // 2
         q = torch.cat([q_rope, q[..., half:]], dim=-1)
@@ -582,9 +612,9 @@ class GatedMultiHeadAttention(nn.Module):
             k_full = self.k_up_proj(c_kv_full).view(batch, -1, self.n_heads, self.d_kv)
             v_full = self.v_up_proj(c_kv_full).view(batch, -1, self.n_heads, self.d_kv)
 
-            # Apply RoPE to reconstructed K
+            # Apply RoPE to reconstructed K — v1.6.1 fix: gunakan offset yang benar
             k_full_rope = k_full[..., :half].contiguous()
-            k_full_rope = self.rope(k_full_rope, offset=0)
+            k_full_rope = self.rope(k_full_rope, offset=0)  # K direkonstruksi dari scratch, offset 0 karena sudah mencakup full sequence
             k_full = torch.cat([k_full_rope, k_full[..., half:]], dim=-1)
 
             present_kv = (c_kv_full, None)

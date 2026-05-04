@@ -82,10 +82,10 @@ jobs:
           pip install einops
       - name: Run tests
         run: |
-          pytest tests/ -v --tb=short -x || true
+          pytest tests/ -v --tb=short -x
       - name: Run train test
         run: |
-          python scripts/train_test.py || true
+          python scripts/train_test.py
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4

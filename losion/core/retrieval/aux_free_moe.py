@@ -198,13 +198,14 @@ class AuxFreeMoERouter(nn.Module):
             top_k_weights.sum(dim=-1, keepdim=True) + 1e-8
         )
 
-        # Hitung load per expert
+        # Hitung load per expert — vectorized via bincount (O(batch*seq*top_k) vs O(top_k*num_experts*batch*seq))
         expert_loads = torch.zeros(
             self.num_experts, dtype=torch.long, device=x.device
         )
-        for k in range(self.top_k):
-            for e in range(self.num_experts):
-                expert_loads[e] += (top_k_indices[:, :, k] == e).sum()
+        # Flatten top_k_indices dan hitung dengan bincount
+        flat_indices = top_k_indices.reshape(-1)
+        counts = torch.bincount(flat_indices, minlength=self.num_experts)
+        expert_loads = counts[:self.num_experts]
 
         # Update running statistics
         with torch.no_grad():
@@ -588,7 +589,7 @@ class AuxFreeMoE(nn.Module):
             mtp_loss, mtp_predictions = self.mtp_head(output, targets)
             if mtp_loss is not None:
                 auxiliary_losses["mtp_loss"] = mtp_loss * self.mtp_loss_weight
-            auxiliary_losses["mtp_loss_raw"] = mtp_loss if mtp_loss is not None else torch.tensor(0.0)
+            auxiliary_losses["mtp_loss_raw"] = mtp_loss if mtp_loss is not None else torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
         # Monitoring metrics (bukan loss)
         auxiliary_losses["load_balance_metric"] = torch.tensor(

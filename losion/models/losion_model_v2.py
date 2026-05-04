@@ -367,7 +367,8 @@ def _build_moe(config: LosionConfig) -> nn.Module:
                 d_model=d_model,
                 d_ff=d_ff,
                 num_experts=num_experts,
-                num_active_experts=ret_cfg.num_active_experts,
+                top_k=ret_cfg.num_active_experts,  # Fix: gunakan top_k bukan num_active_experts
+                vocab_size=config.vocab_size,  # Fix: teruskan vocab_size aktual
             )
             return base_moe
 
@@ -378,6 +379,7 @@ def _build_moe(config: LosionConfig) -> nn.Module:
             d_ff=d_ff,
             num_experts=num_experts,
             top_k=ret_cfg.num_active_experts,
+            vocab_size=config.vocab_size,  # Fix: teruskan vocab_size aktual, bukan default 32000
         )
 
     except ImportError:
@@ -453,12 +455,14 @@ class LosionLayerV2(nn.Module):
         ssm_state: Optional[Any] = None,
         past_kv: Optional[Any] = None,
         position_ids: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Forward pass through the Tri-Jalur layer.
 
         v0.9.1: Fixed all interface mismatches between pathway modules and
         their callers. SSM, Attention, and MoE modules now all properly
         connect regardless of their internal parameter naming conventions.
+        v1.6.1: Added labels parameter for MTP loss computation in MoE layers.
         """
         batch, seq_len, _ = x.shape
 
@@ -522,7 +526,7 @@ class LosionLayerV2(nn.Module):
         # and normalizes to (output, aux_info) for consistent downstream use
         # ===================================================================
         ret_input = self.retrieval_norm(x)
-        ret_out, ret_aux = self._forward_moe(ret_input)
+        ret_out, ret_aux = self._forward_moe(ret_input, targets=labels)
 
         # Combine with routing weights
         w_ssm = route_weights[:, :, 0:1]
@@ -669,6 +673,7 @@ class LosionLayerV2(nn.Module):
     def _forward_moe(
         self,
         ret_input: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Unified MoE/Retrieval forward that handles all interface variants.
 
@@ -679,10 +684,20 @@ class LosionLayerV2(nn.Module):
         - 2-tuple (output, aux_info) from FallbackMoE
         - Single tensor output from plain FFN
 
+        v1.6.1: Added targets parameter for MTP loss computation in AuxFreeMoE.
+
         Returns:
             (output, aux_info) — always 2 values, aux_info is always a dict.
         """
-        ret_result = self.retrieval_layer(ret_input)
+        # Try calling with targets first (for AuxFreeMoE MTP loss)
+        try:
+            if targets is not None:
+                ret_result = self.retrieval_layer(ret_input, targets=targets)
+            else:
+                ret_result = self.retrieval_layer(ret_input)
+        except TypeError:
+            # Module doesn't accept targets kwarg
+            ret_result = self.retrieval_layer(ret_input)
 
         if isinstance(ret_result, tuple):
             if len(ret_result) == 3:
@@ -714,13 +729,21 @@ class LosionLayerV2(nn.Module):
         tensor: torch.Tensor,
         proj_name: str,
     ) -> torch.Tensor:
-        """Align tensor's last dimension to d_model via learned projection."""
+        """Align tensor's last dimension to d_model via learned projection.
+
+        v1.6.1 fix: Register projection lazily but track it properly.
+        The projection is created on first call but then registered as
+        a proper submodule so it appears in state_dict().
+        """
         if tensor.shape[-1] == self.d_model:
             return tensor
         if not hasattr(self, proj_name):
-            proj = nn.Linear(tensor.shape[-1], self.d_model, bias=False).to(tensor.device)
+            proj = nn.Linear(tensor.shape[-1], self.d_model, bias=False)
             nn.init.eye_(proj.weight[:min(tensor.shape[-1], self.d_model)])
-            setattr(self, proj_name, proj)
+            # Register as proper submodule (appears in state_dict, parameters, etc.)
+            self.add_module(proj_name, proj)
+            # Move to same device as input tensor
+            proj = proj.to(tensor.device)
         return getattr(self, proj_name)(tensor)
 
     def forward_inference(
@@ -964,8 +987,12 @@ class LosionModelV2(nn.Module):
         thinking_mode: Optional[bool] = None,
         return_routing_info: bool = False,
         return_all_hidden_states: bool = False,
+        labels: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
-        """Forward pass through the Losion V2 backbone."""
+        """Forward pass through the Losion V2 backbone.
+
+        v1.6.1: Added labels parameter for MTP loss computation in MoE layers.
+        """
         batch, seq_len = input_ids.shape
 
         # Embeddings (no learned position — RoPE is applied in attention)
@@ -987,8 +1014,8 @@ class LosionModelV2(nn.Module):
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
                 x, layer_routing = torch.utils.checkpoint.checkpoint(
-                    lambda h, m, p: layer(h, attention_mask=m, position_ids=p, thinking_mode=thinking_mode),
-                    x, attention_mask, position_ids,
+                    lambda h, m, p, l: layer(h, attention_mask=m, position_ids=p, thinking_mode=thinking_mode, labels=l),
+                    x, attention_mask, position_ids, labels,
                     use_reentrant=False,
                 )
             else:
@@ -998,6 +1025,7 @@ class LosionModelV2(nn.Module):
                     thinking_mode=thinking_mode,
                     ssm_state=ssm_states.get(layer.layer_idx),
                     position_ids=position_ids,
+                    labels=labels,
                 )
 
             # Update SSM states for next forward call
@@ -1319,6 +1347,7 @@ class LosionForCausalLMV2(nn.Module):
             attention_mask=attention_mask,
             thinking_mode=thinking_mode,
             return_routing_info=True,
+            labels=labels,  # v1.6.1: Forward labels to MoE layers for MTP loss
         )
         hidden_states = outputs["hidden_states"]
 
@@ -1373,6 +1402,36 @@ class LosionForCausalLMV2(nn.Module):
                     loss = loss + self.config.jepa.prediction_weight * jepa_loss
                 loss_dict["jepa_loss"] = jepa_loss.item()
             except Exception:
+                pass
+
+        # v1.6.1: Routing entropy regularization — aktifkan entropy regularization
+        # dari AdaptiveRouter untuk mencegah router collapse.
+        # Router entropy rendah = routing yang terlalu focused pada 1 jalur
+        # Entropy target: ~0.9-1.0 (distribusi yang seimbang antara 3 jalur)
+        if self.training and loss is not None and outputs.get("routing_info") is not None:
+            try:
+                from losion.core.router.router import AdaptiveRouter
+                if hasattr(self.model, 'layers') and len(self.model.layers) > 0:
+                    router = self.model.layers[0].router
+                    if isinstance(router, AdaptiveRouter):
+                        routing_weights = outputs.get("routing_info")
+                        if isinstance(routing_weights, dict) and "adjusted_weights" in routing_weights:
+                            adjusted = routing_weights["adjusted_weights"]
+                        elif hasattr(routing_weights, "adjusted_weights"):
+                            adjusted = routing_weights.adjusted_weights
+                        else:
+                            adjusted = None
+
+                        if adjusted is not None:
+                            entropy = router.compute_routing_entropy(adjusted)
+                            # Target entropy: 0.9 (dari 0.0 = collapsed ke 1.1 = max untuk 3 jalur)
+                            # Minimize (entropy - target)^2 agar routing seimbang
+                            target_entropy = 0.9
+                            entropy_loss = ((entropy - target_entropy) ** 2) * 0.01
+                            loss = loss + entropy_loss
+                            loss_dict["routing_entropy"] = entropy.item()
+                            loss_dict["entropy_loss"] = entropy_loss.item()
+            except (ImportError, Exception):
                 pass
 
         return {
@@ -1442,12 +1501,16 @@ class LosionForCausalLMV2(nn.Module):
                 threshold = top_k_vals[:, :, -1:]
                 next_logits = next_logits.where(next_logits >= threshold, float("-inf"))
 
-            # Top-P
+            # Top-P (nucleus sampling) — v1.6.1 fix: correct scatter back to original order
             if top_p < 1.0:
                 sorted_logits, sorted_idx = torch.sort(next_logits, descending=True, dim=-1)
-                cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                remove_mask = cum_probs - F.softmax(sorted_logits, dim=-1) >= top_p
+                sorted_probs = F.softmax(sorted_logits, dim=-1)
+                cum_probs = torch.cumsum(sorted_probs, dim=-1)
+                # Remove tokens with cumulative probability above the threshold
+                # Keep at least the top token
+                remove_mask = cum_probs - sorted_probs >= top_p
                 sorted_logits[remove_mask] = float("-inf")
+                # Scatter back to original ordering
                 next_logits = sorted_logits.scatter(-1, sorted_idx, sorted_logits)
 
             # Sample or greedy

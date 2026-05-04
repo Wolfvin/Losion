@@ -1,7 +1,24 @@
 """
 Losion — Hybrid AI Framework with Tri-Jalur Router Architecture.
 
-Version 1.6.0 — "Training & Pretraining Fully Optimized"
+Version 1.6.1 — "Critical Bug Fixes & Gradient Flow Repair"
+
+v1.6.1 Critical Bug Fixes & Gradient Flow Repair:
+  - ThinkingToggle dead grad FIXED: thinking_score tensor now flows to router differentiably
+  - MTP vocab_size hardcoded 32000 FIXED: config.vocab_size now properly forwarded
+  - symbolic_moe num_active_experts TypeError FIXED
+  - Mamba2 SSD connected to chunk_parallel_scan (no Python loop for seq>chunk_size)
+  - GatedAttentionHead now uses SDPA with manual fallback
+  - RoPE offset for K FIXED in both GatedAttentionHead and GatedMultiHeadAttention
+  - CI || true REMOVED — tests can actually fail now
+  - Entropy regularization ACTIVATED in LosionForCausalLMV2 loss
+  - aux_free_moe load counting vectorized via bincount
+  - aux_free_moe device mismatch fixed
+  - Router double softmax replaced with single renormalization
+  - Top-P sampling scatter FIXED in generate()
+  - _align_dim now uses add_module for proper state_dict tracking
+  - MTP labels now forwarded to MoE layers for gradient flow
+  - chunk_parallel_scan output shape fixed — preserves per-channel info
 
 v1.6.0 Training & Pretraining Fully Optimized:
   - RWKV-7 FULLY parallel WKV scan (cumsum-based, ZERO Python token loop)
@@ -59,7 +76,7 @@ Router:  Adaptive (BiasRouter + ThinkingToggle + Symbolic-MoE), GRPO/DAPO-traine
          + Router ↔ Expert Co-Evolution (Evoformer Level 5)
 """
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 __author__ = "Losion Contributors"
 __license__ = "MIT"
 

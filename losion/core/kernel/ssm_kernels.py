@@ -152,7 +152,7 @@ def chunk_parallel_scan(
     C: torch.Tensor,
     D: Optional[torch.Tensor] = None,
     chunk_size: int = 64,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute SSM output using chunk-based parallel scan.
 
     Implements the State Space Duality (SSD) algorithm from Mamba-2:
@@ -166,41 +166,48 @@ def chunk_parallel_scan(
         h_t = A_t * h_{t-1} + B_t * x_t
         y_t = C_t * h_t + D * x_t
 
+    v1.6.1 fix: Output shape sekarang benar (batch, seq_len, d_inner)
+    dengan per-channel information yang terjaga, bukan broadcast scalar.
+
     Args:
         x: Input tensor (batch, seq_len, d_inner).
         dt: Discretization step (batch, seq_len, d_inner).
-        A: State transition matrix (batch, seq_len, d_state) or (d_inner, d_state).
+        A: State transition matrix (d_inner, d_state) — shared per channel.
         B: Input matrix (batch, seq_len, d_state).
         C: Output matrix (batch, seq_len, d_state).
         D: Skip connection (d_inner,) or None.
         chunk_size: Chunk size for parallel scan.
 
     Returns:
-        SSM output tensor (batch, seq_len, d_inner).
+        Tuple (output, final_state):
+        - output: SSM output tensor (batch, seq_len, d_inner).
+        - final_state: Final hidden state (batch, d_inner, d_state).
     """
     batch, seq_len, d_inner = x.shape
     d_state = B.shape[-1]
 
     # Discretize: A_disc = exp(dt * A), B_disc = dt * B
-    if A.dim() == 2:
-        # Shared A: (d_inner, d_state)
-        A_disc = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0))
-    else:
-        A_disc = torch.exp(dt.unsqueeze(-1) * A)
+    # A: (d_inner, d_state) shared — A should be negative (decay)
+    # dt: (batch, seq_len, d_inner) — should be positive
+    # Numerical stability: clamp the exponent to prevent overflow
+    dt_A = dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0)  # (batch, seq_len, d_inner, d_state)
+    # Clamp to prevent exp overflow (max exp arg ~88 for float32)
+    dt_A = dt_A.clamp(max=20.0)  # exp(20) ≈ 4.85e8, safe range
+    A_disc = torch.exp(dt_A)
+    B_disc = dt.unsqueeze(-1) * B.unsqueeze(2)  # (batch, seq_len, d_inner, d_state)
 
-    B_disc = dt.unsqueeze(-1) * B
-
-    # Compute: xB = x * B_disc (batch, seq_len, d_state)
-    xB = x.unsqueeze(-1) * B_disc.unsqueeze(2)  # (batch, seq, d_inner, d_state)
-    xB = xB.sum(dim=2)  # (batch, seq, d_state) — sum over d_inner
+    # xB: input contribution per (channel, state)
+    # x: (batch, seq_len, d_inner) -> (batch, seq_len, d_inner, 1)
+    # B_disc: (batch, seq_len, d_inner, d_state)
+    xB = x.unsqueeze(-1) * B_disc  # (batch, seq_len, d_inner, d_state)
 
     # Chunk-based parallel scan
     n_chunks = (seq_len + chunk_size - 1) // chunk_size
     pad_len = n_chunks * chunk_size - seq_len
 
     if pad_len > 0:
-        A_disc = F.pad(A_disc, (0, 0, 0, pad_len))
-        xB = F.pad(xB, (0, 0, 0, pad_len))
+        A_disc = F.pad(A_disc, (0, 0, 0, 0, 0, pad_len))
+        xB = F.pad(xB, (0, 0, 0, 0, 0, pad_len))
         x_padded = F.pad(x, (0, 0, 0, pad_len))
         C_padded = F.pad(C, (0, 0, 0, pad_len))
     else:
@@ -208,45 +215,55 @@ def chunk_parallel_scan(
         C_padded = C
 
     # Reshape into chunks: (batch, n_chunks, chunk_size, ...)
-    A_chunks = A_disc.reshape(batch, n_chunks, chunk_size, -1)
-    xB_chunks = xB.reshape(batch, n_chunks, chunk_size, -1)
+    A_chunks = A_disc.reshape(batch, n_chunks, chunk_size, d_inner, d_state)
+    xB_chunks = xB.reshape(batch, n_chunks, chunk_size, d_inner, d_state)
 
     # Intra-chunk scan: parallel cumsum-based scan within each chunk
-    h_chunks = _intra_chunk_scan(A_chunks, xB_chunks)
+    # Operates per (batch, chunk, d_inner, d_state)
+    h_chunks = _intra_chunk_scan_per_channel(A_chunks, xB_chunks)
 
     # Inter-chunk propagation: sequential state passing between chunks
-    h_propagated = _inter_chunk_propagate(h_chunks, A_chunks)
+    h_propagated = _inter_chunk_propagate_per_channel(h_chunks, A_chunks)
 
     # Compute output: y = C * h + D * x
+    # h_propagated: (batch, n_chunks, chunk_size, d_inner, d_state)
+    # C: (batch, seq_len, d_state) -> (batch, n_chunks, chunk_size, 1, d_state)
     C_expanded = C_padded.reshape(batch, n_chunks, chunk_size, d_state)
-    y = (h_propagated * C_expanded).sum(dim=-1)  # (batch, n_chunks, chunk_size)
+    y = (h_propagated * C_expanded.unsqueeze(3)).sum(dim=-1)  # (batch, n_chunks, chunk_size, d_inner)
 
     # Reshape back
-    y = y.reshape(batch, n_chunks * chunk_size)[:, :seq_len]  # (batch, seq_len)
+    y = y.reshape(batch, n_chunks * chunk_size, d_inner)[:, :seq_len, :]  # (batch, seq_len, d_inner)
 
     # Add skip connection D * x
     if D is not None:
-        y = y + x * D.unsqueeze(0)
+        y = y + x * D.unsqueeze(0).unsqueeze(0)
 
-    return y.unsqueeze(-1).expand(-1, -1, d_inner)[:, :, :1].squeeze(-1) if y.dim() == 2 else y
+    # Compute final state untuk return
+    # Final state: h terakhir dari sequence
+    final_state = h_propagated[:, -1, -1, :, :]  # (batch, d_inner, d_state)
+
+    return y, final_state
 
 
-def _intra_chunk_scan(
+def _intra_chunk_scan_per_channel(
     A: torch.Tensor,
     xB: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute intra-chunk SSM state using parallel scan.
+    """Compute intra-chunk SSM state using parallel scan per channel.
+
+    v1.6.1: Operates per (batch, chunk, seq, d_inner, d_state) to preserve
+    per-channel information instead of summing over d_inner.
 
     Args:
-        A: Discretized A per chunk (batch, n_chunks, chunk_size, d_state).
-        xB: x*B per chunk (batch, n_chunks, chunk_size, d_state).
+        A: Discretized A per chunk (batch, n_chunks, chunk_size, d_inner, d_state).
+        xB: x*B per chunk (batch, n_chunks, chunk_size, d_inner, d_state).
 
     Returns:
-        Hidden states (batch, n_chunks, chunk_size, d_state).
+        Hidden states (batch, n_chunks, chunk_size, d_inner, d_state).
     """
     # Use cumsum-based parallel scan within each chunk
     log_A = torch.log(torch.clamp(A, min=1e-20))
-    cum_log_A = torch.cumsum(log_A, dim=2)
+    cum_log_A = torch.cumsum(log_A, dim=2)  # accumulate along chunk dim
 
     running_prod = torch.exp(cum_log_A)
     inv_running_prod = 1.0 / torch.clamp(running_prod, min=1e-20)
@@ -257,43 +274,42 @@ def _intra_chunk_scan(
     return cumsum_weighted * running_prod
 
 
-def _inter_chunk_propagate(
+def _inter_chunk_propagate_per_channel(
     h: torch.Tensor,
     A: torch.Tensor,
 ) -> torch.Tensor:
-    """Propagate SSM state between chunks.
+    """Propagate SSM state between chunks, per channel.
 
-    Each chunk's state is corrected by the final state of the previous chunk.
+    v1.6.1: Preserves per-channel (d_inner) information.
 
     Args:
-        h: Intra-chunk hidden states (batch, n_chunks, chunk_size, d_state).
-        A: Discretized A per chunk (batch, n_chunks, chunk_size, d_state).
+        h: Intra-chunk hidden states (batch, n_chunks, chunk_size, d_inner, d_state).
+        A: Discretized A per chunk (batch, n_chunks, chunk_size, d_inner, d_state).
 
     Returns:
-        Corrected hidden states (batch, n_chunks, chunk_size, d_state).
+        Corrected hidden states (batch, n_chunks, chunk_size, d_inner, d_state).
     """
-    batch, n_chunks, chunk_size, d_state = h.shape
+    batch, n_chunks, chunk_size, d_inner, d_state = h.shape
 
     # Get final state of each chunk
-    # A_chunk_prod = product of A across chunk dimension
     log_A = torch.log(torch.clamp(A, min=1e-20))
-    A_chunk_prod = torch.exp(log_A.sum(dim=2))  # (batch, n_chunks, d_state)
-    h_final = h[:, :, -1, :]  # (batch, n_chunks, d_state)
+    A_chunk_prod = torch.exp(log_A.sum(dim=2))  # (batch, n_chunks, d_inner, d_state)
+    h_final = h[:, :, -1, :, :]  # (batch, n_chunks, d_inner, d_state)
 
     # Sequential inter-chunk propagation
-    running_state = torch.zeros(batch, d_state, device=h.device, dtype=h.dtype)
+    running_state = torch.zeros(batch, d_inner, d_state, device=h.device, dtype=h.dtype)
     corrected = []
 
     for c in range(n_chunks):
         # Correction: add running_state * product of A from start of chunk
         A_from_start = torch.exp(torch.cumsum(
-            log_A[:, c, :, :], dim=1
-        ))  # (batch, chunk_size, d_state)
+            log_A[:, c, :, :, :], dim=1
+        ))  # (batch, chunk_size, d_inner, d_state)
         correction = running_state.unsqueeze(1) * A_from_start
-        corrected.append(h[:, c, :, :] + correction)
+        corrected.append(h[:, c, :, :, :] + correction)
 
         # Update running state for next chunk
-        running_state = h_final[:, c, :] + A_chunk_prod[:, c, :] * running_state
+        running_state = h_final[:, c, :, :] + A_chunk_prod[:, c, :, :] * running_state
 
     return torch.stack(corrected, dim=1)
 
@@ -478,6 +494,6 @@ def multi_mode_ssm_scan(
             C=kwargs["C"],
             D=kwargs.get("D"),
             chunk_size=kwargs.get("chunk_size", 64),
-        )
+        )[0]  # Return only output, discard final_state for this API
     else:
         raise ValueError(f"Unknown SSM scan mode: {mode!r}")

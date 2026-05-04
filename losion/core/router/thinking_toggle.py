@@ -44,6 +44,7 @@ class ThinkingAssessment:
     dominant_task: TaskType
     depth_multiplier: float  # Berapa kali lipat depth untuk Jalur 2+3
     confidence: float  # Confidence dalam assessment
+    thinking_score: torch.Tensor = None  # [batch] — differentiable thinking score dari context_integrator
 
 
 class ThinkingToggle(nn.Module):
@@ -166,6 +167,10 @@ class ThinkingToggle(nn.Module):
             mode = force_mode
         else:
             # Gunakan rata-rata thinking score
+            # NOTE: .item() memutus computational graph, tapi mode
+            # hanya digunakan untuk control flow (branching), bukan
+            # untuk komputasi tensor. Gradien mengalir melalui
+            # thinking_score yang disimpan di ThinkingAssessment.
             avg_score = thinking_score.mean().item()
             mode = (
                 ThinkingMode.THINKING
@@ -179,6 +184,10 @@ class ThinkingToggle(nn.Module):
         dominant_task = list(TaskType)[dominant_task_idx]
 
         # 7. Calculate depth multiplier
+        # NOTE: depth_multiplier adalah Python float untuk logging/monitoring.
+        # Gradien mengalir melalui thinking_score tensor yang disimpan
+        # di ThinkingAssessment dan digunakan secara differentiable
+        # oleh AdaptiveRouter._adjust_for_thinking().
         avg_thinking_score = thinking_score.mean().item()
         if mode == ThinkingMode.THINKING:
             depth_multiplier = (
@@ -201,6 +210,7 @@ class ThinkingToggle(nn.Module):
             dominant_task=dominant_task,
             depth_multiplier=depth_multiplier,
             confidence=confidence,
+            thinking_score=thinking_score,  # [batch] — differentiable!
         )
 
     def _get_force_mode(self) -> Optional[ThinkingMode]:
