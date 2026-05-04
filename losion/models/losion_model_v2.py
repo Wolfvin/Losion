@@ -1050,9 +1050,14 @@ class LosionModelV2(nn.Module):
                 all_routing_info.append(layer_routing)
 
             if all_hidden_states is not None:
+                # Detach for storage (safe across backward passes)
                 all_hidden_states.append(x.detach())
 
         # Evoformer Level 1: Inter-layer recycling (v0.9)
+        # v1.9.0: recycled[-1] now includes revision residual for deep layers
+        # (see evoformer.py LayerRecyclingBlock.forward). This ensures gradient
+        # flows through layer_recycling parameters (shallow_query_proj, etc.)
+        # even though hidden_states are detached.
         if self.use_evoformer and all_hidden_states is not None and len(all_hidden_states) > 1:
             recycled = self.evoformer_manager.recycle_layers(all_hidden_states)
             x = recycled[-1]

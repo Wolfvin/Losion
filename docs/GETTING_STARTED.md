@@ -2,10 +2,14 @@
 
 > Panduan cepat untuk memulai menggunakan framework Losion, dari instalasi
 > hingga training pertama Anda, termasuk Reasoning Engine dan Elastic Inference.
+>
+> **Fitur utama v1.9.0**: DAPO (menggantikan GRPO di Phase 3 untuk eksplorasi
+> yang lebih baik), RLVR (verifiable rewards untuk RL training), dan LLM-JEPA
+> (joint embedding predictive architecture untuk auxiliary loss).
 
 > **Agent Context**
 > ```
-> Entry points: LosionConfig, LosionForCausalLM, LosionTrainer
+> Entry points: LosionConfig, LosionForCausalLMV2, LosionTrainer
 > Quick start config: configs/losion-1b.yaml
 > Training script: scripts/train.py
 > Reasoning Engine: losion/core/reasoning/ (MCTS, Parallel Thinking, Neuro-Symbolic)
@@ -146,7 +150,7 @@ pip install -e ".[dev]"
 
 ```python
 python -c "import losion; print(f'Losion version: {losion.__version__}')"
-# Output: Losion version: 0.1.0
+# Output: Losion version: 1.9.0
 ```
 
 ### Langkah 2: Cek Hardware
@@ -206,7 +210,8 @@ pytest tests/test_advanced.py -v
 ```python
 python -c "
 import torch
-from losion import LosionConfig, LosionForCausalLM
+from losion import LosionConfig
+from losion.models.losion_model_v2 import LosionForCausalLMV2
 
 # Buat konfigurasi kecil untuk testing
 config = LosionConfig(
@@ -216,8 +221,8 @@ config = LosionConfig(
     max_seq_len=128,
 )
 
-# Buat model
-model = LosionForCausalLM(config)
+# Buat model (V2 — config-driven, all v0.4+ features available)
+model = LosionForCausalLMV2(config)
 print(f'Model created with {sum(p.numel() for p in model.parameters()):,} parameters')
 
 # Forward pass
@@ -419,11 +424,12 @@ python scripts/train.py --config configs/my-first-model.yaml \
 
 ```python
 import torch
-from losion import LosionConfig, LosionForCausalLM
+from losion import LosionConfig
+from losion.models.losion_model_v2 import LosionForCausalLMV2
 
 # Load checkpoint
 config = LosionConfig.from_pretrained("./my-first-pretrain")
-model = LosionForCausalLM.from_pretrained("./my-first-pretrain")
+model = LosionForCausalLMV2.from_pretrained("./my-first-pretrain")
 
 # Generate text
 input_ids = torch.tensor([[1, 50, 100]])  # token IDs
@@ -454,12 +460,13 @@ yang terbaik.
 MCTS mengeksplorasi pohon penalaran menggunakan Upper Confidence Bound (UCB):
 
 ```python
-from losion import LosionConfig, LosionForCausalLM
+from losion import LosionConfig
+from losion.models.losion_model_v2 import LosionForCausalLMV2
 from losion.core.reasoning.mcts import MCTSReasoner, MCTSConfig
 
 # Load model
 config = LosionConfig()
-model = LosionForCausalLM(config)
+model = LosionForCausalLMV2(config)
 
 # Konfigurasi MCTS
 mcts_config = MCTSConfig(
@@ -588,12 +595,13 @@ Full Model (100%)
 ### Menggunakan Matryoshka
 
 ```python
-from losion import LosionConfig, LosionForCausalLM
+from losion import LosionConfig
+from losion.models.losion_model_v2 import LosionForCausalLMV2
 from losion.core.elastic.matryoshka import MatryoshkaModel
 
 # Load model dengan Matryoshka support
 config = LosionConfig()
-model = LosionForCausalLM(config)
+model = LosionForCausalLMV2(config)
 
 # Buat wrapper Matryoshka
 matryoshka = MatryoshkaModel(model, granularity_factors=[0.25, 0.5, 0.75, 1.0])
@@ -826,8 +834,12 @@ dan cara mengoptimalkan hyperparameter.
   — lihat [ARCHITECTURE.md §7](ARCHITECTURE.md)
 - **Elastic Inference**: Matryoshka submodel extraction — lihat
   [ARCHITECTURE.md §8](ARCHITECTURE.md)
-- **Advanced RLHF**: GRPO, Self-Play, Value Head — lihat
+- **Advanced RLHF**: DAPO (v0.8+), GRPO, RLVR, Self-Play, Value Head — lihat
   [TRAINING.md §5–6](TRAINING.md)
+- **LLM-JEPA**: Predict future latent states — lihat
+  [ARCHITECTURE.md](ARCHITECTURE.md)
+- **Training Orchestrator**: One-stop 4-phase pipeline — lihat
+  [TRAINING.md](TRAINING.md)
 
 ### 6. Kontribusi
 
@@ -839,17 +851,17 @@ ke pengembangan Losion.
 ```python
 from losion import (
     LosionConfig,
-    LosionForCausalLM,
     LosionTrainer,
     GRPOTrainer,
     CurriculumScheduler,
 )
+from losion.models.losion_model_v2 import LosionForCausalLMV2
 
 # Buat konfigurasi custom
 config = LosionConfig(d_model=256, n_layers=4, vocab_size=1000)
 
-# Buat model
-model = LosionForCausalLM(config)
+# Buat model (V2)
+model = LosionForCausalLMV2(config)
 
 # Hitung parameter
 param_counts = model.count_parameters()
@@ -866,7 +878,6 @@ print(f"Generated: {output}")
 | Dokumen | Deskripsi |
 |---------|-----------|
 | [CHANGELOG.md](../CHANGELOG.md) | Riwayat perubahan per versi |
-| [ROADMAP.md](../ROADMAP.md) | Rencana pengembangan ke depan |
 | [SECURITY.md](../SECURITY.md) | Panduan keamanan dan vulnerability reporting |
 | [CODE_OF_CONDUCT.md](../CODE_OF_CONDUCT.md) | Kode etik komunitas |
 
@@ -924,8 +935,7 @@ Lihat [Menggunakan Elastic Inference](#menggunakan-elastic-inference-matryoshka)
 
 ### Q: Di mana melihat rencana pengembangan?
 
-Lihat [ROADMAP.md](../ROADMAP.md) untuk rencana pengembangan dan
-[CHANGELOG.md](../CHANGELOG.md) untuk riwayat perubahan.
+Lihat [CHANGELOG.md](../CHANGELOG.md) untuk riwayat perubahan.
 
 ### Q: Bagaimana melaporkan masalah keamanan?
 
@@ -933,4 +943,4 @@ Lihat [SECURITY.md](../SECURITY.md) untuk panduan vulnerability reporting.
 
 ---
 
-*Dokumentasi ini ditulis untuk Losion v0.1.0. Jika mengalami masalah, silakan buka issue di repository GitHub.*
+*Dokumentasi ini ditulis untuk Losion v1.9.0. Jika mengalami masalah, silakan buka issue di repository GitHub.*

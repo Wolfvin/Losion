@@ -20,7 +20,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
+# v1.9.0: Removed unused `from einops import rearrange` — code uses .view()/.reshape()
 
 # Import optimized parallel scan from kernel module
 try:

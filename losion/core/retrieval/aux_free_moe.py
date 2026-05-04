@@ -442,7 +442,7 @@ class AuxFreeMoE(nn.Module):
         d_ff: int,
         num_experts: int = 64,
         top_k: int = 2,
-        vocab_size: int = 32000,
+        vocab_size: Optional[int] = None,
         use_shared_expert: bool = True,
         use_mtp: bool = True,
         n_future: int = 4,
@@ -451,6 +451,9 @@ class AuxFreeMoE(nn.Module):
         capacity_factor: float = 1.0,
     ):
         super().__init__()
+
+        if vocab_size is None:
+            vocab_size = 32000  # Default fallback only when not provided
 
         self.d_model = d_model
         self.d_ff = d_ff

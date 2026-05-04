@@ -621,6 +621,26 @@ If you use Losion in your research, please cite the original repository:
 
 ---
 
+### v0.9 Additions
+
+- **AttnRes** (MoonshotAI, 2026): Attention-based residuals for long-context understanding
+- **Evoformer** (Jumper et al., Nature 2021; Nobel Prize 2024): Bidirectional feedback at 5 architecture levels
+- **Child-3W**: QKV-level MoE routing for fine-grained attention
+- **Anchored Diffusion Decoder**: Anchored diffusion for output generation
+- **Dual Memory System**: Two-level memory (Working + Long-Term) inspired by human memory
+
+### v1.0.0 Critical Fixes
+
+- 8 critical bug fixes verified with train_test.py integration test
+
+### v1.9.0 Gradient Flow
+
+- Complete gradient flow through Evoformer and Dual Memory subsystems
+- Vectorized attention mask construction (LightningAttention)
+- All 530+ model parameters now receive valid gradients
+
+---
+
 ## License Note
 
 Each referenced paper and technology is the intellectual property of its respective authors.

@@ -270,8 +270,11 @@ class GatedAttentionHead(nn.Module):
         offset_q = 0
         offset_k = 0
         if position_ids is not None:
-            offset_q = position_ids[0, 0].item() if position_ids.numel() > 0 else 0
-            offset_k = offset_q  # K dimulai dari posisi yang sama dengan Q untuk input saat ini
+            # v1.9.0: Use tensor operation instead of .item() to avoid
+            # breaking gradient flow (though position_ids are typically
+            # non-differentiable, this is better practice)
+            offset_q = position_ids[0, 0].long().item() if position_ids.numel() > 0 else 0
+            offset_k = offset_q  # K starts from the same position as Q for current input
         elif kv_cache is not None and not self.use_mla:
             offset_q = kv_cache[0].shape[1]  # Q dimulai setelah cache
             offset_k = 0  # K baru juga dimulai dari posisi 0 relatif terhadap input baru

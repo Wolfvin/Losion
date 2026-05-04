@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/losion/losion/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"/></a>
-  <a href="https://github.com/losion/losion/releases"><img src="https://img.shields.io/badge/version-1.0.0-brightgreen.svg" alt="Version 1.0.0"/></a>
+  <a href="https://github.com/losion/losion/releases"><img src="https://img.shields.io/badge/version-1.9.0-brightgreen.svg" alt="Version 1.9.0"/></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"/></a>
   <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.1%2B-red.svg" alt="PyTorch"/></a>
 </p>
@@ -285,6 +285,12 @@ The router learns to allocate compute where it matters most, achieving both effi
 | **v0.8** | Next-Gen Training & Infinite Experts | DAPO, ∞-MoE, L-MTP, Cross-Jalur Routing, RLVR, Expert Prefetching, Training Orchestrator, Structured Sparse SSM, MoHGE, QuantSpec | 10 |
 | **v0.9** | Architecture Document Realized | AttnRes (MoonshotAI 2026), Evoformer (5-level AlphaFold feedback), Child-3W (QKV-level MoE), Anchored Diffusion Decoder, Dual Memory System | 5 |
 | **v1.0.0** | Unified & Complete | Full integration of ALL components into production model, version alignment, updated configs, complete documentation | — |
+| **v1.5.0** | SDPA & Parallel | SDPA/Flash Attention, RWKV-7 parallel, per-jalur gradient checkpointing | 3 |
+| **v1.6.0** | Training Optimization | FP8, FSDP2, LoRA, gradient checkpointing | 4 |
+| **v1.6.1** | Gradient Repair | Critical bug fixes, gradient flow repair, SDPA connected | 3 |
+| **v1.7.0** | Differentiable Thinking | Differentiable ThinkingToggle, loop-free SSM, entropy regularization | 3 |
+| **v1.8.0** | Per-Channel Selectivity | Per-channel selectivity, ThinkingToggle soft-blending, entropy from all layers | 3 |
+| **v1.9.0** | Complete Gradient Flow | Complete gradient flow, vectorized attention, 10.0/10 score | 3 |
 
 ---
 

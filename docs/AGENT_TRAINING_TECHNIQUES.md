@@ -2,7 +2,7 @@
 
 > **Framework**: Losion Gen-2 AI Framework  
 > **Developed by**: z.ai + wolfvin  
-> **Version**: 1.0 — Unified Training Methodology  
+> **Version**: 1.9.0 — Unified Training Methodology (Complete Gradient Flow)  
 > **Paradigm**: AI Gen-1 Trains AI Gen-2
 
 ---

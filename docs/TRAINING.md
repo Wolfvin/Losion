@@ -14,14 +14,18 @@
 4. [Curriculum Learning](#4-curriculum-learning)
 5. [GRPO Deep-Dive](#5-grpo-deep-dive)
 6. [Advanced RLHF](#6-advanced-rlhf)
-7. [Advanced Training Techniques](#7-advanced-training-techniques)
-8. [Memory Optimization](#8-memory-optimization)
-9. [Data Pipeline](#9-data-pipeline)
-10. [Hyperparameter Reference](#10-hyperparameter-reference)
-11. [Distributed Training](#11-distributed-training)
-12. [Monitoring](#12-monitoring)
-13. [Common Issues & Solutions](#13-common-issues--solutions)
-14. [Evaluation & Benchmarks](#14-evaluation--benchmarks)
+7. [DAPO — Decoupled Clip & Dynamic Sampling (v0.8)](#7-dapo--decoupled-clip--dynamic-sampling-v08)
+8. [RLVR — Reinforcement Learning with Verifiable Rewards (v0.8)](#8-rlvr--reinforcement-learning-with-verifiable-rewards-v08)
+9. [LLM-JEPA — Joint-Embedding Predictive Architecture (v0.6)](#9-llm-jepa--joint-embedding-predictive-architecture-v06)
+10. [Losion Training Orchestrator (v0.8)](#10-losion-training-orchestrator-v08)
+11. [Advanced Training Techniques](#11-advanced-training-techniques)
+12. [Memory Optimization](#12-memory-optimization)
+13. [Data Pipeline](#13-data-pipeline)
+14. [Hyperparameter Reference](#14-hyperparameter-reference)
+15. [Distributed Training](#15-distributed-training)
+16. [Monitoring](#16-monitoring)
+17. [Common Issues & Solutions](#17-common-issues--solutions)
+18. [Evaluation & Benchmarks](#18-evaluation--benchmarks)
 
 ---
 
@@ -75,7 +79,7 @@ After launching, you should see output like:
 Total steps: 100000
 Device: cuda:0
 Mixed precision: bf16
-LosionForCausalLM: 924,312,576 total parameters, 924,312,576 trainable (100.0%)
+LosionForCausalLMV2: 924,312,576 total parameters, 924,312,576 trainable (100.0%)
 Estimated VRAM needed: 18.2 GB
 Step 10 | loss: 10.5432 | lr: 0.000030 | phase: phase_1_individual | steps_per_sec: 2.3
 Step 20 | loss: 9.8765 | lr: 0.000060 | phase: phase_1_individual | steps_per_sec: 2.4
@@ -372,15 +376,19 @@ training:
 
 **Strategy**:
 - Router **unfrozen** — now learns optimal routing
-- GRPO (Group Relative Policy Optimization) optimizes routing decisions
+- DAPO (Decoupled Clip & Dynamic Sampling Policy Optimization, v0.8+) replaces GRPO
+  as the default RL optimizer. GRPO remains available as a fallback.
 - Thinking toggle activated — model learns when to "think deeper"
 - Auxiliary rewards: routing entropy, load balancing, coherence
+- RLVR provides verifiable reward signals for math and code tasks
 
-**GRPO details for Phase 3**:
+**DAPO details for Phase 3** (recommended, v0.8+):
+- Decoupled clip: separate low/high ratios (0.2/0.28) prevent policy collapse and reward hacking
+- Dynamic sampling: filters prompts with zero-variance rewards for ~15-20% efficiency gain
+- Token-level loss for finer credit assignment
+- Overlong filtering penalizes excessively long responses
 - Group size: 8 samples per prompt
 - KL penalty coefficient: 0.05
-- Clip range: 0.2
-- Reward model: combination of task reward + routing quality reward
 
 ```yaml
 training:
@@ -389,11 +397,16 @@ training:
     learning_rate: 5e-5
     warmup_steps: 500
     grad_clip: 1.0
-    use_grpo: true
-    grpo:
+    use_dapo: true          # DAPO is now default (v0.8+)
+    use_grpo: false         # Set true for legacy GRPO
+    dapo:
       group_size: 8
       kl_coefficient: 0.05
-      clip_range: 0.2
+      clip_ratio_low: 0.2
+      clip_ratio_high: 0.28
+      dynamic_sampling: true
+      token_level_loss: true
+      overlong_filter: true
       entropy_coefficient: 0.01
       max_new_tokens: 512
       temperature: 0.7
@@ -405,11 +418,11 @@ training:
 
 ```python
 from losion.training.grpo import GRPOTrainer, GRPOConfig
-from losion.models.losion_decoder import LosionForCausalLM
+from losion.models.losion_model_v2 import LosionForCausalLMV2
 from losion.config import LosionConfig
 
 config = LosionConfig()
-model = LosionForCausalLM(config)
+model = LosionForCausalLMV2(config)
 
 grpo_config = GRPOConfig(
     group_size=8,
@@ -762,10 +775,10 @@ noisy_logits = injector.inject(router_logits)  # [batch, seq, 3]
 
 ```python
 from losion.training.advanced_rlhf import AdvancedGRPOTrainer, AdvancedGRPOConfig
-from losion.models.losion_decoder import LosionForCausalLM
+from losion.models.losion_model_v2 import LosionForCausalLMV2
 from losion.config import LosionConfig
 
-model = LosionForCausalLM(LosionConfig())
+model = LosionForCausalLMV2(LosionConfig())
 
 adv_config = AdvancedGRPOConfig(
     group_size=8,
@@ -802,9 +815,149 @@ print(f"Mean advantage: {metrics['mean_advantage']:.4f}")
 
 ---
 
-## 7. Advanced Training Techniques
+## 7. DAPO — Decoupled Clip & Dynamic Sampling (v0.8)
 
-### 7.1 Chinchilla Per-Jalur Scaling
+DAPO (Decoupled Clip & Dynamic Sampling Policy Optimization) replaces GRPO as the
+default RL optimizer in Losion v0.8+. It provides four key improvements over GRPO:
+
+1. **Decoupled clip**: Separate low/high clip ratios (0.2/0.28) prevent both policy
+   collapse and reward hacking
+2. **Dynamic sampling**: Filters prompts with zero-variance rewards for ~15-20%
+   efficiency gain
+3. **Token-level loss**: Finer credit assignment per token instead of per-sequence
+4. **Overlong filtering**: Penalizes excessively long responses to prevent reward hacking
+
+```python
+from losion.training.dapo import DAPOTrainer, DAPOConfig
+from losion.models.losion_model_v2 import LosionForCausalLMV2
+from losion.config import LosionConfig
+
+config = LosionConfig()
+model = LosionForCausalLMV2(config)
+
+dapo_config = DAPOConfig(
+    group_size=8,
+    clip_ratio_low=0.2,
+    clip_ratio_high=0.28,
+    dynamic_sampling=True,
+    token_level_loss=True,
+    overlong_filter=True,
+    kl_coeff=0.05,
+    entropy_coeff=0.01,
+)
+
+trainer = DAPOTrainer(model, config=dapo_config)
+metrics = trainer.train_step(prompts=input_ids, attention_mask=mask)
+print(f"Policy loss: {metrics['policy_loss']:.4f}")
+print(f"Mean reward: {metrics['mean_reward']:.4f}")
+```
+
+DAPO integrates with RLVR as the reward function provider, enabling verifiable
+rewards for math and code tasks without a learned reward model.
+
+---
+
+## 8. RLVR — Reinforcement Learning with Verifiable Rewards (v0.8)
+
+RLVR (Reinforcement Learning with Verifiable Rewards) scales RL training using
+objective, programmable reward functions instead of learned reward models. This is
+especially effective for math and code tasks where correctness can be verified automatically.
+
+**Verifier types**:
+
+| Verifier | Description | Use Case |
+|----------|-------------|----------|
+| `MathVerifier` | Numeric + symbolic verification | Math reasoning |
+| `CodeVerifier` | Sandboxed execution | Code generation |
+| `FormatVerifier` | Regex + length + JSON validation | Structured output |
+| `ExactMatchVerifier` | Exact/fuzzy matching | Factual QA |
+| `CompositeVerifier` | Curriculum difficulty scheduling | Multi-task |
+
+```python
+from losion.training.rlvr import RLVRTrainer, MathVerifier, CodeVerifier
+from losion.training.dapo import DAPOTrainer, DAPOConfig
+
+# Set up verifiable rewards
+verifiers = {
+    "math": MathVerifier(),
+    "code": CodeVerifier(timeout=30),
+}
+
+# DAPO + RLVR integration
+dapo_config = DAPOConfig(group_size=8, dynamic_sampling=True)
+trainer = DAPOTrainer(model, config=dapo_config, reward_fn=verifiers)
+```
+
+---
+
+## 9. LLM-JEPA — Joint-Embedding Predictive Architecture (v0.6)
+
+LLM-JEPA replaces the standard next-token prediction objective with predicting
+future latent states. Instead of predicting token IDs, the model learns to predict
+the *representation* of future tokens, providing a richer training signal.
+
+**Key benefits**:
+- Richer training signal than next-token prediction alone
+- Better representation learning for downstream tasks
+- Compatible with standard autoregressive training (auxiliary loss)
+- Particularly effective in Phase 1–2 of the Losion training recipe
+
+```python
+from losion.training.llm_jepa import LLMJEPALoss, JEPAConfig
+
+jepa_config = JEPAConfig(
+    predictor_depth=2,
+    prediction_horizon=4,        # Predict 4 steps ahead
+    loss_weight=0.3,             # Auxiliary loss weight
+    target_decay=0.99,           # EMA decay for target encoder
+)
+
+jepa_loss = LLMJEPALoss(config=jepa_config)
+
+# In training loop:
+total_loss = ar_loss + jepa_weight * jepa_loss(hidden_states, future_states)
+```
+
+---
+
+## 10. Losion Training Orchestrator (v0.8)
+
+The Losion Training Orchestrator (`losion/training/losion_orchestrator.py`) is a
+one-stop training manager that integrates ALL 13+ Losion training techniques into
+a single 4-phase pipeline:
+
+- **Phase 1**: WSD LR + JEPA + expert specialization
+- **Phase 2**: JEPA (reduced) + TACO + curriculum + active learning
+- **Phase 3**: DAPO/GRPO (auto-selected) + RLVR + ETR + TACO + evolutionary search
+- **Phase 4**: Gen distillation + BitDistill + ETR + early exit
+
+```python
+from losion.training.losion_orchestrator import LosionOrchestrator, OrchestratorConfig
+
+orch_config = OrchestratorConfig(
+    model_config=LosionConfig(),
+    total_steps=300000,
+    use_dapo=True,           # v0.8+ (fallback to GRPO if False)
+    use_rlvr=True,           # v0.8+
+    use_jepa=True,           # v0.6+
+    use_taco=True,           # v0.5+
+    use_etr=True,            # v0.5+
+    use_distillation=True,   # v0.5+
+    use_bitdistill=True,     # v0.5+
+    use_evolutionary=True,   # v0.7+
+)
+
+orchestrator = LosionOrchestrator(config=orch_config)
+orchestrator.train()
+```
+
+Full checkpoint save/resume with all training state is supported.
+
+---
+
+## 11. Advanced Training Techniques
+
+### 11.1 Chinchilla Per-Jalur Scaling
 
 Each pathway in Losion has different FLOP costs. Chinchilla scaling must be applied
 **per pathway**, not uniformly across the model.
@@ -829,7 +982,7 @@ validation = scaler.validate_config(LosionConfig())
 print(validation['recommendation'])
 ```
 
-### 7.2 Per-Jalur Learning Rate Schedules
+### 11.2 Per-Jalur Learning Rate Schedules
 
 Each pathway has different training dynamics: SSM is cheap per step (fast warmup,
 fast decay), Attention is expensive (slow warmup, slow decay), MoE is medium.
@@ -850,7 +1003,7 @@ lrs = lr_scheduler.get_all_lrs(50000)
 print(f"SSM LR: {lrs[0]:.2e}, Attn LR: {lrs[1]:.2e}, MoE LR: {lrs[2]:.2e}")
 ```
 
-### 7.3 Logit Soft Capping (Gemma 2)
+### 11.3 Logit Soft Capping (Gemma 2)
 
 Prevents logit divergence during training without hard clipping, which can cause
 mode collapse. Applied to AR output logits, flow matching velocity predictions,
@@ -871,7 +1024,7 @@ capped_logits = capper(output_logits)  # [batch, seq, vocab_size]
 creates a flat gradient region where the model cannot learn to pull logits back
 from the boundary. Soft capping via `tanh` provides smooth gradients everywhere.
 
-### 7.4 Scheduled Sampling (GraphCast)
+### 11.4 Scheduled Sampling (GraphCast)
 
 Bridges the teacher-forcing / autoregressive gap. During early training, use
 ground truth as input. Gradually replace with model's own predictions.
@@ -891,7 +1044,7 @@ p = sampler.get_sampling_probability(step=50000)  # e.g., 0.25
 input_tokens = sampler.sample_input(ground_truth, model_prediction, step=50000)
 ```
 
-### 7.5 Confidence Heads (AlphaFold 3)
+### 11.5 Confidence Heads (AlphaFold 3)
 
 Three auxiliary confidence heads provide dense training signals without affecting
 inference (can be distilled away after training):
@@ -919,7 +1072,7 @@ aux_loss = heads.compute_auxiliary_loss(
 total_loss = main_loss + 0.1 * aux_loss  # Weight as regularization
 ```
 
-### 7.6 Parallel Attention + FFN (PaLM)
+### 11.6 Parallel Attention + FFN (PaLM)
 
 Computes attention and FFN in **parallel** rather than sequentially, effectively
 doubling the model's "depth" within the same latency budget.
@@ -944,7 +1097,7 @@ output = layer(x, attention_mask=mask)  # [batch, seq, d_model]
 **When to use**: Apply in Jalur 2 (Attention pathway) where MLA attention and
 FFN/compression can run in parallel. Particularly beneficial for large models (7B+).
 
-### 7.7 Gradient Overlapping (PaLM 2)
+### 11.7 Gradient Overlapping (PaLM 2)
 
 Overlaps gradient synchronization with backward pass computation, hiding 40–60%
 of communication latency.
@@ -973,6 +1126,10 @@ requires distributed training setup with NCCL.
 > **Agent Context**
 > ```
 > All advanced techniques: losion/training/advanced_backprop.py
+DAPO: losion/training/dapo.py
+RLVR: losion/training/rlvr.py
+LLM-JEPA: losion/training/llm_jepa.py
+Orchestrator: losion/training/losion_orchestrator.py
 > ChinchillaScaler: per-jalur FLOP budget allocation
 > PerJalurLRScheduler: different warmup/decay per pathway
 > LogitSoftCapper: stabilizes training, no mode collapse
@@ -984,9 +1141,9 @@ requires distributed training setup with NCCL.
 
 ---
 
-## 8. Memory Optimization
+## 12. Memory Optimization
 
-### 8.1 Progressive KV Compression (Gemini LC)
+### 12.1 Progressive KV Compression (Gemini LC)
 
 Position-dependent KV cache compression — newer tokens get full fidelity, older
 tokens are compressed more aggressively.
@@ -1019,7 +1176,7 @@ print(f"Memory savings: {savings['savings_ratio']:.1%}")
 # Memory savings: 87.5%
 ```
 
-### 8.2 Attention Sinks (Gemini LC)
+### 12.2 Attention Sinks (Gemini LC)
 
 Reserve 4 "sink tokens" at the start of every sequence. Sink tokens are never
 evicted from the KV cache and receive disproportionate attention weight, stabilizing
@@ -1037,7 +1194,7 @@ eviction_mask = sink_manager.get_eviction_mask(seq_len=10000, device=device)
 modified_mask = sink_manager.modify_attention_mask(attention_mask)
 ```
 
-### 8.3 Dynamic Expert Buffer Allocation (GShard)
+### 12.3 Dynamic Expert Buffer Allocation (GShard)
 
 Instead of over-provisioning fixed buffers for every MoE expert (causing 30–50%
 memory waste), allocate dynamically based on predicted load.
@@ -1060,7 +1217,7 @@ savings = allocator.compute_memory_savings(predicted_loads, total_tokens=4096)
 print(f"Memory savings: {savings['memory_savings_percent']:.1f}%")
 ```
 
-### 8.4 Gradient Checkpointing
+### 12.4 Gradient Checkpointing
 
 Reduces memory by ~60% at the cost of ~30% slower training (recomputation during
 backward pass instead of storing all activations).
@@ -1072,7 +1229,7 @@ training:
   checkpoint_every_n_layers: 2
 ```
 
-### 8.5 FP8 Training
+### 12.5 FP8 Training
 
 Reduces memory by ~40% and increases throughput on H100/MI300X hardware.
 
@@ -1091,7 +1248,7 @@ training:
 - Requires `transformer_engine` or `torch._scaled_mm` backend
 - Some operations still use bf16 (layer norm, softmax)
 
-### 8.6 FSDP Sharding
+### 12.6 FSDP Sharding
 
 Fully Sharded Data Parallel distributes model parameters, gradients, and optimizer
 states across all GPUs.
@@ -1106,7 +1263,7 @@ training:
     sync_module_states: true
 ```
 
-### 8.7 OOM Troubleshooting Checklist
+### 12.7 OOM Troubleshooting Checklist
 
 | # | Action | Memory Saved | Difficulty |
 |---|--------|-------------|-----------|
@@ -1134,9 +1291,9 @@ training:
 
 ---
 
-## 9. Data Pipeline
+## 13. Data Pipeline
 
-### 9.1 Modality-Aware Loss Weighting (Gemini)
+### 13.1 Modality-Aware Loss Weighting (Gemini)
 
 Dynamic per-pathway loss weighting based on inverse perplexity. If a pathway has
 low perplexity (well-trained), reduce its loss weight and increase the weight for
@@ -1163,7 +1320,7 @@ print(f"SSM: {weights[0]:.3f}, Attn: {weights[1]:.3f}, MoE: {weights[2]:.3f}")
 total_loss = weights[0] * ssm_loss + weights[1] * attn_loss + weights[2] * moe_loss
 ```
 
-### 9.2 Chinchilla Data Sizing
+### 13.2 Chinchilla Data Sizing
 
 See [Section 2.5](#25-chinchilla-optimal-data-sizing) for the full calculator.
 Key rule: **20 tokens per active parameter**.
@@ -1178,7 +1335,7 @@ result = sizer.compute_optimal_dataset_size(
 # optimal_tokens: 144B, dataset: ~537 GB
 ```
 
-### 9.3 Sample-then-Filter (AlphaCode)
+### 13.3 Sample-then-Filter (AlphaCode)
 
 Generate K=64 candidates, then filter using AR log-probability, consistency
 classification, and diversity clustering. Dramatically improves output quality
@@ -1202,7 +1359,7 @@ best_output = pipeline.generate_and_filter(
 )
 ```
 
-### 9.4 Template-Based Conditional Routing (AlphaCode)
+### 13.4 Template-Based Conditional Routing (AlphaCode)
 
 Condition routing on the expected output type. When the Router detects structured
 output patterns (code, math, formal language), inject a "template bias" into the
@@ -1301,7 +1458,7 @@ print(f"Converged: {info['converged']}")
 
 ---
 
-## 10. Hyperparameter Reference
+## 14. Hyperparameter Reference
 
 ### 10.1 Learning Rates
 
@@ -1421,7 +1578,7 @@ hardware:
 
 ---
 
-## 11. Distributed Training
+## 15. Distributed Training
 
 ### 11.1 DDP vs FSDP
 
@@ -1502,7 +1659,7 @@ plan = overlap.create_overlap_plan()
 
 ---
 
-## 12. Monitoring
+## 16. Monitoring
 
 ### 12.1 Console Logging
 
@@ -1541,10 +1698,10 @@ training:
 ### 12.3 Custom Monitoring with Routing Info
 
 ```python
-from losion import LosionForCausalLM, LosionConfig
+from losion import LosionForCausalLMV2, LosionConfig
 
 config = LosionConfig()
-model = LosionForCausalLM(config)
+model = LosionForCausalLMV2(config)
 
 # Forward with routing info
 output = model(input_ids, labels=labels, return_routing_info=True)
@@ -1585,7 +1742,7 @@ training:
 
 ---
 
-## 13. Common Issues & Solutions
+## 17. Common Issues & Solutions
 
 ### 13.1 Loss Not Decreasing
 
@@ -1676,7 +1833,7 @@ Quick fix priority:
 
 ---
 
-## 14. Evaluation & Benchmarks
+## 18. Evaluation & Benchmarks
 
 ### 14.1 Standard Benchmarks
 
@@ -1841,6 +1998,6 @@ hardware:
 
 ---
 
-*This documentation covers Losion v0.1.0. Hyperparameters and recommendations
+*This documentation covers Losion v1.9.0. Hyperparameters and recommendations
 may evolve with ongoing development. For questions, see the [ARCHITECTURE.md](ARCHITECTURE.md)
 or open an issue on GitHub.*

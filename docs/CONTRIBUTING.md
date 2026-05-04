@@ -333,12 +333,26 @@ komponen baru ke Jalur 1 (SSM), Jalur 2 (Attention), atau Jalur 3 (Retrieval).
 lossion/core/
 ├── ssm/                   # Jalur 1: State Space Model
 │   ├── mamba2.py          # Mamba-2 SSD
+│   ├── mamba3.py          # Mamba-3 SSD (v0.6)
 │   ├── rwkv7.py           # RWKV-7 WKV
 │   ├── delta_net.py       # Gated DeltaNet
+│   ├── liquid_ssm.py      # Liquid SSM (v0.4)
+│   ├── post_decay.py      # PoST Decay Spectra (v0.5)
+│   ├── fg2_gdn.py         # FG2-GDN (v0.5)
+│   ├── routing_mamba.py   # Routing Mamba (v0.6)
+│   ├── structured_sparse.py # Structured Sparse SSM (v0.8)
 │   └── ssm_layer.py       # Interleaving + dispatch
 ├── attention/             # Jalur 2: Attention + Compression
 │   ├── mla.py             # Multi-head Latent Attention
 │   ├── irope.py           # Interleaved RoPE/NoPE
+│   ├── kda_mla.py         # KDA+MLA Hybrid (v0.5)
+│   ├── gated_attention.py # Gated Attention (v0.6)
+│   ├── moba.py            # MoBA (v0.6)
+│   ├── lightning_attention.py # Lightning Attention (v0.4)
+│   ├── shared_attention.py # Shared Attention (v0.4)
+│   ├── attn_res.py        # Attention Residuals (v0.9)
+│   ├── child_3w.py        # Child-3W QKV-level MoE (v0.9)
+│   ├── context_extension.py # YaRN, NTK, SSM extension (v0.7)
 │   ├── interleaving.py    # Adaptive local/global
 │   ├── pairformer.py      # AlphaFold3-style triangular
 │   └── attention_layer.py # Layer abstraction
@@ -346,7 +360,28 @@ lossion/core/
 │   ├── moe.py             # Mixture of Experts
 │   ├── engram.py          # Engram Memory
 │   ├── expert_choice.py   # Expert Choice routing
+│   ├── aux_free_moe.py    # Aux-Loss-Free MoE (v0.5)
+│   ├── infinite_moe.py    # ∞-MoE Infinite MoE (v0.8)
+│   ├── mohge.py           # MoHGE Grouped Experts (v0.8)
+│   ├── smore.py           # S'MoRE (v0.6)
+│   ├── cross_jalur_routing.py # Cross-Jalur Routing (v0.8)
 │   └── retrieval_layer.py # Gated Fusion layer
+├── feedback/              # Evoformer Feedback (v0.9)
+│   └── evoformer.py       # 5-level AlphaFold feedback
+├── memory/                # Dual Memory System (v0.9)
+│   └── dual_memory.py     # Working + Long-term memory
+├── output/                # Output Heads
+│   ├── flow_matching.py   # Flow Matching
+│   ├── diffusion_refinement.py # Diffusion Refinement
+│   ├── speculative_decoder.py  # MTP Speculative (v0.4)
+│   ├── mirror_speculative.py   # Mirror Speculative (v0.5)
+│   ├── leap_mtp.py        # L-MTP Leap MTP (v0.8)
+│   └── anchored_decoder.py # Anchored Diffusion Decoder (v0.9)
+├── reasoning/             # Reasoning Modules
+│   ├── mcts.py            # Monte Carlo Tree Search
+│   ├── neuro_symbolic.py  # Neuro-symbolic integration
+│   ├── parallel_thinking.py # Parallel Thinking
+│   └── path_lock_expert.py # Path-Lock Expert (v0.5)
 └── router/                # Adaptive Router
     ├── bias_router.py     # Bias-based routing
     ├── thinking_toggle.py # Thinking Toggle
@@ -1000,7 +1035,7 @@ Apa yang benar-benar terjadi.
 - Python: (e.g., 3.11.5)
 - PyTorch: (e.g., 2.4.0)
 - GPU: (e.g., NVIDIA A100 80GB)
-- Losion version: (e.g., 0.1.0)
+- Losion version: (e.g., 1.9.0)
 
 ## Additional Context
 Log, screenshot, atau informasi tambahan.
@@ -1034,7 +1069,7 @@ release yang terstruktur. Riwayat perubahan dicatat di [CHANGELOG.md](../CHANGEL
 
 ### Versi
 
-- **v0.1.0**: Initial release — arsitektur dasar Tri-Jalur Router
+- **v1.9.0**: Initial release — arsitektur dasar Tri-Jalur Router
 - Versi berikutnya mengikuti format `MAJOR.MINOR.PATCH`
 
 ### Alur Release
@@ -1107,4 +1142,4 @@ untuk pengembangan proyek ini.
 
 ---
 
-*Dokumen ini ditulis untuk Losion v0.1.0.*
+*Dokumen ini ditulis untuk Losion v1.9.0.*

@@ -20,11 +20,11 @@ community to resolve security issues promptly and transparently.
 
 ## 2. Supported Versions
 
-| Version | Branch / Tag        | Status      | Support Ends |
-|---------|---------------------|-------------|--------------|
-| 0.1.x   | `main`              | ✅ Active   | Next minor   |
-| 0.0.x   | `v0.0.x`            | ⚠️ Patch-only| EOL on 0.1.0 |
-| < 0.0.x | —                   | ❌ End-of-life| —           |
+| Version | Branch / Tag        | Status       | Support Ends |
+|---------|---------------------|--------------|--------------|
+| 1.x     | `main`              | ✅ Active    | Next major   |
+| 0.9.x   | `v0.9.x`            | ⚠️ Patch-only| EOL on 2.0   |
+| ≤ 0.8   | —                   | ❌ End-of-life| —            |
 
 > **Note:** Only the latest minor release on `main` receives active feature and
 > security updates. Prior minor versions receive critical patches only for 30
@@ -120,7 +120,7 @@ processing. Follow these guidelines to use Losion securely.
   redaction features where applicable.
 - **No data in repos** — Never commit raw data files, user data, or model
   weights to version control. Use the provided `.gitignore` patterns.
-- **Secure data pipelines** — Use encrypted storage and传输 for sensitive
+- **Secure data pipelines** — Use encrypted storage and transfer for sensitive
   datasets. Avoid logging raw inputs to disk or external services.
 
 ### 6.3 Environment & Dependencies

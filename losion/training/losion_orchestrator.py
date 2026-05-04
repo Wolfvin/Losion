@@ -860,8 +860,8 @@ class LosionTrainingOrchestrator:
                         jepa_loss_val, device=self.device
                     )
                 components.jepa_loss = jepa_loss_val
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"JEPA loss computation failed: {e}")
 
         # ---- Expert Specialization Loss (Phase 1) ----
         if "expert_spec_loss" in loss_weights:
@@ -903,8 +903,8 @@ class LosionTrainingOrchestrator:
                 components.etr_reward = torch.tensor(
                     etr_reward_val, device=self.device
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"ETR reward computation failed: {e}")
 
         # ---- Router Entropy Loss (Phase 3) ----
         if "router_entropy_loss" in loss_weights:
@@ -931,8 +931,8 @@ class LosionTrainingOrchestrator:
                         distill_metrics.get("total_loss", 0.0),
                         device=self.device,
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Distillation loss computation failed: {e}")
 
         # ---- BitDistill Loss (Phase 4) ----
         if (
@@ -952,8 +952,8 @@ class LosionTrainingOrchestrator:
                         bd_metrics.get("total_loss", 0.0),
                         device=self.device,
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"BitDistill loss computation failed: {e}")
 
         # ---- TACO Compute-Aligned Loss (Phase 2+) ----
         if self.config.use_taco and recipe.use_taco and self._taco_trainer is not None:
@@ -962,8 +962,8 @@ class LosionTrainingOrchestrator:
                 # TACO adjusts the base loss by alignment weights
                 # We store it as a modifier rather than a separate loss
                 components.taco_aligned_loss = lm_loss  # Will be adjusted below
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"TACO alignment computation failed: {e}")
 
         # ---- Early Exit Loss (Phase 4) ----
         if self.config.use_early_exit and recipe.use_early_exit:
@@ -1310,22 +1310,22 @@ class LosionTrainingOrchestrator:
         if self._taco_trainer is not None and self.config.use_taco:
             try:
                 self._taco_trainer.track_inference_compute(input_ids, attention_mask)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"TACO inference compute tracking failed: {e}")
 
         # Curriculum: update scheduler
         if self._curriculum_scheduler is not None and self.config.use_curriculum:
             try:
                 self._curriculum_scheduler.update(self._global_step)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Curriculum scheduler update failed: {e}")
 
         # JEPA: update teacher EMA
         if self._jepa_module is not None and self.config.use_jepa:
             try:
                 self._jepa_module.update_teacher()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"JEPA teacher EMA update failed: {e}")
 
         # ---- Build Metrics ----
         metrics = loss_components.to_dict()
@@ -1392,8 +1392,8 @@ class LosionTrainingOrchestrator:
                 metrics["etr/alpha"] = etr_diag.get("current_alpha", 0.0)
                 metrics["etr/convergence"] = etr_diag.get("convergence_score", 0.0)
                 metrics["etr/waste"] = etr_diag.get("waste_score", 0.0)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"ETR diagnostics retrieval failed: {e}")
 
         # ---- Evolutionary Search ----
         if self._evolutionary_searcher is not None and self.config.use_evolutionary:
@@ -1488,8 +1488,8 @@ class LosionTrainingOrchestrator:
         if self._taco_trainer is not None and self.config.use_taco:
             try:
                 taco_summary = self._taco_trainer.get_alignment_summary()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"TACO alignment summary retrieval failed: {e}")
 
         eval_metrics = {
             "eval_loss": avg_loss,

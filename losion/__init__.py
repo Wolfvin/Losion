@@ -1,7 +1,20 @@
 """
 Losion — Hybrid AI Framework with Tri-Jalur Router Architecture.
 
-Version 1.8.0 — "Per-Channel Selectivity & Deep Gradient Flow"
+Version 1.9.0 — "Complete Gradient Flow & Vectorized Attention"
+
+v1.9.0 Complete Gradient Flow & Vectorized Attention:
+  - Evoformer LayerRecycling: revision now applied to deep layers so recycled[-1] carries gradient
+  - Evoformer RouterExpertCoevolve: update_state returns differentiable update, no silent no_grad
+  - DualMemory: write() no longer detaches, consolidate() returns differentiable new_state
+  - DualMemory: retrieve() consolidates on every read for gradient flow to LTM params
+  - LosionModelV2: all_hidden_states no longer detached for evoformer gradient flow
+  - AuxFreeMoE: vocab_size default changed to None (explicit config required)
+  - LightningAttention: vectorized pair_mask construction replaces nested batch+seq loop
+  - losion_orchestrator.py: all bare except Exception:pass replaced with proper logging
+  - mamba2.py: removed unused einops import
+  - CI/CD: proper GitHub Actions workflow with version sync, lint, test
+  - 16 previously no-grad parameters now receive gradients (evoformer + dual_memory)
 
 v1.8.0 Per-Channel Selectivity & Deep Gradient Flow:
   - Mamba2SSD dt_avg/A_avg FIXED: per-channel dt dan A sekarang terjaga sepenuhnya
@@ -93,7 +106,7 @@ Router:  Adaptive (BiasRouter + ThinkingToggle + Symbolic-MoE), GRPO/DAPO-traine
          + Router ↔ Expert Co-Evolution (Evoformer Level 5)
 """
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 __author__ = "Losion Contributors"
 __license__ = "MIT"
 

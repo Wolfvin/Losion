@@ -1304,18 +1304,27 @@ class PairwiseAttentionLayer(nn.Module):
 
         # Pairwise mask
         if pair_indices is not None:
-            # Buat mask berdasarkan pair_indices
-            # pair_indices: (batch, seq_len, n_pairs) -> setiap query meng-attend
-            # hanya ke key positions dalam pair_indices
+            # v1.9.0: Vectorized mask construction — replaces nested batch+seq loop
+            # pair_indices: (batch, seq_len, n_pairs) -> -1 = padding
             k_indices = torch.arange(kv_len, device=x.device)
+            # Clamp -1 to 0 (will be masked out by valid_mask)
+            clamped = pair_indices.clamp(min=0)
+            valid_mask = pair_indices >= 0  # (batch, seq_len, n_pairs)
+
+            # Expand for scatter: (batch, seq_len, n_pairs, kv_len)
+            # For each (b, i, p), set pair_mask[b, i, clamped[b,i,p]] = True
             pair_mask = torch.zeros(
                 batch, seq_len, kv_len, dtype=torch.bool, device=x.device
             )
-            for b in range(batch):
-                for i in range(seq_len):
-                    valid_indices = pair_indices[b, i]
-                    valid_indices = valid_indices[valid_indices >= 0]  # -1 = padding
-                    pair_mask[b, i, valid_indices] = True
+            # Use scatter for vectorized one-hot encoding
+            expanded_clamped = clamped.unsqueeze(-1).expand(-1, -1, -1, kv_len)
+            one_hot = torch.zeros(
+                batch, seq_len, pair_indices.shape[-1], kv_len,
+                dtype=torch.bool, device=x.device
+            )
+            one_hot.scatter_(-1, expanded_clamped, valid_mask.unsqueeze(-1))
+            pair_mask = one_hot.any(dim=2)
+
             attn_weights = attn_weights.masked_fill(
                 ~pair_mask.unsqueeze(1), float("-inf")
             )

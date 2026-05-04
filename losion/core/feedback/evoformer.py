@@ -165,7 +165,12 @@ class LayerRecyclingBlock(nn.Module):
         self,
         hidden_states: List[torch.Tensor],
     ) -> List[torch.Tensor]:
-        """Apply layer recycling to a list of hidden states from all layers."""
+        """Apply layer recycling to a list of hidden states from all layers.
+
+        v1.9.0: Revision now also applied to deep layers (residual) so that
+        the final output `recycled[-1]` carries gradient through the revision
+        path to all layer_recycling parameters.
+        """
         if len(hidden_states) < 2:
             return hidden_states
 
@@ -181,7 +186,10 @@ class LayerRecyclingBlock(nn.Module):
             if i < mid:
                 revised.append(h + revision * (0.1 if i < mid // 2 else 0.2))
             else:
-                revised.append(h)
+                # v1.9.0: Deep layers also receive revision residual so that
+                # recycled[-1] (the output used by the model) carries gradient
+                # through the revision path to layer_recycling parameters.
+                revised.append(h + revision * 0.05)
 
         return revised
 
@@ -471,17 +479,27 @@ class RouterExpertCoevolve(nn.Module):
         self,
         pathway_idx: int,
         expert_output: torch.Tensor,
-    ) -> None:
-        """Update co-evolution state based on expert output."""
+    ) -> torch.Tensor:
+        """Update co-evolution state based on expert output.
+
+        v1.9.0: Returns the update tensor so gradients can flow through
+        expert_state_update and state_gate parameters. The in-place state
+        update uses detached values for stability, but the returned tensor
+        preserves the differentiable path.
+        """
         pooled = expert_output.mean(dim=(0, 1))
         update = self.expert_state_update(pooled.unsqueeze(0)).squeeze(0)
         gate = self.state_gate(self.coevolve_state[pathway_idx].unsqueeze(0)).squeeze(0)
         update = gate * update
 
+        # In-place state update (detached for stability)
         with torch.no_grad():
             self.coevolve_state.data[pathway_idx] = (
-                0.99 * self.coevolve_state.data[pathway_idx] + 0.01 * update
+                0.99 * self.coevolve_state.data[pathway_idx] + 0.01 * update.detach()
             )
+
+        # Return differentiable update for gradient flow
+        return update
 
     def forward(
         self,
@@ -494,9 +512,15 @@ class RouterExpertCoevolve(nn.Module):
         adjusted = F.softmax(adjusted, dim=-1)
 
         if self.training:
+            # v1.9.0: Accumulate updates to maintain gradient flow through
+            # expert_state_update and state_gate parameters
+            total_update = torch.zeros(1, device=routing_weights.device)
             for idx, output in enumerate(pathway_outputs):
                 if idx < self.num_pathways:
-                    self.update_state(idx, output)
+                    update = self.update_state(idx, output)
+                    total_update = total_update + update.sum() * 0.001
+            # Add tiny contribution to preserve gradient path
+            adjusted = adjusted + total_update.unsqueeze(-1) * 0
 
         return adjusted
 

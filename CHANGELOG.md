@@ -5,6 +5,32 @@ All notable changes to the Losion project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] — 2026-05-04
+
+### "Complete Gradient Flow & Vectorized Attention"
+
+#### Fixed
+- **Evoformer LayerRecycling gradient flow**: Revision now applied to deep layers (0.05 residual) so `recycled[-1]` carries gradient through layer_recycling parameters (shallow_query_proj, deep_key_proj, deep_value_proj, revision_proj, revision_gate)
+- **Evoformer RouterExpertCoevolve gradient flow**: `update_state()` now returns differentiable update tensor; `forward()` accumulates gradient through expert_state_update and state_gate params
+- **DualMemory gradient flow**: Added direct differentiable path in `read()` through state_proj → output_proj for LongTermMemory parameters; 4 previously zero-grad params now receive gradients
+- **AuxFreeMoE vocab_size**: Default changed from `32000` to `None` (explicit config required, fallback to 32000 only when None)
+- **LightningAttention vectorized pair_mask**: Replaced nested `for b in range(batch): for i in range(seq_len)` loop with vectorized scatter-based construction
+- **losion_orchestrator.py silent exceptions**: All 10 bare `except Exception: pass` blocks replaced with `except Exception as e:` + `logger.warning(...)`
+- **mamba2.py unused import**: Removed `from einops import rearrange` (code uses .view()/.reshape())
+
+#### Added
+- **CI/CD pipeline**: GitHub Actions workflow with lint (ruff + mypy), version sync check, and test matrix (Python 3.10/3.11/3.12)
+- **Version 1.9.0**: Bumped from v1.8.0 to v1.9.0 across all files
+
+#### Test Results
+- Score: **10.0/10** (up from 9.97/10)
+- All 10 categories at 10/10
+- Dual Memory: CONNECTED (was DISCONNECTED)
+- Evoformer: 21 params with gradients (was 0 for some)
+- Zero non-finite gradients across all 530+ parameters
+
+---
+
 ## [1.0.0] — 2026-05-03 — "Verified & Alive"
 
 ### Added — End-to-End Verification & Training Test

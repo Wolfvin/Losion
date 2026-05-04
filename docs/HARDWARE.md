@@ -148,6 +148,22 @@ terpisah jika menggunakan PyTorch dari pip/conda.
 | H100 80GB | 80 GB | 7B-48B | Fastest training + FP8 |
 | H200 141GB | 141 GB | 48B (single) | Memory-optimized |
 | B200 192GB | 192 GB | 48B+ (single) | Next-gen + FP8 native |
+| B200 192GB (QuantSpec) | 192 GB | 48B+ quantized | BitNet/QuantSpec aware, 3× throughput |
+
+### B200 192GB GPU — Deep Dive
+
+The NVIDIA B200 with 192GB HBM3e is a game-changer for Losion training:
+
+- **192 GB VRAM**: Fits Losion-48B entirely in single-GPU memory, even with optimizer states
+- **FP8 native**: Blackwell FP8 support for ~2x training throughput vs bf16
+- **Quantization-aware considerations**:
+  - **BitNet 1.58-bit**: With B200's large memory, BitNet quantized models can train
+    at 3× throughput. Use `BitNetConfig(warmup_steps=2000)` for gradual quantization.
+  - **QuantSpec**: Self-speculative decoding with hierarchical quantization uses
+    quantized versions of the same model as draft models for >90% acceptance rates.
+    Pathway-aware: SSM pathway quantized more aggressively (less sensitive to error).
+  - **Recommended**: For 48B+ models on B200, enable `fp8_enabled: true` +
+    `use_bitdistill: true` for joint quantization + distillation training.
 
 #### Untuk Inference
 
@@ -1025,4 +1041,4 @@ DataLoader(dataset, num_workers=8, pin_memory=True, persistent_workers=True)
 
 ---
 
-*Dokumentasi ini ditulis untuk Losion v0.1.0. Performa dapat bervariasi tergantung driver, firmware, dan versi software.*
+*Dokumentasi ini ditulis untuk Losion v1.9.0. Performa dapat bervariasi tergantung driver, firmware, dan versi software.*
