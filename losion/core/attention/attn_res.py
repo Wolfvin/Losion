@@ -185,12 +185,12 @@ class FullAttnRes(nn.Module):
             layer_idx: Index of the layer (0-indexed).
             output: Layer output tensor (batch, seq_len, d_model).
         """
-        # Detach to prevent gradient accumulation through stored outputs
-        # Gradients flow through the attention mechanism instead
+        # Store with gradient flow when not using checkpointing
+        # Gradients flow through the attention mechanism
         if layer_idx < len(self._layer_outputs):
-            self._layer_outputs[layer_idx] = output.detach()
+            self._layer_outputs[layer_idx] = output
         else:
-            self._layer_outputs.append(output.detach())
+            self._layer_outputs.append(output)
 
     def forward(
         self,
@@ -381,7 +381,7 @@ class BlockAttnRes(nn.Module):
             layer_idx: Layer index (0-indexed).
             output: Layer output tensor.
         """
-        self._current_block_outputs.append(output.detach())
+        self._current_block_outputs.append(output)
 
         if self._is_block_boundary(layer_idx):
             # Compute block representative: mean of all outputs in this block

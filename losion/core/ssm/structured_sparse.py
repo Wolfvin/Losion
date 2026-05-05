@@ -320,7 +320,9 @@ class StructuredSparseTransition(nn.Module):
             return A  # (n_inner, S)
 
         # Full matrix: (n_out, S, S)
-        A_full = torch.zeros(n_out, self.d_state, self.d_state)
+        A_full = torch.zeros(n_out, self.d_state, self.d_state,
+                            device=self.block_trans_log.device,
+                            dtype=self.block_trans_log.dtype)
         A_log = self.block_trans_log.float()  # (n_out, n_blocks, B, B)
 
         for b_idx in range(self.n_blocks):
@@ -338,7 +340,9 @@ class StructuredSparseTransition(nn.Module):
         has_inner = self.n_inner > 0
         n_out = self.n_inner if has_inner else 1
 
-        A_full = torch.zeros(n_out, self.d_state, self.d_state)
+        A_full = torch.zeros(n_out, self.d_state, self.d_state,
+                            device=self.band_trans_log.device,
+                            dtype=self.band_trans_log.dtype)
         A_log = self.band_trans_log.float()  # (n_out, S, n_diags)
 
         for d in range(self.d_state):
@@ -357,7 +361,9 @@ class StructuredSparseTransition(nn.Module):
         n_out = self.n_inner if has_inner else 1
 
         # Start with identity per block
-        A_full = torch.zeros(n_out, self.d_state, self.d_state)
+        A_full = torch.zeros(n_out, self.d_state, self.d_state,
+                            device=self.butterfly_log[0].device,
+                            dtype=self.butterfly_log[0].dtype)
 
         for b_idx in range(self.n_blocks):
             start = b_idx * self.block_size
@@ -379,8 +385,8 @@ class StructuredSparseTransition(nn.Module):
                     # Here we use a simple sequential 2×2 block approach
                     row_start = half * 2
                     for n_idx in range(n_out):
-                        block[n_idx, row_start:row_start+2, row_start:row_start+2] = (
-                            mat_2x2[n_idx]
+                        block[n_idx, row_start:row_start+2, :] = torch.matmul(
+                            mat_2x2[n_idx], block[n_idx, row_start:row_start+2, :]
                         )
 
             A_full[:, start:end, start:end] = block
@@ -612,6 +618,7 @@ class StructuredSparseSSM(nn.Module):
         self.expand = config.expand
         self.chunk_size = config.chunk_size
         self.d_inner = int(config.expand * config.d_model)
+        self.dt_init_floor = 1e-4
 
         # Resolve block size
         self.block_size = config.resolve_block_size()
@@ -631,7 +638,7 @@ class StructuredSparseSSM(nn.Module):
 
         # ---- SSM parameter projections ----
         self.x_proj = nn.Linear(self.d_inner, self.d_state * 2, bias=False)
-        self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=True)
+        self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=False)
 
         # ---- dt bias (per-channel, log-uniform init) ----
         dt_init = torch.exp(
@@ -695,7 +702,7 @@ class StructuredSparseSSM(nn.Module):
             x_seq: Input sequence, ``(batch, seq_len, d_inner)``.
             B: Input matrix, ``(batch, seq_len, d_state)``.
             C: Output matrix, ``(batch, seq_len, d_state)``.
-            dt: Step sizes, ``(batch, seq_len)``.
+            dt: Step sizes, ``(batch, seq_len, d_inner)`` — per-channel.
             initial_state: Optional initial state, ``(batch, d_inner, d_state)``.
 
         Returns:
@@ -714,29 +721,34 @@ class StructuredSparseSSM(nn.Module):
 
         if self.block_size <= 1:
             # ---- Pure diagonal mode: use standard SSD scan ----
-            # Need to provide A_avg for diagonal scan
+            # Pass per-channel A directly (no averaging)
             A = -torch.exp(self.A_log.float()).to(dtype=x_seq.dtype)
-            A_avg = A.mean(dim=0)  # (d_state,)
 
             return ssd_chunk_scan(
                 x_seq=x_seq,
-                A=A_avg.unsqueeze(0).unsqueeze(0).expand(batch, seq_len, -1),
+                A=A,  # (d_inner, d_state) — per-channel, NOT averaged
                 B=B,
                 C=C,
-                dt=dt,
+                dt=dt,  # (batch, seq_len, d_inner) — per-channel
                 chunk_size=self.chunk_size,
                 initial_state=initial_state,
             )
 
         # ---- Structured sparse scan ----
+        # For structured sparse transitions (block_size > 1), the transition
+        # applies a shared matrix per block using first-order approximation
+        # which requires scalar dt. Per-channel dt is used for input injection.
         outputs = []
         for t in range(seq_len):
             # Apply structured sparse transition: h = T(dt_t) @ h
-            dt_t = dt[:, t]  # (batch,)
-            h = self.transition.apply_transition(h, dt_t)
+            # Use mean dt for shared transition (first-order approximation)
+            dt_t_avg = dt[:, t].mean(dim=-1)  # (batch,)
+            h = self.transition.apply_transition(h, dt_t_avg)
 
             # Input injection: h += x_t ⊗ (dt_t * B_t)
-            dB_t = dt_t.unsqueeze(-1) * B[:, t, :]  # (batch, d_state)
+            # Use per-channel dt for input injection
+            dt_t = dt[:, t]  # (batch, d_inner)
+            dB_t = dt_t_avg.unsqueeze(-1) * B[:, t, :]  # (batch, d_state)
             h = h + x_seq[:, t, :].unsqueeze(-1) * dB_t.unsqueeze(1)
             # h: (batch, d_inner, d_state)
 
@@ -801,18 +813,16 @@ class StructuredSparseSSM(nn.Module):
         C = ssm_params[..., self.d_state:self.d_state * 2]
 
         # dt: per-channel projection + bias
-        dt_bias = self._get_dt()  # (d_inner,)
         dt_full = F.softplus(
-            self.dt_proj(x_conv) + dt_bias.unsqueeze(0).unsqueeze(0)
+            self.dt_proj(x_conv) + self.dt_bias.unsqueeze(0).unsqueeze(0) + self.dt_init_floor
         )  # (batch, seq_len, d_inner)
-        dt_avg = dt_full.mean(dim=-1)  # (batch, seq_len)
 
         # ---- Step 4: Structured Sparse SSM Scan ----
         y, final_state = self._structured_sparse_scan(
             x_seq=x_conv,
             B=B,
             C=C,
-            dt=dt_avg,
+            dt=dt_full,
             initial_state=initial_state,
         )
 
@@ -850,14 +860,13 @@ class StructuredSparseSSM(nn.Module):
         # SSM parameters
         ssm_params = self.x_proj(x_conv)
         B = ssm_params[..., :self.d_state]  # (batch, 1, d_state)
-        C = ssm_params[..., self.d_state:]   # (batch, 1, d_state)
+        C = ssm_params[..., self.d_state:self.d_state * 2]   # (batch, 1, d_state)
 
         # dt
-        dt_bias = self._get_dt()
-        dt = F.softplus(
-            self.dt_proj(x_conv) + dt_bias.unsqueeze(0).unsqueeze(0)
+        dt_full = F.softplus(
+            self.dt_proj(x_conv) + self.dt_bias.unsqueeze(0).unsqueeze(0) + self.dt_init_floor
         )  # (batch, 1, d_inner)
-        dt_scalar = dt.mean(dim=-1).squeeze(1)  # (batch,)
+        dt_scalar = dt_full.mean(dim=-1).squeeze(1)  # (batch,)
 
         # Apply structured sparse transition
         new_state = self.transition.apply_transition(state, dt_scalar)

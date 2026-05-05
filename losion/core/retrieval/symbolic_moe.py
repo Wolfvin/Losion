@@ -85,7 +85,7 @@ class SkillType(Enum):
     KNOWLEDGE = "knowledge"
     CODING = "coding"
     CREATIVE = "creative"
-    MATHEMATICAL = "mathematicical"
+    MATHEMATICAL = "mathematical"
 
 
 # Mapping from SkillType enum index to enum member (for tensor → enum)

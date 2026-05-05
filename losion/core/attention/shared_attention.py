@@ -159,14 +159,14 @@ class SharedAttentionPool(nn.Module):
         k = self.k_proj(x).view(batch, seq_len, self.n_heads, self.d_head)
         v = self.v_proj(x).view(batch, seq_len, self.n_heads, self.d_head)
 
-        # QK normalization
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-
-        # RoPE
+        # RoPE (applied before QK normalization, consistent with gated_attention.py)
         if self.use_rope:
             q = self.rope(q, offset=position_offset)
             k = self.rope(k, offset=position_offset)
+
+        # QK normalization (applied after RoPE, consistent with gated_attention.py)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         return q, k, v
 

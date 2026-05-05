@@ -876,7 +876,7 @@ class LeapMTP(nn.Module):
             Scalar loss tensor.
         """
         batch, seq_len, num_leaps, vocab_size = all_logits.shape
-        total_loss = torch.tensor(0.0, device=all_logits.device, dtype=all_logits.dtype)
+        total_loss = torch.zeros(1, device=all_logits.device, dtype=all_logits.dtype, requires_grad=True).squeeze()
 
         for k in range(num_leaps):
             d_k = self.leap_distances[k]

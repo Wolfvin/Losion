@@ -486,36 +486,30 @@ class DAPOTrainer:
         advantages_expanded = self._expand_advantages(advantages, log_probs)
 
         # ---- Step 3: Decoupled clip (DAPO improvement #1) ----
-        # Lower clip: clamp ratio to [1 - eps_low, +inf)
-        #   → allows the policy to freely *increase* probabilities of
-        #     high-reward actions (ratio > 1) but prevents it from
-        #     collapsing probabilities too fast (ratio < 1 - eps_low).
-        clipped_ratio_low = torch.clamp(
-            ratio, 1.0 - cfg.clip_ratio_low, float("inf")
+        # Single clipped ratio with asymmetric bounds:
+        #   clamp(r, 1 - eps_low, 1 + eps_high)
+        # This prevents the policy from changing too much in either
+        # direction, with separate bounds for increases (eps_high,
+        # typically tighter to prevent reward hacking) and decreases
+        # (eps_low, typically looser to allow confident updates on
+        # high-reward actions).
+        clipped_ratio = torch.clamp(
+            ratio, 1.0 - cfg.clip_ratio_low, 1.0 + cfg.clip_ratio_high
         )
 
-        # Upper clip: clamp ratio to (0, 1 + eps_high]
-        #   → prevents the policy from *excessively* increasing
-        #     probabilities, which is the primary mechanism for reward
-        #     hacking.
-        clipped_ratio_high = torch.clamp(
-            ratio, 0.0, 1.0 + cfg.clip_ratio_high
-        )
-
-        # Combined: take the element-wise minimum of the two clipped
-        # surrogates.  This is the DAPO equivalent of PPO's
-        # min(r*A, clip(r)*A), but with asymmetric clipping bounds.
-        surr_unclipped = ratio * advantages_expanded
-        surr_clipped_low = clipped_ratio_low * advantages_expanded
-        surr_clipped_high = clipped_ratio_high * advantages_expanded
-        surr_clipped = torch.min(surr_clipped_low, surr_clipped_high)
+        # DAPO clipped objective (same structure as PPO but with
+        # asymmetric clipping bounds):
+        #   L_clip = -min(r * A, clip(r, 1-eps_low, 1+eps_high) * A)
+        surr1 = ratio * advantages_expanded
+        surr2 = clipped_ratio * advantages_expanded
+        surr_clipped = torch.min(surr1, surr2)
 
         # ---- Step 4: Token-level vs. sequence-level loss ----
         if cfg.token_level_loss:
             # DAPO improvement #3: token-level policy gradient loss.
             # Each token contributes independently to the loss, providing
             # finer-grained credit assignment.
-            per_token_loss = -torch.min(surr_unclipped, surr_clipped)
+            per_token_loss = -torch.min(surr1, surr2)
             per_token_loss = per_token_loss * attention_mask
             num_valid_tokens = attention_mask.sum(dim=-1, keepdim=True).clamp(min=1)
             policy_loss = (
@@ -524,7 +518,7 @@ class DAPOTrainer:
         else:
             # Sequence-level loss (standard GRPO).
             per_token_loss = (
-                -torch.min(surr_unclipped, surr_clipped) * attention_mask
+                -torch.min(surr1, surr2) * attention_mask
             )
             seq_loss = per_token_loss.sum(dim=-1) / attention_mask.sum(
                 dim=-1

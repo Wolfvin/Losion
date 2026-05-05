@@ -1,7 +1,53 @@
 """
 Losion — Hybrid AI Framework with Tri-Jalur Router Architecture.
 
-Version 2.1.0 — "Honest Code & Real Kernels"
+Version 2.2.0 — "Deep Audit & Bug Purge"
+
+v2.2.0 Deep Audit & Bug Purge:
+  - CRITICAL: Double-softplus dt bias FIXED in Mamba2/3/Liquid/PoST/StructuredSparse
+    — dt_bias was pre-softplused then softplus applied again, making dt 11x too large
+  - CRITICAL: Per-channel dt/A selectivity RESTORED in Mamba3/RoutingMamba/Liquid/PoST
+    — Averaging over d_inner destroyed Mamba's core per-channel selectivity innovation
+  - CRITICAL: WKV state shape mismatch FIXED — 3D init_state now correctly 2D
+  - CRITICAL: DeltaNet/GDN state output uses per-position state, not final state
+  - CRITICAL: MLA Key reconstruction no longer uses Value dims as Key dimensions
+  - CRITICAL: Double RoPE application in GatedMultiHeadAttention MLA path fixed
+  - CRITICAL: MLA KV cache returns proper 2-tuple (not 1-tuple) for interface compat
+  - CRITICAL: GRPO policy update now uses fresh forward pass (was stale, ratio always 1.0)
+  - CRITICAL: NAS compute_nas_loss returns total_loss (was returning task_loss, discarding arch reg)
+  - CRITICAL: Missing `import math` in generation.py fixed
+  - HIGH: Butterfly materialization composes (multiplies) instead of overwriting
+  - HIGH: Mamba3 dual token shift now functional during inference (prev_token cache)
+  - HIGH: Mamba3 uses correct dt*B discretization instead of softplus(dt)*B
+  - HIGH: FG2-GDN temperature parameters are now nn.Parameter (were buffers, non-learnable)
+  - HIGH: RoutingMamba inference adds exp clamp to prevent overflow
+  - HIGH: SmoreMoE uses expert index (not sub-tree index) for load tracking
+  - HIGH: BidirectionalTokenUpdate uses no causal mask (was using causal = not bidirectional)
+  - HIGH: AttnRes stores non-detached outputs for gradient flow to original layers
+  - HIGH: Child3W avoids double-counting when same child selected twice
+  - HIGH: ExpertChoiceMoE renormalizes by token count for multi-expert accumulation
+  - HIGH: GRPO reward uses actual reward_fn (was random noise placeholder)
+  - HIGH: DAPO decoupled clip uses correct single-clamp formulation
+  - HIGH: Beam search applies length_penalty normalization
+  - HIGH: In-place logits modification replaced with clone() for gradient safety
+  - MEDIUM: LiquidSSM A-modulation consistent between training and inference
+  - MEDIUM: C slicing uses explicit end index in inference paths
+  - MEDIUM: StructuredSparse creates tensors on correct device/dtype
+  - MEDIUM: SymbolicMoE MATHEMATICAL enum typo fixed
+  - MEDIUM: context_extension.py missing logger import added
+  - MEDIUM: ACT halting_threshold default changed from 0.99 to 0.01
+  - MEDIUM: PagedKVCache free_page detects double-free
+  - MEDIUM: Generation add_request squeezes 2D input_ids
+  - MEDIUM: LeapMTP total_loss uses requires_grad=True initialization
+  - MEDIUM: InfiniteMoE diversity loss bounded with log(1+dist)
+  - MEDIUM: Evoformer RouterCoevolve uses 1e-4 coefficient (was *0 = dead gradient)
+  - MEDIUM: DualMemory write() no longer detaches (gradient flows to LTM)
+  - MEDIUM: PostDecay gamma padding enforced with d_inner%nhads==0 assertion
+  - MEDIUM: LiquidSSM depth_entropy normalized by max_entropy
+  - MEDIUM: LiquidSSM complexity_scale expanded per-channel instead of averaged to scalar
+  - MEDIUM: KDA+MLA cumulative_state initialized from initial_state
+  - MEDIUM: SharedAttentionPool QK norm applied after RoPE (consistent with other modules)
+  - LOW: DeltaNet/GDN torch.stack→torch.cat for correct state output shape
 
 v2.1.0 Honest Code & Real Kernels:
   - CRITICAL: _triton_associative_scan now has a REAL Triton GPU kernel
@@ -131,7 +177,7 @@ Router:  Adaptive (BiasRouter + ThinkingToggle + Symbolic-MoE), GRPO/DAPO-traine
          + Router ↔ Expert Co-Evolution (Evoformer Level 5)
 """
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 __author__ = "Losion Contributors"
 __license__ = "MIT"
 

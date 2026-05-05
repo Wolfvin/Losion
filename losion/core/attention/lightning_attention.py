@@ -299,7 +299,7 @@ class MLA(nn.Module):
         # Latent norm
         self.kv_norm = nn.RMSNorm(kv_lora_rank, eps=1e-5)
         # Up-projections dari latent
-        self.k_up_proj = nn.Linear(kv_lora_rank, n_heads * self.d_rope, bias=False)
+        self.k_up_proj = nn.Linear(kv_lora_rank, self.d_inner, bias=False)
         self.v_up_proj = nn.Linear(kv_lora_rank, self.d_inner, bias=False)
 
         # ---- Q projection (dengan optional LoRA) ----
@@ -324,7 +324,7 @@ class MLA(nn.Module):
 
         # ---- QK normalization ----
         self.q_norm = nn.RMSNorm(d_head, eps=1e-5)
-        self.k_norm = nn.RMSNorm(self.d_rope, eps=1e-5)
+        self.k_norm = nn.RMSNorm(self.d_head, eps=1e-5)
 
     def _project_q(self, x: torch.Tensor) -> torch.Tensor:
         """Proyeksi Q dengan optional LoRA compression."""
@@ -374,54 +374,43 @@ class MLA(nn.Module):
         present_kv = c_kv_full
 
         # ---- Up-project K dan V ----
-        k_pe = self.k_up_proj(c_kv_full)  # (batch, full_len, n_heads * d_rope)
+        k = self.k_up_proj(c_kv_full)  # (batch, full_len, n_heads * d_head)
         v = self.v_up_proj(c_kv_full)     # (batch, full_len, n_heads * d_head)
 
         # Reshape ke heads
-        k_pe = k_pe.view(batch, -1, self.n_heads, self.d_rope)
+        k = k.view(batch, -1, self.n_heads, self.d_head)
         v = v.view(batch, -1, self.n_heads, self.d_head)
 
         # ---- Proyeksi Q ----
         q = self._project_q(x)  # (batch, seq_len, n_heads * d_head)
         q = q.view(batch, seq_len, self.n_heads, self.d_head)
 
-        # ---- Split Q untuk RoPE dan non-RoPE ----
+        # ---- Split Q dan K untuk RoPE dan non-RoPE ----
         q_rope = q[..., :self.d_rope].contiguous()
         q_pass = q[..., self.d_rope:].contiguous()
+        k_rope = k[..., :self.d_rope].contiguous()
+        k_pass = k[..., self.d_rope:].contiguous()
 
         # ---- Terapkan RoPE ----
         full_len = c_kv_full.shape[1]
         offset = full_len - seq_len + position_offset
 
         q_rope = self.rope(q_rope, offset=offset)
-        k_rope = self.rope(k_pe, offset=0)  # K sudah full sequence
+        k_rope = self.rope(k_rope, offset=0)  # K sudah full sequence
 
-        # ---- Reconstruct Q dan K ----
-        if self.d_rope < self.d_head:
-            q = torch.cat([q_rope, q_pass], dim=-1)
-            k = torch.cat([k_rope, v[..., :self.d_rope].clone()], dim=-1)
-            # K: gunakan d_head dimensi (d_rope dari RoPE + sisa dari V up-proj)
-            # Simplifikasi: k sudah punya d_rope dimensi, kita perlu d_head
-            # Gunakan V sebagai basis untuk K non-RoPE
-            k = F.pad(k, (0, self.d_head - k.shape[-1]))
-            k[..., :self.d_rope] = k_rope[..., :self.d_rope]
-        else:
-            q = q_rope
-            k = k_rope
+        # ---- Reconstruct Q dan K dengan RoPE pada dimensi pertama ----
+        q = torch.cat([q_rope, q_pass], dim=-1)
+        k = torch.cat([k_rope, k_pass], dim=-1)
 
-        # ---- QK normalization ----
+        # ---- QK normalization (full d_head) ----
         q = self.q_norm(q)
-        k = self.k_norm(k[..., :self.d_rope])
+        k = self.k_norm(k)
 
         # ---- Standard multi-head attention ----
         # Transpose ke (batch, n_heads, seq_len, d_head)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-
-        # Expand K untuk RoPE padding jika perlu
-        if k.shape[-1] < self.d_head:
-            k = F.pad(k, (0, self.d_head - k.shape[-1]))
 
         # Attention scores
         scale = math.sqrt(self.d_head)

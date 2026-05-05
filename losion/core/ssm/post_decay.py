@@ -286,13 +286,16 @@ def post_ssm_scan(
         pad = d_inner - gamma_expanded.shape[0]
         gamma_expanded = F.pad(gamma_expanded, (0, 0, 0, pad), value=0.5)
 
-    # ---- Pre-compute discretization ----
-    # dA_base = exp(dt * A) tanpa decay modulation
-    A_avg = A_base.mean(dim=0)  # (d_state,)
+    # ---- Pre-compute discretization with per-channel dt and A ----
+    # A_base: (d_inner, d_state), dt: (batch, seq_len, d_inner)
+    # dA = exp(dt * A) per channel
+    dt_expanded = dt.unsqueeze(-1)  # (batch, seq_len, d_inner, 1)
+    A_broadcast = A_base.unsqueeze(0).unsqueeze(0)  # (1, 1, d_inner, d_state)
     dA_base = torch.exp(
-        dt.unsqueeze(-1) * A_avg.unsqueeze(0).unsqueeze(0)
-    )  # (batch, seq_len, d_state)
-    dB = dt.unsqueeze(-1) * B  # (batch, seq_len, d_state)
+        (dt_expanded * A_broadcast).clamp(max=20.0)
+    )  # (batch, seq_len, d_inner, d_state)
+    # dB = dt * B per channel
+    dB = dt.unsqueeze(-1) * B.unsqueeze(2)  # (batch, seq_len, d_inner, d_state)
 
     # ---- Sequential scan ----
     outputs = []
@@ -309,8 +312,8 @@ def post_ssm_scan(
 
             # State update: h_m = gamma_m * dA_t * h_{m, t-1} + dB_t * x_t / n_modes
             # Distribusikan input contribution merata ke mode
-            dA_t = dA_base[:, t, :].unsqueeze(1)  # (batch, 1, d_state)
-            dB_t = dB[:, t, :]  # (batch, d_state)
+            dA_t = dA_base[:, t, :, :]  # (batch, d_inner, d_state)
+            dB_t = dB[:, t, :, :]  # (batch, d_inner, d_state)
             x_t = x_seq[:, t, :]  # (batch, d_inner)
 
             # Apply gamma per channel
@@ -319,7 +322,7 @@ def post_ssm_scan(
 
             h_m = states[m] * dA_t * gamma_broadcast  # (batch, d_inner, d_state)
             # Input contribution (dibagi merata ke modes)
-            h_m = h_m + (x_t.unsqueeze(-1) * dB_t.unsqueeze(1)) / n_modes
+            h_m = h_m + (x_t.unsqueeze(-1) * dB_t) / n_modes
 
             new_states.append(h_m)
 
@@ -417,6 +420,11 @@ class PoSTDecaySSM(nn.Module):
         self.n_decay_modes = n_decay_modes
         self.max_seq_len = max_seq_len
         self.d_inner = int(expand * d_model)
+        self.dt_init_floor = dt_init_floor
+
+        assert self.d_inner % self.n_heads == 0, (
+            f"d_inner={self.d_inner} must be divisible by n_heads={self.n_heads}"
+        )
 
         # ---- Input projection ----
         self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=use_bias)
@@ -433,7 +441,7 @@ class PoSTDecaySSM(nn.Module):
 
         # ---- SSM parameter projections ----
         self.x_proj = nn.Linear(self.d_inner, d_state * 2, bias=False)
-        self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=True)
+        self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=False)
 
         # ---- dt bias (per-channel) ----
         dt_init = torch.exp(
@@ -532,11 +540,9 @@ class PoSTDecaySSM(nn.Module):
         C = ssm_params[..., self.d_state:self.d_state * 2]
 
         # dt
-        dt_bias = self._get_dt()
         dt_full = F.softplus(
-            self.dt_proj(x_conv) + dt_bias.unsqueeze(0).unsqueeze(0)
+            self.dt_proj(x_conv) + self.dt_bias.unsqueeze(0).unsqueeze(0) + self.dt_init_floor
         )
-        dt_avg = dt_full.mean(dim=-1)  # (batch, seq_len)
 
         # ---- Step 4: A parameter ----
         A = -torch.exp(self.A_log.float()).to(dtype=x_conv.dtype)
@@ -552,7 +558,7 @@ class PoSTDecaySSM(nn.Module):
             A_base=A,
             B=B,
             C=C,
-            dt=dt_avg,
+            dt=dt_full,
             gamma=gamma,
             mix=mix,
             initial_state=initial_state,
@@ -602,12 +608,11 @@ class PoSTDecaySSM(nn.Module):
         # ---- SSM parameters ----
         ssm_params = self.x_proj(x_conv)
         B = ssm_params[..., :self.d_state]
-        C = ssm_params[..., self.d_state:]
+        C = ssm_params[..., self.d_state:self.d_state * 2]
 
         # dt
-        dt_bias = self._get_dt()
-        dt = F.softplus(
-            self.dt_proj(x_conv) + dt_bias.unsqueeze(0).unsqueeze(0)
+        dt_full = F.softplus(
+            self.dt_proj(x_conv) + self.dt_bias.unsqueeze(0).unsqueeze(0) + self.dt_init_floor
         )
 
         # A
@@ -620,7 +625,7 @@ class PoSTDecaySSM(nn.Module):
         # mix: (batch, 1, n_heads, n_modes)
 
         # ---- Mode-specific state update (inference) ----
-        dt_squeezed = dt.squeeze(1)  # (batch, d_inner)
+        dt_squeezed = dt_full.squeeze(1)  # (batch, d_inner)
 
         # dA: exp(dt * A) — per (batch, d_inner, d_state)
         # A: (d_inner, d_state)

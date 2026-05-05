@@ -144,6 +144,8 @@ def delta_net_forward_parallel(
         intra_output = torch.matmul(attn_weights, v_h)
 
         # ---- Delta rule update untuk state ----
+        # Store intermediate states so each position uses its own state
+        intermediate_states = []
         for s in range(chunk_s):
             # Decay state
             a_t = alpha_chunk[:, s].unsqueeze(-1).unsqueeze(-1)  # (batch, n_heads, 1, 1)
@@ -151,19 +153,22 @@ def delta_net_forward_parallel(
 
             k_t = k_h[:, :, s:s+1, :]  # (batch, n_heads, 1, d_head)
             v_t = v_h[:, :, s:s+1, :]  # (batch, n_heads, 1, d_head)
-            q_t = q_h[:, :, s:s+1, :]  # (batch, n_heads, 1, d_head)
 
             # Delta rule: new_state = alpha * prev_state + beta * k^T @ v
             # Full delta: delta = beta * (k^T @ v - alpha * prev_state)
             # Simplifikasi: new_state = alpha * state + beta * k^T @ v
             kv_outer = torch.matmul(k_t.transpose(-2, -1), v_t)  # (batch, n_heads, d_head, d_head)
             state = a_t * state + b_t * kv_outer
+            intermediate_states.append(state.clone())
 
         # ---- Inter-chunk output dari state ----
-        # output_from_state: q @ state @ v
+        # Each position s uses the state at position s (not the final state)
         # q_h: (batch, n_heads, chunk_s, d_head)
-        # state: (batch, n_heads, d_head, d_head)
-        state_output = torch.matmul(q_h, state)  # (batch, n_heads, chunk_s, d_head)
+        # intermediate_states[s]: (batch, n_heads, d_head, d_head)
+        state_outputs = torch.cat([
+            torch.matmul(q_h[:, :, s:s+1, :], intermediate_states[s])
+            for s in range(chunk_s)
+        ], dim=2)  # (batch, n_heads, chunk_s, d_head)
 
         # Gabungkan intra-chunk dan state output
         # Interpolasi: gunakan gating berdasarkan posisi
@@ -173,7 +178,7 @@ def delta_net_forward_parallel(
             0, 1, chunk_s, device=q.device, dtype=q.dtype
         ).unsqueeze(0).unsqueeze(0).unsqueeze(-1)  # (1, 1, chunk_s, 1)
 
-        y_chunk = (1 - position_weight) * state_output + position_weight * intra_output
+        y_chunk = (1 - position_weight) * state_outputs + position_weight * intra_output
         # (batch, n_heads, chunk_s, d_head)
 
         y_chunk = rearrange(y_chunk, "b h s d -> b s h d")

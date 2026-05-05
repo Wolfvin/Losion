@@ -275,6 +275,10 @@ class ExpertChoiceMoE(nn.Module):
         # === Compute Routed Expert Output ===
         routed_output = torch.zeros_like(x_flat)
 
+        # Track token counts for renormalization (prevent double-counting
+        # when same token is selected by multiple experts)
+        token_counts = torch.zeros(total_tokens, 1, device=x.device, dtype=x_flat.dtype)
+
         # Track which tokens were processed
         processed_tokens = torch.zeros(
             total_tokens, dtype=torch.bool, device=x.device
@@ -300,7 +304,11 @@ class ExpertChoiceMoE(nn.Module):
             for c in range(capacity):
                 idx = token_indices[c].item()
                 routed_output[idx] += weighted_output[c]
+                token_counts[idx] += 1
                 processed_tokens[idx] = True
+
+        # Renormalize by token count to prevent double-counting
+        routed_output = routed_output / token_counts.clamp(min=1)
 
         # === Handle Dropped Tokens ===
         dropped_mask = ~processed_tokens

@@ -118,13 +118,11 @@ class FineGrainedGate(nn.Module):
 
         # ---- Learnable temperature per head ----
         # Di-log space untuk memastikan positif
-        self.register_buffer(
-            "log_beta_temperature",
-            torch.full((n_heads,), math.log(init_temperature)),
+        self.log_beta_temperature = nn.Parameter(
+            torch.full((n_heads,), math.log(init_temperature))
         )
-        self.register_buffer(
-            "log_alpha_temperature",
-            torch.full((n_heads,), math.log(init_temperature)),
+        self.log_alpha_temperature = nn.Parameter(
+            torch.full((n_heads,), math.log(init_temperature))
         )
 
         # ---- Position bias (opsional) ----
@@ -314,6 +312,8 @@ def fg2_gdn_forward_parallel(
         intra_output = torch.matmul(attn_weights, v_h)
 
         # ---- Delta rule update dengan fine-grained gating ----
+        # Store intermediate states so each position uses its own state
+        intermediate_states = []
         for s in range(chunk_s):
             # Per-head, per-position alpha dan beta
             a_t = alpha_chunk[:, s].unsqueeze(-1).unsqueeze(-1)  # (batch, n_heads, 1, 1)
@@ -327,16 +327,21 @@ def fg2_gdn_forward_parallel(
             # Fine-grained delta rule:
             # new_state = alpha * prev_state + beta * k^T @ v
             state = a_t * state + b_t * kv_outer
+            intermediate_states.append(state.clone())
 
         # ---- Inter-chunk output dari state ----
-        state_output = torch.matmul(q_h, state)
+        # Each position s uses the state at position s (not the final state)
+        state_outputs = torch.cat([
+            torch.matmul(q_h[:, :, s:s+1, :], intermediate_states[s])
+            for s in range(chunk_s)
+        ], dim=2)  # (batch, n_heads, chunk_s, d_head)
 
         # Gabungkan dengan position-dependent weighting
         position_weight = torch.linspace(
             0, 1, chunk_s, device=q.device, dtype=q.dtype
         ).unsqueeze(0).unsqueeze(0).unsqueeze(-1)
 
-        y_chunk = (1 - position_weight) * state_output + position_weight * intra_output
+        y_chunk = (1 - position_weight) * state_outputs + position_weight * intra_output
         y_chunk = rearrange(y_chunk, "b h s d -> b s h d")
         outputs.append(y_chunk)
 

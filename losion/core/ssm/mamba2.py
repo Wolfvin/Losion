@@ -282,7 +282,7 @@ class Mamba2SSD(nn.Module):
 
         # ---- Proyeksi dt terpisah (per channel) ----
         # dt diproyeksikan dari d_inner ke d_inner (satu per channel)
-        self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=True)
+        self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=False)
 
         # ---- Parameter dt per channel (bias) ----
         # Inisialisasi log(dt) secara uniform
@@ -366,9 +366,8 @@ class Mamba2SSD(nn.Module):
         C = ssm_params[..., self.d_state:self.d_state*2]  # (batch, seq_len, d_state)
 
         # dt: proyeksi terpisah per channel + bias
-        dt_bias = self._get_dt()  # (d_inner,)
         dt_full = F.softplus(
-            self.dt_proj(x_conv) + dt_bias.unsqueeze(0).unsqueeze(0)
+            self.dt_proj(x_conv) + self.dt_bias.unsqueeze(0).unsqueeze(0) + self.dt_init_floor
         )  # (batch, seq_len, d_inner)
 
         # ---- Step 4: Hitung parameter A diskret ----
@@ -463,9 +462,8 @@ class Mamba2SSD(nn.Module):
         C = ssm_params[..., self.d_state:self.d_state*2]  # (batch, 1, d_state)
 
         # dt: proyeksi terpisah per channel + bias
-        dt_bias = self._get_dt()  # (d_inner,)
         dt = F.softplus(
-            self.dt_proj(x_conv) + dt_bias.unsqueeze(0).unsqueeze(0)
+            self.dt_proj(x_conv) + self.dt_bias.unsqueeze(0).unsqueeze(0) + self.dt_init_floor
         )  # (batch, 1, d_inner)
 
         A = -torch.exp(self.A_log.float()).to(dtype=x_conv.dtype)  # (d_inner, d_state)

@@ -250,9 +250,9 @@ class BidirectionalTokenUpdate(nn.Module):
 
         scores = torch.matmul(q, k.transpose(-2, -1)) / self.scale
 
-        # LOWER triangular mask: token i can attend to tokens j >= i
-        mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1)
-        scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+        # Bidirectional attention: no causal mask — each token can attend
+        # to all other tokens. This is for training-only non-autoregressive
+        # recycling, not for autoregressive generation.
 
         attn = F.softmax(scores, dim=-1, dtype=torch.float32).to(x.dtype)
 
@@ -519,8 +519,8 @@ class RouterExpertCoevolve(nn.Module):
                 if idx < self.num_pathways:
                     update = self.update_state(idx, output)
                     total_update = total_update + update.sum() * 0.001
-            # Add tiny contribution to preserve gradient path
-            adjusted = adjusted + total_update.unsqueeze(-1) * 0
+            # Add small non-zero contribution to preserve gradient path
+            adjusted = adjusted + total_update.unsqueeze(-1) * 1e-4
 
         return adjusted
 

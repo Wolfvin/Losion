@@ -392,14 +392,12 @@ class RoutingMamba(nn.Module):
 
         # Step 7: Shared A matrix (negative for stability)
         A = -torch.exp(self.A_log.float()).to(dtype=x_conv.dtype)
-        dt_avg = dt.mean(dim=-1)  # (B, L)
-        A_avg = A.mean(dim=0)     # (d_state,)
 
-        # Step 8: SSD chunk scan
+        # Step 8: SSD chunk scan — per-channel dt and A (no averaging)
         y, final_state = ssd_chunk_scan(
             x_seq=x_conv,
-            A=A_avg.unsqueeze(0).unsqueeze(0).expand(batch, seq_len, -1),
-            B=B, C=C, dt=dt_avg,
+            A=A,  # (d_inner, d_state) — per-channel, NOT averaged
+            B=B, C=C, dt=dt,
             chunk_size=self.chunk_size,
             initial_state=state,
         )
@@ -465,7 +463,8 @@ class RoutingMamba(nn.Module):
 
         # Sequential SSM update: O(1) per token
         dt_sq = dt.squeeze(1)                                    # (B, d_inner)
-        dA = torch.exp(dt_sq.unsqueeze(-1) * A.unsqueeze(0))    # (B, d_inner, d_state)
+        dt_A = (dt_sq.unsqueeze(-1) * A.unsqueeze(0)).clamp(max=20.0)
+        dA = torch.exp(dt_A)                                    # (B, d_inner, d_state)
         dB = dt_sq.unsqueeze(-1) * B.squeeze(1).unsqueeze(1)    # (B, d_inner, d_state)
         dBx = x_conv.squeeze(1).unsqueeze(-1) * dB              # (B, d_inner, d_state)
         new_state = dA * state + dBx

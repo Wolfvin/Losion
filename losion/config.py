@@ -408,7 +408,7 @@ class RecurrentConfig:
     max_loop_iters: int = 16
     use_lti_stable: bool = True
     use_act: bool = True
-    act_halting_threshold: float = 0.99
+    act_halting_threshold: float = 0.01
     use_depth_lora: bool = True
     depth_lora_rank: int = 8
     use_loop_index_embedding: bool = True
@@ -931,7 +931,7 @@ class LosionConfig:
             max_loop_iters=rec_raw.get("max_loop_iters", 16),
             use_lti_stable=rec_raw.get("use_lti_stable", True),
             use_act=rec_raw.get("use_act", True),
-            act_halting_threshold=rec_raw.get("act_halting_threshold", 0.99),
+            act_halting_threshold=rec_raw.get("act_halting_threshold", 0.01),
             use_depth_lora=rec_raw.get("use_depth_lora", True),
             depth_lora_rank=rec_raw.get("depth_lora_rank", 8),
             use_loop_index_embedding=rec_raw.get("use_loop_index_embedding", True),

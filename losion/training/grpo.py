@@ -329,9 +329,23 @@ class GRPOTrainer:
         stacked_response_ids = torch.stack(all_response_ids, dim=0)  # [group, batch, gen_len]
         stacked_log_probs = torch.stack(all_log_probs, dim=0)  # [group, batch, gen_len]
 
-        # Hitung reward placeholder
-        # (Dalam implementasi penuh, decode responses dan hitung reward sebenarnya)
-        rewards = torch.randn(group_size, device=device) * 0.5  # Placeholder
+        # Decode responses dan hitung reward sebenarnya
+        if self.reward_fn is not None:
+            # Decode each response to text for reward computation
+            generated_texts = []
+            prompt_texts = []
+            for g in range(group_size):
+                resp_ids = all_response_ids[g]
+                # Simple decode: convert token ids to string representation
+                generated_texts.append(str(resp_ids.tolist()))
+                prompt_texts.append(str(prompts.tolist()))
+            rewards = self.reward_fn(responses=generated_texts, prompts=prompt_texts)
+            if isinstance(rewards, list):
+                rewards = torch.tensor(rewards, device=device, dtype=torch.float32)
+            else:
+                rewards = rewards.to(device)
+        else:
+            rewards = torch.zeros(group_size, device=device)
 
         return GRPOGroupResult(
             prompt_ids=prompts,
@@ -443,9 +457,20 @@ class GRPOTrainer:
         advantages = group_result.advantages  # [group_size]
         old_log_probs = group_result.old_log_probs  # [group_size, seq_len]
 
-        # Hitung new log probs dari model saat ini
-        # (forward pass dengan gradient)
-        new_log_probs = group_result.log_probs  # [group_size, seq_len]
+        # Re-run forward pass with current model to get new log probs
+        # (This is essential: the stored log_probs are from generation time,
+        #  we need fresh log_probs from the current model parameters so that
+        #  the ratio r = exp(new - old) is not always 1.0)
+        prompt_ids = group_result.prompt_ids  # [batch, prompt_len]
+        response_ids = group_result.response_ids  # [group_size, seq_len]
+        full_ids = torch.cat([prompt_ids, response_ids], dim=1)
+        prompt_len = prompt_ids.shape[-1]
+        with torch.enable_grad():
+            new_outputs = self.model(input_ids=full_ids)
+            # Extract per-token log probs from the new forward pass
+            new_all_logits = new_outputs.logits  # (batch, seq_len, vocab_size)
+            # Compute log probs for the actions taken
+            new_log_probs = F.log_softmax(new_all_logits[:, prompt_len - 1:, :], dim=-1).gather(-1, response_ids.unsqueeze(-1)).squeeze(-1)
 
         # Probability ratio: r = exp(new_log_prob - old_log_prob)
         log_ratio = new_log_probs - old_log_probs

@@ -524,10 +524,10 @@ class SmoreMoE(nn.Module):
         # ---- Sub-tree usage ----
         sub_tree_usage = torch.zeros(self.num_sub_trees, device=x.device)
         with torch.no_grad():
-            for expert in self.experts:
+            for e, expert in enumerate(self.experts):
                 w = expert.get_sub_tree_weights()  # (S,)
                 # Weight by how often this expert is selected
-                expert_frac = expert_loads[expert.get_sub_tree_weights().argmax()].float()
+                expert_frac = expert_loads[e].float()
                 sub_tree_usage += w * expert_frac
             # Normalise
             total = sub_tree_usage.sum().clamp(min=1e-8)

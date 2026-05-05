@@ -468,8 +468,14 @@ class KDAMLA(nn.Module):
 
         # Sequential scan untuk linear attention
         outputs = []
-        cumulative_state = torch.zeros_like(state)
-        cumulative_sum = torch.zeros_like(sum_k)
+        if initial_state is not None:
+            cumulative_state = initial_state.clone()
+        else:
+            cumulative_state = torch.zeros_like(state)
+        if initial_sum is not None:
+            cumulative_sum = initial_sum.clone()
+        else:
+            cumulative_sum = torch.zeros_like(sum_k)
 
         for s in range(seq_len):
             k_s = k_feat[:, :, s:s+1, :]
@@ -489,35 +495,23 @@ class KDAMLA(nn.Module):
 
             outputs.append(out_s.squeeze(2))
 
-        # Inter-chunk contribution dari state awal
-        if initial_state is not None:
-            inter_output = torch.matmul(q_feat, state)
-            inter_normalizer = torch.matmul(q_feat, sum_k.unsqueeze(-1)).squeeze(-1)
-        else:
-            inter_output = torch.zeros(
-                batch, n_heads, seq_len, d_head, dtype=q.dtype, device=q.device
-            )
-            inter_normalizer = torch.zeros(
-                batch, n_heads, seq_len, dtype=q.dtype, device=q.device
-            )
-
-        # Stack intra-chunk outputs
-        intra_output = torch.stack(outputs, dim=2)
+        # Stack intra-chunk outputs (already includes initial_state contribution
+        # since cumulative_state was initialized from it)
+        total_output = torch.stack(outputs, dim=2)
         cumulative_sum_expanded = torch.stack(
             [torch.matmul(q_feat[:, :, s:s+1, :], cumulative_sum.unsqueeze(-1)).squeeze(-1).squeeze(2)
              for s in range(seq_len)],
             dim=2,
         )
 
-        # Gabungkan inter-chunk dan intra-chunk
-        total_output = inter_output + intra_output
-        total_normalizer = inter_normalizer.unsqueeze(-1) + cumulative_sum_expanded.unsqueeze(-1) + 1e-6
+        total_normalizer = cumulative_sum_expanded.unsqueeze(-1) + 1e-6
 
         output = total_output / total_normalizer
 
-        # Update state
-        final_state = decay_state * state + cumulative_state
-        final_sum = decay_sum * sum_k + cumulative_sum
+        # Final state is the last value of cumulative_state/cumulative_sum
+        # (already includes decayed initial_state + all intra-chunk updates)
+        final_state = cumulative_state
+        final_sum = cumulative_sum
 
         return output, final_state, final_sum
 

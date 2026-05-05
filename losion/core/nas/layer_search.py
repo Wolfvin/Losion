@@ -839,7 +839,7 @@ def compute_nas_loss(
         metrics.get("arch_loss", 0.0) - task_loss.item(),
         device=task_loss.device,
     )
-    return task_loss, metrics
+    return total_loss, metrics
 
 
 def suggest_architecture(

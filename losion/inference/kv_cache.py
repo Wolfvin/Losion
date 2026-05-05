@@ -523,6 +523,8 @@ class PagedKVCache:
             raise ValueError(
                 f"page_id {page_id} out of range [0, {self.num_pages})"
             )
+        if page_id in self._free_pages:
+            raise ValueError(f"Double free detected for page {page_id}")
         self._free_pages.append(page_id)
         # Sort free list for better allocation patterns
         self._free_pages.sort()

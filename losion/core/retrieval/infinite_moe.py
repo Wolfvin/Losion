@@ -488,8 +488,8 @@ class ExpertCodeRouter(nn.Module):
             )
             mean_dist = pairwise_dists[:, off_diag_mask].mean()
 
-            # Loss: negative because we want to maximise distance
-            code_diversity_loss = -mean_dist
+            # Loss: negative log to bound the diversity loss (prevents unbounded growth)
+            code_diversity_loss = -torch.log(1.0 + mean_dist)
         else:
             code_diversity_loss = torch.tensor(
                 0.0, device=router_logits.device

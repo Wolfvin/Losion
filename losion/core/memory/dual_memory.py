@@ -62,15 +62,15 @@ class WorkingMemory(nn.Module):
     def write(self, entries: torch.Tensor) -> None:
         """Write entries to the ring buffer.
 
-        Buffer entries are detached to ensure they persist across forward
-        passes without causing "backward through graph a second time" errors.
-        Gradient flow to WorkingMemory params is established through the
-        differentiable read path in DualMemorySystem.read() instead.
+        v1.9.1: Stores non-detached values to preserve gradient flow through
+        the consolidation path in LongTermMemory. This enables differentiable
+        retrieve() results. Callers that need persistence across forward passes
+        should handle detachment at a higher level.
         """
         n = entries.shape[0]
         for i in range(n):
             idx = (self._write_ptr + i) % self.capacity
-            self.buffer[idx] = entries[i].detach()
+            self.buffer[idx] = entries[i]  # NOT detached — preserves gradient flow
             self.occupation[idx] = True
         self._write_ptr = (self._write_ptr + n) % self.capacity
         self._count = min(self._count + n, self.capacity)
@@ -208,15 +208,14 @@ class DualMemorySystem(nn.Module):
     def write(self, x: torch.Tensor) -> None:
         """Write to working memory.
 
-        Buffer entries are detached to ensure persistence across forward passes.
-        Gradient flow to DualMemory params is established through a direct
-        differentiable path in read() that processes the current input x
-        through the LongTermMemory params on each step.
+        v1.9.1: Passes non-detached entries to preserve gradient flow through
+        the consolidation path. WorkingMemory.write() now stores non-detached
+        values to enable differentiable retrieve() results.
         """
         if x.dim() == 3:
-            entries = x.reshape(-1, self.d_model).detach()
+            entries = x.reshape(-1, self.d_model)
         else:
-            entries = x.detach()
+            entries = x
         self.working_memory.write(entries)
 
     def read(self, x: torch.Tensor) -> torch.Tensor:

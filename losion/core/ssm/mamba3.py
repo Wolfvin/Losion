@@ -258,10 +258,9 @@ def mamba3_ssd_scan(
     dA_raw = dt_clamped.unsqueeze(-1) * A  # (batch, seq_len, d_state)
     dA = torch.exp(dA_raw.clamp(max=0.0))  # (batch, seq_len, d_state) — selalu <= 1
 
-    # dB = softplus_stabilized(dt) * B — menghindari multiplying two small numbers
-    # Ini lebih stabil daripada dB = dt * B pada dt yang sangat kecil
-    dt_stabilized = F.softplus(dt_clamped)  # (batch, seq_len)
-    dB = dt_stabilized.unsqueeze(-1) * B  # (batch, seq_len, d_state)
+    # dB = dt * B — correct ZOH discretization
+    dt_safe = dt_clamped.clamp(min=1e-6)
+    dB = dt_safe.unsqueeze(-1) * B  # (batch, seq_len, d_state)
 
     # ---- Sequential SSM scan ----
     outputs = []
@@ -405,7 +404,7 @@ class Mamba3SSD(nn.Module):
         self.x_proj = nn.Linear(self.d_inner, d_state * 2, bias=False)
 
         # ---- Proyeksi dt terpisah (per channel) ----
-        self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=True)
+        self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=False)
 
         # ---- Parameter dt bias per channel ----
         # Inisialisasi log(dt) secara uniform (inference-first: range lebih ketat)
@@ -433,6 +432,9 @@ class Mamba3SSD(nn.Module):
 
         # ---- Norm ----
         self.norm = nn.RMSNorm(self.d_inner, eps=1e-5)
+
+        # ---- Token cache for dual shift inference ----
+        self.register_buffer("_prev_token", None)
 
     def _get_dt(self) -> torch.Tensor:
         """
@@ -497,30 +499,26 @@ class Mamba3SSD(nn.Module):
         C = ssm_params[..., self.d_state:self.d_state * 2]  # (batch, seq_len, d_state)
 
         # dt: proyeksi terpisah per channel + bias
-        dt_bias = self._get_dt()  # (d_inner,)
         dt_full = F.softplus(
-            self.dt_proj(x_conv) + dt_bias.unsqueeze(0).unsqueeze(0)
+            self.dt_proj(x_conv) + self.dt_bias.unsqueeze(0).unsqueeze(0) + self.dt_init_floor
         )  # (batch, seq_len, d_inner)
 
         # ---- Step 5: Parameter A diskret ----
         # A_log: (d_inner, d_state) → negatif setelah exp
         A = -torch.exp(self.A_log.float()).to(dtype=x_conv.dtype)  # (d_inner, d_state)
 
-        # Untuk SSD scan: A per (batch, seq_len, d_state), dt per (batch, seq_len)
-        # Gunakan dt rata-rata per token dan A rata-rata per d_inner
-        dt_avg = dt_full.mean(dim=-1)  # (batch, seq_len)
-        A_avg = A.mean(dim=0)  # (d_state,)
-
-        # ---- Step 6: SSD Scan dengan inference-first discretization ----
-        y, final_state = mamba3_ssd_scan(
+        # ---- Step 6: SSD Scan dengan per-channel dt dan A ----
+        # v1.8.0 fix: Gunakan per-channel dt dan A (TIDAK di-average)
+        # untuk mempertahankan input-dependent selectivity.
+        from losion.core.ssm.mamba2 import ssd_chunk_scan as _ssd_chunk_scan
+        y, final_state = _ssd_chunk_scan(
             x_seq=x_conv,
-            A=A_avg.unsqueeze(0).unsqueeze(0).expand(batch, seq_len, -1),
+            A=A,  # (d_inner, d_state) — per-channel, NOT averaged
             B=B,
             C=C,
-            dt=dt_avg,
+            dt=dt_full,  # (batch, seq_len, d_inner) — per-channel, NOT averaged
             chunk_size=self.chunk_size,
             initial_state=initial_state,
-            dt_clamp_max=self.dt_clamp_max,
         )
 
         # ---- Step 7: Skip connection D ----
@@ -576,8 +574,8 @@ class Mamba3SSD(nn.Module):
         # ---- Dual shift inference ----
         if self.use_dual_shift and self.dual_shift is not None:
             # Untuk inference, gunakan shift cache dari token sebelumnya
-            # Simplifikasi: hanya forward shift (prev_token = state terakhir)
-            x, _ = self.dual_shift.forward_inference(x, prev_token=None)
+            x, _ = self.dual_shift.forward_inference(x, prev_token=self._prev_token)
+            self._prev_token = x.detach().clone()
 
         # ---- Konvolusi: skip untuk single-token (asumsi cached) ----
         x_conv = F.silu(x)  # (batch, 1, d_inner)
@@ -588,9 +586,8 @@ class Mamba3SSD(nn.Module):
         C = ssm_params[..., self.d_state:self.d_state * 2]  # (batch, 1, d_state)
 
         # dt: proyeksi terpisah per channel + bias
-        dt_bias = self._get_dt()  # (d_inner,)
         dt = F.softplus(
-            self.dt_proj(x_conv) + dt_bias.unsqueeze(0).unsqueeze(0)
+            self.dt_proj(x_conv) + self.dt_bias.unsqueeze(0).unsqueeze(0) + self.dt_init_floor
         )  # (batch, 1, d_inner)
 
         # A parameter
@@ -606,9 +603,9 @@ class Mamba3SSD(nn.Module):
         dA_raw = dt_clamped.unsqueeze(-1) * A.unsqueeze(0)  # (batch, d_inner, d_state)
         dA = torch.exp(dA_raw.clamp(max=0.0))  # (batch, d_inner, d_state) — selalu <= 1
 
-        # dB = softplus(dt) * B — stabilized input scaling
-        dt_stabilized = F.softplus(dt_clamped)  # (batch, d_inner)
-        dB = dt_stabilized.unsqueeze(-1) * B.squeeze(1).unsqueeze(1)  # (batch, d_inner, d_state)
+        # dB = dt * B — correct ZOH discretization
+        dt_safe = dt_clamped.clamp(min=1e-6)
+        dB = dt_safe.unsqueeze(-1) * B.squeeze(1).unsqueeze(1)  # (batch, d_inner, d_state)
 
         # Outer product: x * dB
         dBx = x_conv.squeeze(1).unsqueeze(-1) * dB  # (batch, d_inner, d_state)

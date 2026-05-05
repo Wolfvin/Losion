@@ -19,6 +19,7 @@ Hardware: Pure PyTorch, compatible with CUDA / ROCm / CPU.
 from __future__ import annotations
 
 import enum
+import math
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -254,6 +255,8 @@ class LogitsProcessor:
         if penalty == 1.0:
             return logits
 
+        logits = logits.clone()
+
         for b in range(logits.shape[0]):
             # Get unique previously generated tokens
             prev_tokens = input_ids[b].unique()
@@ -285,6 +288,8 @@ class LogitsProcessor:
         # Simple n-gram penalty: penalize tokens from the last 3 positions
         ngram_window = 3
         penalty_factor = 1.2  # Mild penalty for n-gram repetition
+
+        logits = logits.clone()
 
         for b in range(logits.shape[0]):
             seq_len = input_ids.shape[1]
@@ -629,6 +634,9 @@ class ContinuousBatcher:
 
         if config is None:
             config = GenerationConfig()
+
+        if input_ids.dim() > 1:
+            input_ids = input_ids.squeeze(0)
 
         request_id = self._next_request_id
         self._next_request_id += 1
@@ -1041,6 +1049,12 @@ class LosionGenerator:
             # Add beam scores
             vocab_size = log_probs.shape[-1]
             next_scores = log_probs + beam_scores.unsqueeze(1)  # [num_beams, vocab_size]
+
+            # Apply length penalty normalization
+            # Normalize scores by sequence length raised to length_penalty power
+            current_length = (step + 1)  # 1-indexed count of generated tokens
+            length_norm = current_length ** config.length_penalty
+            next_scores = next_scores / length_norm
 
             # Flatten and pick top 2*num_beams candidates
             next_scores = next_scores.view(-1)  # [num_beams * vocab_size]

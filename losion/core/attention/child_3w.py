@@ -296,6 +296,14 @@ class Child3WAttention(nn.Module):
         else:
             decompressed = all_child_outputs
 
+        # Track which (token, child) pairs have already been accumulated
+        # to prevent double-counting when the same child is selected
+        # at multiple k positions for the same token
+        seen_children = torch.zeros(
+            batch, seq_len, self.num_children,
+            dtype=torch.bool, device=x.device,
+        )
+
         for k in range(self.top_k):
             # Get weights and indices for this top-k position
             w = weights[:, :, k:k+1]  # (batch, seq_len, 1)
@@ -303,10 +311,14 @@ class Child3WAttention(nn.Module):
 
             # Gather child outputs
             for child_id in range(self.num_children):
-                mask = (idx == child_id)  # (batch, seq_len)
+                selected = (idx == child_id)  # (batch, seq_len)
+                # Skip if this child was already selected at a previous k position
+                mask = selected & ~seen_children[:, :, child_id]
                 if mask.any():
                     child_out = decompressed[child_id]  # (batch, seq_len, d_model)
                     output[mask] += (w * child_out)[mask]
+                # Mark all tokens that selected this child at this k position
+                seen_children[:, :, child_id] |= selected
 
         # Norm and optional dropout
         output = self.output_norm(output)

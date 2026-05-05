@@ -245,10 +245,10 @@ class GatedAttentionHead(nn.Module):
             c_kv_full = torch.cat([c_kv_cached, c_kv_new], dim=1)
             k = self.k_up_proj(c_kv_full)
             v = self.v_up_proj(c_kv_full)
-            present_kv = (c_kv_full,)
+            present_kv = (c_kv_full, None)
         elif self.use_mla:
             c_kv_new = self.kv_norm(self.kv_down_proj(x))
-            present_kv = (c_kv_new,)
+            present_kv = (c_kv_new, None)
         else:
             # Standard KV cache
             if kv_cache is not None:
@@ -591,15 +591,11 @@ class GatedMultiHeadAttention(nn.Module):
             offset_q = cached_kv.shape[1]
             offset_k = cached_kv.shape[1]  # K yang di-cache sudah punya RoPE, K baru perlu offset
 
-        q_rope = q[..., : self.d_kv // 2].contiguous()
-        k_rope = k[..., : self.d_kv // 2].contiguous()
-
-        q_rope = self.rope(q_rope, offset=offset_q)
-        k_rope = self.rope(k_rope, offset=offset_k)
-
+        # ---- Apply RoPE to Q (K RoPE deferred to per-path handling) ----
         half = self.d_kv // 2
+        q_rope = q[..., :half].contiguous()
+        q_rope = self.rope(q_rope, offset=offset_q)
         q = torch.cat([q_rope, q[..., half:]], dim=-1)
-        k = torch.cat([k_rope, k[..., half:]], dim=-1)
 
         # ---- KV cache handling ----
         if self.use_mla:
@@ -613,13 +609,18 @@ class GatedMultiHeadAttention(nn.Module):
             k_full = self.k_up_proj(c_kv_full).view(batch, -1, self.n_heads, self.d_kv)
             v_full = self.v_up_proj(c_kv_full).view(batch, -1, self.n_heads, self.d_kv)
 
-            # Apply RoPE to reconstructed K — v1.6.1 fix: gunakan offset yang benar
+            # Apply RoPE to reconstructed K — single application with correct offset
             k_full_rope = k_full[..., :half].contiguous()
-            k_full_rope = self.rope(k_full_rope, offset=0)  # K direkonstruksi dari scratch, offset 0 karena sudah mencakup full sequence
+            k_full_rope = self.rope(k_full_rope, offset=0)  # offset=0 because k_full starts from position 0
             k_full = torch.cat([k_full_rope, k_full[..., half:]], dim=-1)
 
             present_kv = (c_kv_full, None)
         else:
+            # Apply RoPE to K for non-MLA path (cached K already has RoPE)
+            k_rope = k[..., :half].contiguous()
+            k_rope = self.rope(k_rope, offset=offset_k)
+            k = torch.cat([k_rope, k[..., half:]], dim=-1)
+
             if cached_kv is not None:
                 cached_k, cached_v = cached_kv
                 k_full = torch.cat([cached_k, k], dim=1)

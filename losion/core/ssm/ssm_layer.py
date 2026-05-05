@@ -563,8 +563,8 @@ class SSMTerpaduLayer(nn.Module):
         h_dim = n_heads * d_head
 
         wkv_state = (
-            torch.zeros(batch_size, h_dim, d_head, dtype=dtype, device=device),
-            torch.zeros(batch_size, h_dim, d_head, dtype=dtype, device=device),
+            torch.zeros(batch_size, h_dim, dtype=dtype, device=device),
+            torch.zeros(batch_size, h_dim, dtype=dtype, device=device),
         )
 
         delta_state = torch.zeros(

@@ -187,6 +187,7 @@ class LiquidSSD(nn.Module):
         self.chunk_size = chunk_size
         self.num_heads = num_heads
         self.d_inner = int(expand * d_model)
+        self.dt_init_floor = dt_init_floor
 
         # ---- Input projection (same as Mamba2SSD) ----
         self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=use_bias)
@@ -203,7 +204,7 @@ class LiquidSSD(nn.Module):
 
         # ---- SSM parameter projections ----
         self.x_proj = nn.Linear(self.d_inner, d_state * 2, bias=False)
-        self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=True)
+        self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=False)
 
         # ---- dt bias (per-channel, same init as Mamba2SSD) ----
         dt_init = torch.exp(
@@ -276,11 +277,17 @@ class LiquidSSD(nn.Module):
         c_inner = self.complexity_to_inner(complexity)  # (B, S, d_inner)
 
         # Per-d_inner scale (learnable, initialised near 0)
-        # complexity_scale has shape (num_heads,); we project via
-        # complexity_to_inner which already produces (B, S, d_inner).
-        # A simpler and more stable approach: use a single global
-        # scalar scale that applies uniformly.
-        scale = torch.sigmoid(self.complexity_scale).mean()  # scalar
+        # complexity_scale has shape (num_heads,); expand to (d_inner,)
+        # so each head group has its own scale instead of a single scalar.
+        scale = torch.sigmoid(self.complexity_scale)  # (num_heads,)
+        channels_per_head = self.d_inner // self.complexity_scale.shape[0]
+        scale_expanded = scale.repeat_interleave(channels_per_head)  # (d_inner,)
+        # Pad if d_inner is not evenly divisible
+        if scale_expanded.shape[0] < self.d_inner:
+            pad = self.d_inner - scale_expanded.shape[0]
+            scale_expanded = F.pad(scale_expanded, (0, pad), value=0.0)
+        # Reshape for broadcasting: (1, 1, d_inner)
+        scale_expanded = scale_expanded.unsqueeze(0).unsqueeze(0)
 
         # Modulation: (1 + scale * (2 * c_projected - 1))
         # c_inner ∈ (0, 1)-ish after sigmoid in the gate,
@@ -288,7 +295,7 @@ class LiquidSSD(nn.Module):
         # are unbounded.  We apply sigmoid to normalise first.
         c_normalised = torch.sigmoid(c_inner)  # (B, S, d_inner) ∈ (0, 1)
 
-        modulation = 1.0 + scale * (2.0 * c_normalised - 1.0)
+        modulation = 1.0 + scale_expanded * (2.0 * c_normalised - 1.0)
 
         dt_eff = dt * modulation
         # Clamp to avoid numerical issues
@@ -399,14 +406,13 @@ class LiquidSSD(nn.Module):
         B = ssm_params[..., : self.d_state]
         C = ssm_params[..., self.d_state : self.d_state * 2]
 
-        dt_bias = self._get_dt()
-        dt = F.softplus(
-            self.dt_proj(x_conv) + dt_bias.unsqueeze(0).unsqueeze(0)
+        dt_full = F.softplus(
+            self.dt_proj(x_conv) + self.dt_bias.unsqueeze(0).unsqueeze(0) + self.dt_init_floor
         )  # (B, S, d_inner)
 
         # ---- Step 3b: Liquid modulation ----
         if complexity is not None:
-            dt = self._apply_liquid_modulation(dt, complexity)
+            dt_full = self._apply_liquid_modulation(dt_full, complexity)
 
         # ---- Step 4: A in discrete domain ----
         A = -torch.exp(self.A_log.float()).to(dtype=x_conv.dtype)  # (d_inner, d_state)
@@ -417,25 +423,29 @@ class LiquidSSD(nn.Module):
             # Reduce complexity to a scalar per token
             c_scalar = complexity.mean(dim=-1)  # (B, S)
             # A modulation: A_eff = A * (1 - mix * complexity)
-            # Higher complexity → less negative A → slower decay → more memory
-            # We broadcast: (B, S, 1) * (1, 1, d_state) → (B, S, d_state)
-            A_avg = A.mean(dim=0)  # (d_state,)
-            a_mod = 1.0 - (mix.mean() * c_scalar).unsqueeze(-1)  # (B, S, 1)
-            A_avg_expanded = A_avg.unsqueeze(0).unsqueeze(0).expand(batch, seq_len, -1)
-            A_mod = A_avg_expanded * a_mod
+            # Per-channel modulation: mix is (H,) → scale per channel
+            # Expand mix to (d_inner,): each head covers channels_per_head channels
+            channels_per_head = self.d_inner // self.num_heads
+            mix_expanded = mix.repeat_interleave(channels_per_head)
+            if mix_expanded.shape[0] < self.d_inner:
+                pad = self.d_inner - mix_expanded.shape[0]
+                mix_expanded = F.pad(mix_expanded, (0, pad), value=0.0)
+            # A_eff per channel: (d_inner, d_state)
+            a_mod = 1.0 - (mix_expanded.unsqueeze(-1) * c_scalar.mean(dim=-1).mean(dim=-1)).unsqueeze(-1)
+            A_eff = A * a_mod
         else:
-            A_avg = A.mean(dim=0)
-            A_mod = A_avg.unsqueeze(0).unsqueeze(0).expand(batch, seq_len, -1)
+            A_eff = A
 
-        dt_avg = dt.mean(dim=-1)  # (B, S)
+        dt_eff = dt_full
 
-        # ---- Step 5: SSD scan ----
-        y, final_state = self._ssd_scan(
+        # ---- Step 5: SSD scan with per-channel dt and A ----
+        from losion.core.ssm.mamba2 import ssd_chunk_scan as _ssd_chunk_scan
+        y, final_state = _ssd_chunk_scan(
             x_seq=x_conv,
-            A=A_mod,
+            A=A_eff,  # (d_inner, d_state) — per-channel
             B=B,
             C=C,
-            dt=dt_avg,
+            dt=dt_eff,  # (B, S, d_inner) — per-channel
             initial_state=initial_state,
         )
 
@@ -477,32 +487,28 @@ class LiquidSSD(nn.Module):
 
         ssm_params = self.x_proj(x_conv)
         B = ssm_params[..., : self.d_state]
-        C = ssm_params[..., self.d_state :]
+        C = ssm_params[..., self.d_state:self.d_state * 2]
 
-        dt_bias = self._get_dt()
-        dt = F.softplus(
-            self.dt_proj(x_conv) + dt_bias.unsqueeze(0).unsqueeze(0)
+        dt_full = F.softplus(
+            self.dt_proj(x_conv) + self.dt_bias.unsqueeze(0).unsqueeze(0) + self.dt_init_floor
         )
 
-        # Liquid modulation
         if complexity is not None:
-            dt = self._apply_liquid_modulation(dt, complexity)
+            dt_full = self._apply_liquid_modulation(dt_full, complexity)
 
         A = -torch.exp(self.A_log.float()).to(dtype=x_conv.dtype)
 
-        # A modulation for inference
+        # A modulation for inference — apply before exponentiation (consistent with training)
         if complexity is not None:
             mix = torch.sigmoid(self.mix_coeff)
             c_scalar = complexity.mean(dim=-1)  # (B, 1)
             a_mod = 1.0 - (mix.mean() * c_scalar)  # (B, 1)
+            A_mod = A * a_mod.unsqueeze(-1)  # a_mod applied to A, not to exp(dA)
         else:
-            a_mod = None
+            A_mod = A
 
-        dt_squeezed = dt.squeeze(1)
-        dA = torch.exp(dt_squeezed.unsqueeze(-1) * A.unsqueeze(0))
-
-        if a_mod is not None:
-            dA = dA * a_mod.unsqueeze(-1)
+        dt_squeezed = dt_full.squeeze(1)
+        dA = torch.exp(dt_squeezed.unsqueeze(-1) * A_mod.unsqueeze(0))
 
         dB = dt_squeezed.unsqueeze(-1) * B.squeeze(1).unsqueeze(1)
         dBx = x_conv.squeeze(1).unsqueeze(-1) * dB
@@ -857,7 +863,8 @@ class LiquidSSMTerpaduLayer(nn.Module):
             # Auxiliary: depth entropy loss (encourages decisive choice)
             entropy = -(depth_probs * (depth_probs + 1e-8).log()).sum(dim=-1)  # (B, S)
             max_entropy = math.log(NUM_DEPTH_LEVELS)
-            aux_losses["depth_entropy"] = self.depth_entropy_weight * entropy.mean()
+            normalized_entropy = entropy / max_entropy
+            aux_losses["depth_entropy"] = self.depth_entropy_weight * normalized_entropy.mean()
 
             # Auxiliary: complexity L1 (mild sparsity on complexity scores)
             aux_losses["complexity_l1"] = 0.001 * complexity.mean()
