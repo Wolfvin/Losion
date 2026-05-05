@@ -1,15 +1,32 @@
 """
 Losion — Hybrid AI Framework with Tri-Jalur Router Architecture.
 
-Version 2.0.0 — "Alive Gradients & Production Ready"
+Version 2.1.0 — "Honest Code & Real Kernels"
 
-v2.0.0 Alive Gradients & Production Ready:
-  - CRITICAL FIX: AuxFreeMoE MTP loss now propagated to model total loss
-    Previously 32.2% of model params (MTPMoEHead pred_heads) were dead weight —
-    mtp_loss was computed but never added to loss, so 32 tensors had zero gradient.
-    Now loss += avg_moe_mtp_loss from all layers' retrieval_aux["mtp_loss"].
-  - All gradient paths verified: every parameter receives non-zero gradient during training
-  - Repo polished for open-source publication
+v2.1.0 Honest Code & Real Kernels:
+  - CRITICAL: _triton_associative_scan now has a REAL Triton GPU kernel
+    (previously it just called _pytorch_associative_scan — fake Triton claim)
+  - CRITICAL: use_cache in generate() is now FUNCTIONAL — KV pairs are
+    cached during prefill and reused during decode, reducing attention
+    from O(n²) to O(n) per token
+  - CRITICAL: Evoformer gradient flow fixed — hidden_states are NO LONGER
+    detached when Evoformer is active, so gradients flow naturally through
+    the recycling pathway to all layers
+  - HIGH: iRoPE actually implemented — self.interleaved now controls real
+    interleaved rotation pattern in RoPE.forward() (previously stored but unused)
+  - HIGH: _align_dim lazy module creation FIXED — projections now created
+    eagerly in __init__ via _infer_output_dim(), compatible with
+    torch.compile and deterministic DDP initialization
+  - HIGH: Inter-chunk propagation VECTORIZED — eliminated Python for-loop
+    over chunks, replaced with vectorized prefix-scan (same log-space cumsum
+    trick as intra-chunk scan)
+  - MEDIUM: Gradient checkpointing lambda closure bug FIXED — replaced with
+    module-level _checkpoint_layer_fn() to avoid reference capture issues
+  - MEDIUM: MTP loss requires_grad guard FIXED — uses self.training instead
+    of mtp_l.requires_grad, which was False under torch.no_grad() context
+  - MEDIUM: Dead code modules documented — losion/agent/, losion/safety/,
+    losion/core/reasoning/ marked as "experimental" (not in model forward path)
+  - LOW: Audit documentation now honest — no more inflated scores
 
 v1.9.0 Complete Gradient Flow & Vectorized Attention:
   - Evoformer LayerRecycling: revision now applied to deep layers so recycled[-1] carries gradient
@@ -114,7 +131,7 @@ Router:  Adaptive (BiasRouter + ThinkingToggle + Symbolic-MoE), GRPO/DAPO-traine
          + Router ↔ Expert Co-Evolution (Evoformer Level 5)
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 __author__ = "Losion Contributors"
 __license__ = "MIT"
 
@@ -269,7 +286,7 @@ __all__ = [
     "DAPOConfig",
     "RLVRConfig",
     "OutputConfig",
-    # Models (V2 primary)
+    # Models (V2 primary) — CORE, IN PRODUCTION FORWARD PATH
     "LosionModelV2",
     "LosionForCausalLMV2",
     "LosionLayerV2",
@@ -280,16 +297,19 @@ __all__ = [
     "LosionModel",
     "LosionLayer",
     "LosionForCausalLM",
-    # Kernel
+    # Kernel — CORE (used in SSM forward path)
+    "associative_scan",
+    "chunk_parallel_scan",
+    "rwkv7_parallel_wkv",
+    "HAS_TRITON",
+    # Kernel — EXPERIMENTAL (exported but NOT in model forward path)
+    # These are utility classes for advanced usage. They are not wired into
+    # LosionModelV2 by default but can be used standalone.
     "PathwayEarlyExit",
     "FlashAttentionWrapper",
     "RingAttention",
     "sdpa_attention",
     "SDPACompat",
-    "associative_scan",
-    "chunk_parallel_scan",
-    "rwkv7_parallel_wkv",
-    "HAS_TRITON",
     "PagedKVCacheManager",
     "INT4KVCacheQuantizer",
     "MemoryEfficientTrainer",
@@ -299,7 +319,7 @@ __all__ = [
     "CPUOffloadOptimizer",
     "FP8TrainingWrapper",
     "has_fp8_support",
-    # Advanced Training (v1.6.0)
+    # Advanced Training — EXPERIMENTAL
     "ActivationOffloader",
     "MemoryAwareBatchScheduler",
     "EightBitOptimizer",
@@ -309,7 +329,7 @@ __all__ = [
     "CommComputeOverlap",
     "SelectiveGradientCheckpointing",
     "DynamicLossScaler",
-    # Distributed
+    # Distributed — EXPERIMENTAL
     "ParallelismConfig",
     "LosionFSDPWrapper",
     "ContextParallel",

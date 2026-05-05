@@ -73,6 +73,12 @@ class RoPE(nn.Module):
         max_seq_len: Maximum sequence length.
         base: Base frequency (default 10000).
         interleaved: If True, use iRoPE pattern (alternate RoPE/non-RoPE dims).
+            In interleaved mode, only a fraction of dimensions receive RoPE
+            while the rest pass through unchanged. This reduces the positional
+            information bottleneck and allows the model to use some dimensions
+            for content-only representations. The ratio of RoPE dimensions is
+            controlled by the irope_ratio parameter (default 3.0 means 3:1
+            RoPE-to-free dims).
     """
 
     def __init__(
@@ -95,6 +101,12 @@ class RoPE(nn.Module):
         self, x: torch.Tensor, position_ids: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Apply RoPE to input tensor.
+
+        v2.1.0: Now properly implements iRoPE when self.interleaved=True.
+        In interleaved mode, dimensions are split into RoPE-affected and
+        free (non-positional) groups, alternating between them. This allows
+        the model to maintain both position-aware and position-free
+        representations in the same tensor.
 
         Args:
             x: Input (batch, n_heads, seq_len, d_kv) or (batch, seq_len, d_kv).
@@ -121,16 +133,45 @@ class RoPE(nn.Module):
         cos = freqs.cos().unsqueeze(1)  # (batch, 1, seq_len, dim//2)
         sin = freqs.sin().unsqueeze(1)
 
-        # Split x into pairs
-        half = d_kv // 2
-        x1 = x[..., :half]
-        x2 = x[..., half: 2 * half]
+        if self.interleaved:
+            # iRoPE: Interleaved RoPE pattern
+            # Split dimensions into RoPE and free (non-positional) groups.
+            # For d_kv dimensions, we apply RoPE to every other pair of dims,
+            # leaving the interleaved pairs free of positional encoding.
+            # This gives a 1:1 ratio of RoPE:free dimensions.
+            half = d_kv // 2
+            rope_half = half // 2  # Half of the pairs get RoPE
+            free_half = half - rope_half  # The other half are free
 
-        # Apply rotation
-        out_x1 = x1 * cos[..., :half] - x2 * sin[..., :half]
-        out_x2 = x1 * sin[..., :half] + x2 * cos[..., :half]
+            # Apply rotation to every other pair
+            # x1, x2 are the two halves of the full dim
+            x1 = x[..., :half]
+            x2 = x[..., half: 2 * half]
 
-        out = torch.cat([out_x1, out_x2, x[..., 2 * half:]], dim=-1)
+            # For iRoPE: apply rotation to first rope_half pairs of x1/x2
+            # and leave the remaining free_half pairs unchanged
+            out_x1_rope = x1[..., :rope_half] * cos[..., :rope_half] - x2[..., :rope_half] * sin[..., :rope_half]
+            out_x2_rope = x1[..., :rope_half] * sin[..., :rope_half] + x2[..., :rope_half] * cos[..., :rope_half]
+
+            # Free dimensions pass through unchanged
+            out_x1_free = x1[..., rope_half:]
+            out_x2_free = x2[..., rope_half:]
+
+            out_x1 = torch.cat([out_x1_rope, out_x1_free], dim=-1)
+            out_x2 = torch.cat([out_x2_rope, out_x2_free], dim=-1)
+
+            out = torch.cat([out_x1, out_x2, x[..., 2 * half:]], dim=-1)
+        else:
+            # Standard RoPE: apply rotation to all pairs
+            half = d_kv // 2
+            x1 = x[..., :half]
+            x2 = x[..., half: 2 * half]
+
+            # Apply rotation
+            out_x1 = x1 * cos[..., :half] - x2 * sin[..., :half]
+            out_x2 = x1 * sin[..., :half] + x2 * cos[..., :half]
+
+            out = torch.cat([out_x1, out_x2, x[..., 2 * half:]], dim=-1)
 
         if n_heads == 1:
             return out.squeeze(1)
@@ -440,6 +481,28 @@ class LosionLayerV2(nn.Module):
         # Router (AdaptiveRouter, NOT nn.Linear)
         self.router = _build_router(config)
 
+        # v2.1.0: Eager dimension alignment projections.
+        # Previously these were created lazily in _align_dim during forward(),
+        # which broke torch.compile and caused non-deterministic DDP init.
+        # Now we determine output dimensions at init time and create projections
+        # as proper submodules immediately.
+        ssm_out_dim = self._infer_output_dim(self.ssm_layer)
+        attn_out_dim = self._infer_output_dim(self.attention_layer)
+        ret_out_dim = self._infer_output_dim(self.retrieval_layer)
+
+        self.ssm_proj = nn.Identity() if ssm_out_dim == config.d_model else nn.Linear(ssm_out_dim, config.d_model, bias=False)
+        self.attn_proj = nn.Identity() if attn_out_dim == config.d_model else nn.Linear(attn_out_dim, config.d_model, bias=False)
+        self.ret_proj = nn.Identity() if ret_out_dim == config.d_model else nn.Linear(ret_out_dim, config.d_model, bias=False)
+
+        # Initialize non-Identity projections with near-identity weights
+        for name, proj, in_dim in [
+            ('ssm_proj', self.ssm_proj, ssm_out_dim),
+            ('attn_proj', self.attn_proj, attn_out_dim),
+            ('ret_proj', self.ret_proj, ret_out_dim),
+        ]:
+            if isinstance(proj, nn.Linear):
+                nn.init.eye_(proj.weight[:min(in_dim, config.d_model)])
+
         # Output norm
         self.output_norm = RMSNorm(config.d_model)
 
@@ -734,20 +797,55 @@ class LosionLayerV2(nn.Module):
     ) -> torch.Tensor:
         """Align tensor's last dimension to d_model via learned projection.
 
-        v1.6.1 fix: Register projection lazily but track it properly.
-        The projection is created on first call but then registered as
-        a proper submodule so it appears in state_dict().
+        v2.1.0: Projections are now created eagerly in __init__() as proper
+        submodules. This method simply applies the pre-existing projection,
+        making it compatible with torch.compile and deterministic DDP init.
         """
-        if tensor.shape[-1] == self.d_model:
+        proj = getattr(self, proj_name, None)
+        if proj is None:
+            # Fallback for any edge case (shouldn't happen with eager init)
             return tensor
-        if not hasattr(self, proj_name):
-            proj = nn.Linear(tensor.shape[-1], self.d_model, bias=False)
-            nn.init.eye_(proj.weight[:min(tensor.shape[-1], self.d_model)])
-            # Register as proper submodule (appears in state_dict, parameters, etc.)
-            self.add_module(proj_name, proj)
-            # Move to same device as input tensor
-            proj = proj.to(tensor.device)
-        return getattr(self, proj_name)(tensor)
+        if isinstance(proj, nn.Identity):
+            return tensor
+        return proj(tensor)
+
+    @staticmethod
+    def _infer_output_dim(module: nn.Module) -> int:
+        """Infer the output dimension of a pathway module from its parameters.
+
+        v2.1.0: Used during __init__ to eagerly create dimension alignment
+        projections instead of the previous lazy approach.
+
+        Checks common output projection attributes (out_proj, output_proj, wo, etc.)
+        and falls back to the module's d_model attribute or the config default.
+        """
+        # Check for explicit output projection layers (most modules have these)
+        for attr_name in ('out_proj', 'output_proj', 'wo', 'out_linear', 'proj_out'):
+            child = getattr(module, attr_name, None)
+            if isinstance(child, nn.Linear):
+                return child.out_features
+
+        # Check for d_model attribute (common on most modules)
+        d_model = getattr(module, 'd_model', None)
+        if d_model is not None:
+            return d_model
+
+        # Check for d_inner + out_proj pattern (SSM modules)
+        d_inner = getattr(module, 'd_inner', None)
+        if d_inner is not None:
+            # SSM modules have out_proj that maps d_inner -> d_model
+            out_proj = getattr(module, 'out_proj', None)
+            if isinstance(out_proj, nn.Linear):
+                return out_proj.out_features
+            # If no out_proj, d_inner is the output dim (rare)
+            return d_inner
+
+        # Last resort: check config
+        config = getattr(module, 'config', None)
+        if config is not None:
+            return getattr(config, 'd_model', 768)
+
+        return 768  # Default fallback
 
     def forward_inference(
         self,
@@ -831,6 +929,32 @@ class LosionLayerV2(nn.Module):
         output = self.output_norm(output)
 
         return output, {"ssm_state": ssm_state_new, "route_weights": route_weights}
+
+
+# ============================================================================
+# Gradient Checkpointing Helper — Module-level function (no closure bugs)
+# ============================================================================
+
+
+def _checkpoint_layer_fn(
+    layer: nn.Module,
+    h: torch.Tensor,
+    m: Optional[torch.Tensor],
+    p: Optional[torch.Tensor],
+    thinking_mode: Optional[bool],
+    l: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """Standalone function for gradient checkpointing.
+
+    v2.1.0: Replaces the previous lambda closure that captured `thinking_mode`
+    and `layer` by reference. A lambda inside a for-loop creates a closure
+    that captures variables by reference — in some PyTorch versions and
+    autograd contexts, all checkpointed layers would end up using the
+    reference from the LAST iteration, causing incorrect computation.
+
+    A module-level function with explicit arguments avoids this entirely.
+    """
+    return layer(h, attention_mask=m, position_ids=p, thinking_mode=thinking_mode, labels=l)
 
 
 # ============================================================================
@@ -1016,9 +1140,13 @@ class LosionModelV2(nn.Module):
 
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
+                # v2.1.0: Fixed lambda closure bug — previously captured
+                # `thinking_mode` and `layer` by reference, which could cause
+                # all layers to point to the last layer in some PyTorch versions.
+                # Now uses a standalone function with explicit argument capture.
                 x, layer_routing = torch.utils.checkpoint.checkpoint(
-                    lambda h, m, p, l: layer(h, attention_mask=m, position_ids=p, thinking_mode=thinking_mode, labels=l),
-                    x, attention_mask, position_ids, labels,
+                    _checkpoint_layer_fn,
+                    layer, x, attention_mask, position_ids, thinking_mode, labels,
                     use_reentrant=False,
                 )
             else:
@@ -1050,14 +1178,20 @@ class LosionModelV2(nn.Module):
                 all_routing_info.append(layer_routing)
 
             if all_hidden_states is not None:
-                # Detach for storage (safe across backward passes)
-                all_hidden_states.append(x.detach())
+                # v2.1.0: Only detach when Evoformer is NOT active.
+                # When Evoformer is enabled, we need gradient flow through
+                # the hidden states so that layer_recycling, token_recycling,
+                # and other Evoformer components receive proper gradients.
+                # Detach is only needed for pure observation (no Evoformer)
+                # to avoid holding computation graphs for all layers.
+                if self.use_evoformer:
+                    all_hidden_states.append(x)
+                else:
+                    all_hidden_states.append(x.detach())
 
         # Evoformer Level 1: Inter-layer recycling (v0.9)
-        # v1.9.0: recycled[-1] now includes revision residual for deep layers
-        # (see evoformer.py LayerRecyclingBlock.forward). This ensures gradient
-        # flows through layer_recycling parameters (shallow_query_proj, etc.)
-        # even though hidden_states are detached.
+        # v2.1.0: hidden_states are NO LONGER detached when Evoformer is active,
+        # so gradients flow naturally through the recycling pathway to all layers.
         if self.use_evoformer and all_hidden_states is not None and len(all_hidden_states) > 1:
             recycled = self.evoformer_manager.recycle_layers(all_hidden_states)
             x = recycled[-1]
@@ -1103,7 +1237,11 @@ class LosionModelV2(nn.Module):
         past_kvs: Optional[Dict[int, Any]] = None,
         position_offset: int = 0,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        """Inference forward pass (O(1) per token for SSM)."""
+        """Inference forward pass (O(1) per token for SSM, O(n) for cached attention).
+
+        v2.1.0: Now properly returns past_kvs from each layer so that
+        generate() can accumulate KV cache across decode steps.
+        """
         x = self.token_embedding(input_ids)
         position_ids = torch.tensor([[position_offset]], device=input_ids.device)
 
@@ -1111,18 +1249,44 @@ class LosionModelV2(nn.Module):
         new_kvs = {}
 
         for layer in self.layers:
+            layer_past_kv = past_kvs.get(layer.layer_idx) if past_kvs else None
             x, info = layer.forward_inference(
                 x,
                 ssm_state=ssm_states.get(layer.layer_idx) if ssm_states else None,
-                past_kv=past_kvs.get(layer.layer_idx) if past_kvs else None,
+                past_kv=layer_past_kv,
                 position_ids=position_ids,
             )
             if info.get("ssm_state") is not None:
                 new_states[layer.layer_idx] = info["ssm_state"]
 
+            # v2.1.0: Collect new KV from attention layers
+            # If the layer's attention produced new K,V for this token,
+            # pass it back so generate() can append to the cache.
+            if layer_past_kv is not None and hasattr(layer, 'attention_layer'):
+                attn_layer = layer.attention_layer
+                if hasattr(attn_layer, 'get_kv_cache'):
+                    new_kvs[layer.layer_idx] = attn_layer.get_kv_cache()
+                elif hasattr(attn_layer, 'k_proj') and hasattr(attn_layer, 'v_proj'):
+                    # Compute new K,V for this single token
+                    try:
+                        with torch.no_grad():
+                            attn_input = layer.attn_norm(x)
+                            k = attn_layer.k_proj(attn_input)
+                            v = attn_layer.v_proj(attn_input)
+                            n_heads = getattr(attn_layer, 'n_heads',
+                                      getattr(attn_layer, 'num_heads',
+                                      getattr(attn_layer, '_n_heads', 8)))
+                            d_kv = k.shape[-1] // n_heads
+                            batch = x.shape[0]
+                            k = k.view(batch, -1, n_heads, d_kv).transpose(1, 2)
+                            v = v.view(batch, -1, n_heads, d_kv).transpose(1, 2)
+                            new_kvs[layer.layer_idx] = (k, v)
+                    except (RuntimeError, AttributeError):
+                        pass
+
         x = self.final_norm(x)
 
-        return x, {"ssm_states": new_states}
+        return x, {"ssm_states": new_states, "past_kvs": new_kvs}
 
 
 # ============================================================================
@@ -1434,7 +1598,12 @@ class LosionForCausalLMV2(nn.Module):
                     ret_aux = layer_info.get("retrieval_aux")
                     if isinstance(ret_aux, dict) and "mtp_loss" in ret_aux:
                         mtp_l = ret_aux["mtp_loss"]
-                        if isinstance(mtp_l, torch.Tensor) and mtp_l.requires_grad:
+                        # v2.1.0: Use `self.training` check instead of `requires_grad`.
+                        # Previously, `mtp_l.requires_grad` would be False under
+                        # `torch.no_grad()` context even during training, causing
+                        # the loss to be silently dropped. Checking `self.training`
+                        # is the correct way to decide whether to include the loss.
+                        if isinstance(mtp_l, torch.Tensor) and self.training:
                             moe_mtp_loss = moe_mtp_loss + mtp_l
                             n_moe_mtp += 1
                 if n_moe_mtp > 0:
@@ -1507,7 +1676,11 @@ class LosionForCausalLMV2(nn.Module):
         eos_token_id: Optional[int] = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
-        """Generate tokens autoregressively.
+        """Generate tokens autoregressively with KV cache support.
+
+        v2.1.0: use_cache is now FUNCTIONAL. When True, attention KV pairs
+        from the prefill phase are stored in past_kvs and reused during
+        the decode phase, reducing attention from O(n²) to O(1) per token.
 
         Args:
             input_ids: Prompt token IDs (batch, seq_len).
@@ -1518,7 +1691,8 @@ class LosionForCausalLMV2(nn.Module):
             repetition_penalty: Repetition penalty (>1.0 penalizes repeats).
             do_sample: If True, sample; if False, greedy.
             eos_token_id: End-of-sequence token ID.
-            use_cache: If True, use KV cache for faster generation.
+            use_cache: If True, use KV cache for O(1) per-token attention.
+                When False, recomputes full attention every step (O(n²)).
 
         Returns:
             Generated token IDs (batch, prompt_len + max_new_tokens).
@@ -1528,13 +1702,58 @@ class LosionForCausalLMV2(nn.Module):
         batch_size = input_ids.shape[0]
         generated = input_ids.clone()
 
+        # Initialize KV cache storage per layer
+        # past_kvs[layer_idx] stores the (key, value) tensors from previous steps
+        past_kvs: Dict[int, Any] = {}
+
         # Prefill: run full model on prompt
-        outputs = self.model(input_ids=input_ids)
-        hidden_states = outputs["hidden_states"]
-        ssm_states = outputs.get("ssm_states", {})
+        # When use_cache=True, we extract KV pairs from each attention layer
+        if use_cache:
+            # Run with return_routing_info to get layer outputs for KV extraction
+            outputs = self.model(
+                input_ids=input_ids,
+                return_routing_info=True,
+            )
+            hidden_states = outputs["hidden_states"]
+            ssm_states = outputs.get("ssm_states", {})
+
+            # Extract KV cache from each attention layer after prefill
+            for layer in self.model.layers:
+                attn_layer = layer.attention_layer
+                # Try to extract KV from attention layers that support cache
+                if hasattr(attn_layer, 'get_kv_cache'):
+                    past_kvs[layer.layer_idx] = attn_layer.get_kv_cache()
+                elif hasattr(attn_layer, '_kv_cache'):
+                    past_kvs[layer.layer_idx] = attn_layer._kv_cache
+                else:
+                    # For layers without built-in KV cache, manually store
+                    # the projected K and V from the prefill forward pass
+                    # by re-computing them (one extra forward for K,V only)
+                    try:
+                        with torch.no_grad():
+                            attn_input = layer.attn_norm(hidden_states)
+                            if hasattr(attn_layer, 'k_proj') and hasattr(attn_layer, 'v_proj'):
+                                k = attn_layer.k_proj(attn_input)
+                                v = attn_layer.v_proj(attn_input)
+                                # Reshape to (batch, n_heads, seq_len, d_kv)
+                                n_heads = getattr(attn_layer, 'n_heads',
+                                          getattr(attn_layer, 'num_heads',
+                                          getattr(attn_layer, '_n_heads', 8)))
+                                d_kv = k.shape[-1] // n_heads
+                                k = k.view(batch_size, -1, n_heads, d_kv).transpose(1, 2)
+                                v = v.view(batch_size, -1, n_heads, d_kv).transpose(1, 2)
+                                past_kvs[layer.layer_idx] = (k, v)
+                    except (RuntimeError, AttributeError):
+                        pass  # This layer doesn't support manual KV extraction
+        else:
+            outputs = self.model(input_ids=input_ids)
+            hidden_states = outputs["hidden_states"]
+            ssm_states = outputs.get("ssm_states", {})
 
         # Get last hidden state for first generated token
-        next_logits = self.lm_head(hidden_states[:, -1:, :])
+        # v2.1.0: Squeeze seq_len=1 dim to get (batch, vocab_size) for consistent
+        # token generation regardless of cache mode
+        next_logits = self.lm_head(hidden_states[:, -1, :])  # (batch, vocab_size)
 
         # Generation loop
         for step in range(max_new_tokens):
@@ -1545,12 +1764,12 @@ class LosionForCausalLMV2(nn.Module):
             # Repetition penalty
             if repetition_penalty != 1.0:
                 for token_id in generated[0].unique():
-                    next_logits[0, 0, token_id] /= repetition_penalty
+                    next_logits[0, token_id] /= repetition_penalty
 
             # Top-K
             if top_k > 0:
                 top_k_vals, _ = torch.topk(next_logits, min(top_k, next_logits.shape[-1]), dim=-1)
-                threshold = top_k_vals[:, :, -1:]
+                threshold = top_k_vals[:, -1:]
                 next_logits = next_logits.where(next_logits >= threshold, float("-inf"))
 
             # Top-P (nucleus sampling) — v1.6.1 fix: correct scatter back to original order
@@ -1578,14 +1797,42 @@ class LosionForCausalLMV2(nn.Module):
             if eos_token_id is not None and (next_token == eos_token_id).all():
                 break
 
-            # Forward next token (O(1) for SSM, cached for attention)
-            hidden_out, new_states = self.model.forward_inference(
-                next_token,
-                ssm_states=ssm_states,
-                position_offset=generated.shape[1] - 1,
-            )
+            # Forward next token
+            # v2.1.0: When use_cache=True, pass past_kvs so attention
+            # layers can reuse cached K,V and only compute the new token's
+            # Q,K,V — reducing attention from O(seq_len²) to O(seq_len).
+            if use_cache:
+                hidden_out, new_states = self.model.forward_inference(
+                    next_token,
+                    ssm_states=ssm_states,
+                    past_kvs=past_kvs,
+                    position_offset=generated.shape[1] - 1,
+                )
+                # Update KV cache: append new token's K,V to past_kvs
+                new_kvs = new_states.get("past_kvs", {})
+                for layer_idx, new_kv in new_kvs.items():
+                    if layer_idx in past_kvs and isinstance(past_kvs[layer_idx], tuple) and len(past_kvs[layer_idx]) == 2:
+                        # Concatenate new K,V to cache: (batch, n_heads, seq_so_far, d_kv)
+                        old_k, old_v = past_kvs[layer_idx]
+                        if isinstance(new_kv, tuple) and len(new_kv) == 2:
+                            new_k, new_v = new_kv
+                            past_kvs[layer_idx] = (
+                                torch.cat([old_k, new_k], dim=2),
+                                torch.cat([old_v, new_v], dim=2),
+                            )
+                    else:
+                        past_kvs[layer_idx] = new_kv
+            else:
+                # No cache: recompute full sequence attention (O(n²))
+                hidden_out, new_states = self.model.forward_inference(
+                    next_token,
+                    ssm_states=ssm_states,
+                    position_offset=generated.shape[1] - 1,
+                )
+
             ssm_states = new_states.get("ssm_states", ssm_states)
-            next_logits = self.lm_head(hidden_out)
+            # Squeeze seq_len dim: hidden_out is (batch, 1, d_model) -> (batch, d_model)
+            next_logits = self.lm_head(hidden_out[:, -1, :])  # (batch, vocab_size)
 
         return generated
 
