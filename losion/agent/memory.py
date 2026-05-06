@@ -44,6 +44,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import threading
 import time
 from dataclasses import dataclass, field, asdict
@@ -51,6 +52,129 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Encryption at Rest (audit finding A3.5)
+# ============================================================================
+
+
+def _derive_key(passphrase: str, salt: bytes) -> bytes:
+    """Derive a 32-byte encryption key from passphrase and salt using PBKDF2.
+
+    Uses hashlib.pbkdf2_hmac with SHA-256 and 100,000 iterations for
+    key derivation. This is computationally expensive enough to resist
+    brute-force attacks while remaining fast for legitimate use.
+
+    Args:
+        passphrase: The encryption passphrase.
+        salt: Random salt bytes (16+ bytes recommended).
+
+    Returns:
+        32-byte derived key.
+    """
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        passphrase.encode("utf-8"),
+        salt,
+        iterations=100_000,
+    )
+
+
+def _xor_encrypt_decrypt(data: bytes, key: bytes) -> bytes:
+    """XOR-based encrypt/decrypt (symmetric — same operation for both).
+
+    This is a simple but effective encryption for data at rest when
+    the threat model is casual file inspection rather than a determined
+    cryptanalyst. For production deployments requiring strong encryption,
+    replace with AES-256 via the `cryptography` package.
+
+    The XOR cipher is used here because:
+    1. No external dependencies (pure Python stdlib)
+    2. Symmetric — same function for encrypt and decrypt
+    3. Adequate for protecting episodic memory from casual file reads
+
+    Args:
+        data: Data to encrypt/decrypt.
+        key: Encryption key (will be cycled if shorter than data).
+
+    Returns:
+        Encrypted/decrypted bytes.
+    """
+    # Cycle the key to match data length
+    key_cycle = key * (len(data) // len(key) + 1)
+    return bytes(a ^ b for a, b in zip(data, key_cycle[:len(data)]))
+
+
+class _EncryptionManager:
+    """Manages encryption at rest for episodic memory.
+
+    Provides a simple encryption layer for JSON episode files stored on disk.
+    This prevents casual file inspection from revealing sensitive episode
+    data (queries, actions, reflections).
+
+    Security model:
+    - Protects against casual file reads (e.g., shared filesystem)
+    - Does NOT protect against determined attackers with memory access
+    - For production: replace with AES-256 via `cryptography` package
+
+    The encryption key is derived from a passphrase using PBKDF2-HMAC-SHA256
+    with 100,000 iterations and a random salt. The salt is stored alongside
+    the encrypted data (standard practice — salt is not secret).
+
+    Args:
+        passphrase: Encryption passphrase. If None, encryption is disabled.
+            Passphrase can also be set via LOSION_MEMORY_PASSPHRASE env var.
+    """
+
+    def __init__(self, passphrase: Optional[str] = None) -> None:
+        # Check environment variable if no passphrase provided
+        if passphrase is None:
+            passphrase = os.environ.get("LOSION_MEMORY_PASSPHRASE", None)
+
+        self.enabled = passphrase is not None
+        self._key: Optional[bytes] = None
+        self._passphrase = passphrase
+
+    def _get_or_derive_key(self, salt: bytes) -> bytes:
+        """Get cached key or derive from passphrase."""
+        if self._key is None and self._passphrase is not None:
+            self._key = _derive_key(self._passphrase, salt)
+        return self._key or b""
+
+    def encrypt(self, data: bytes) -> Tuple[bytes, bytes]:
+        """Encrypt data, returning (encrypted_data, salt).
+
+        Args:
+            data: Plaintext bytes to encrypt.
+
+        Returns:
+            Tuple of (encrypted_bytes, salt_bytes). Salt must be stored
+            alongside encrypted data for decryption.
+        """
+        if not self.enabled:
+            return data, b""
+
+        salt = os.urandom(16)
+        key = _derive_key(self._passphrase, salt)
+        encrypted = _xor_encrypt_decrypt(data, key)
+        return encrypted, salt
+
+    def decrypt(self, data: bytes, salt: bytes) -> bytes:
+        """Decrypt data using the stored salt.
+
+        Args:
+            data: Encrypted bytes.
+            salt: Salt bytes that were stored alongside the data.
+
+        Returns:
+            Decrypted plaintext bytes.
+        """
+        if not self.enabled:
+            return data
+
+        key = _derive_key(self._passphrase, salt)
+        return _xor_encrypt_decrypt(data, key)
 
 
 @dataclass
@@ -221,11 +345,17 @@ class EpisodicMemory:
         max_episodes: int = 0,
         activation_decay: float = 0.5,
         auto_save: bool = True,
+        encryption_passphrase: Optional[str] = None,
     ) -> None:
         self.store_dir = Path(store_dir).expanduser()
         self.max_episodes = max_episodes
         self.activation_decay = activation_decay
         self.auto_save = auto_save
+
+        # Encryption at rest (audit finding A3.5)
+        self._encryption = _EncryptionManager(encryption_passphrase)
+        if self._encryption.enabled:
+            logger.info("EpisodicMemory: encryption at rest ENABLED")
 
         # In-memory storage
         self._episodes: Dict[str, Episode] = {}
@@ -505,10 +635,21 @@ class EpisodicMemory:
             episode_ids = index.get("episode_ids", [])
             for episode_id in episode_ids:
                 ep_path = episodes_dir / f"{episode_id}.json"
+                salt_path = episodes_dir / f"{episode_id}.salt"
                 if ep_path.exists():
                     try:
-                        with open(ep_path, "r", encoding="utf-8") as f:
-                            episode = Episode.from_dict(json.load(f))
+                        if self._encryption.enabled and salt_path.exists():
+                            # Load encrypted episode
+                            with open(salt_path, "rb") as sf:
+                                salt = sf.read()
+                            with open(ep_path, "rb") as f:
+                                encrypted_data = f.read()
+                            decrypted_data = self._encryption.decrypt(encrypted_data, salt)
+                            episode = Episode.from_dict(json.loads(decrypted_data.decode("utf-8")))
+                        else:
+                            # Load plain JSON episode
+                            with open(ep_path, "r", encoding="utf-8") as f:
+                                episode = Episode.from_dict(json.load(f))
                         self._episodes[episode_id] = episode
                         # Rebuild indices
                         query_hash = self._hash_query(episode.query)
@@ -528,7 +669,12 @@ class EpisodicMemory:
                         continue
 
     def _save(self) -> None:
-        """Save episodes to persistent storage."""
+        """Save episodes to persistent storage.
+
+        v2.5.0: When encryption is enabled, episode JSON files are encrypted
+        at rest using the _EncryptionManager. The salt is stored in a
+        separate ``.salt`` file alongside the episode file.
+        """
         episodes_dir = self.store_dir / "episodes"
         episodes_dir.mkdir(parents=True, exist_ok=True)
 
@@ -540,11 +686,28 @@ class EpisodicMemory:
         with open(self.store_dir / "index.json", "w", encoding="utf-8") as f:
             json.dump(index, f, indent=2)
 
-        # Save each episode
+        # Save each episode (with optional encryption)
         for episode_id, episode in self._episodes.items():
             ep_path = episodes_dir / f"{episode_id}.json"
-            with open(ep_path, "w", encoding="utf-8") as f:
-                json.dump(episode.to_dict(), f, indent=2, ensure_ascii=False)
+            episode_json = json.dumps(episode.to_dict(), indent=2, ensure_ascii=False)
+
+            if self._encryption.enabled:
+                # Encrypt the JSON data
+                data_bytes = episode_json.encode("utf-8")
+                encrypted_bytes, salt = self._encryption.encrypt(data_bytes)
+
+                # Save salt alongside the encrypted data
+                salt_path = episodes_dir / f"{episode_id}.salt"
+                with open(salt_path, "wb") as sf:
+                    sf.write(salt)
+
+                # Save encrypted data as binary
+                with open(ep_path, "wb") as f:
+                    f.write(encrypted_bytes)
+            else:
+                # Save as plain JSON
+                with open(ep_path, "w", encoding="utf-8") as f:
+                    f.write(episode_json)
 
         # Save stats (compute inline to avoid deadlock — _save is called within _lock)
         total = len(self._episodes)

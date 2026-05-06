@@ -150,15 +150,31 @@ class Constitution:
         )
 
     def evaluate_response(
-        self, response: str
+        self, response: str,
+        context: Optional[str] = None,
     ) -> Tuple[bool, List[str]]:
         """Evaluate a model response against constitutional principles.
 
-        Uses keyword-based heuristics for principle violation detection.
-        In production, this would use the model itself for critique.
+        v2.5.0: Improved evaluation with context-awareness and reduced
+        false positives. The previous regex-only approach had high false
+        positive rates (e.g., "Don't kill the process" triggered violence,
+        "hack-a-thon" triggered illegal, "sexual health education" triggered
+        sexual content). The new approach:
+
+        1. Checks for negation context before flagging ("don't kill",
+           "should not hack", "avoid violence")
+        2. Uses word boundary matching more carefully
+        3. Allows optional context parameter for educational/medical exceptions
+        4. Still uses keyword heuristics — for production, use model critique
+
+        Note: This remains a heuristic approach. For production safety,
+        consider using a dedicated safety model or embedding similarity
+        based evaluation rather than keyword matching.
 
         Args:
             response: Model response text to evaluate.
+            context: Optional context (e.g., "educational", "medical")
+                that may exempt certain phrases from being flagged.
 
         Returns:
             Tuple of (compliant, violations) where:
@@ -168,21 +184,53 @@ class Constitution:
         violations: List[str] = []
         response_lower = response.lower()
 
-        # Harmful content patterns
-        harm_patterns = [
-            (r"\b(kill|murder|assassinate|attack|bomb)\b", "violence"),
-            (r"\b(hate|racist|bigot|nazi|supremacist)\b", "hate"),
-            (r"\b(sexual|explicit|nude|pornograph)\b", "sexual"),
-            (r"\b(suicide|self.harm|self-inflict|cut yourself)\b", "self_harm"),
-            (r"\b(hack|steal|illegal|drug|contraband)\b", "illegal"),
-            (r"\b(ssn|social security|credit card|password)\b", "privacy"),
-            (r"\b(toxic|abuse|harass|threat|bully)\b", "toxicity"),
+        # v2.5.0: Negation-awareness — phrases like "don't kill",
+        # "should not hack", "avoid violence" are refusals, not violations.
+        negation_patterns = [
+            r"\b(do not|don't|should not|shouldn't|never|avoid|refuse to|"
+            r"will not|won't|cannot|can't|must not|mustn't)\s+",
         ]
+
+        def _is_negated(text: str, match_start: int) -> bool:
+            """Check if a keyword match is preceded by a negation."""
+            for neg_pattern in negation_patterns:
+                for neg_match in re.finditer(neg_pattern, text):
+                    # If negation is within 3 words before the keyword
+                    if 0 < match_start - neg_match.end() < 30:
+                        return True
+            return False
+
+        # Harmful content patterns — v2.5.0: tightened word boundaries
+        # to reduce false positives like "kill a process" vs "kill a person"
+        harm_patterns = [
+            (r"\b(kill|murder|assassinate)\s+(a|an|the|someone|people|person)\b", "violence"),
+            (r"\bhow\s+to\s+(make|build|create)\s+a\s+bomb\b", "violence"),
+            (r"\battack\s+(someone|a person|people)\b", "violence"),
+            (r"\b(racist|bigot|nazi|supremacist)\b", "hate"),
+            (r"\bspread\s+hate\b", "hate"),
+            (r"\b(sexually\s+explicit|pornograph)\b", "sexual"),
+            (r"\b(suicide|self-inflict|cut\s+yourself)\b", "self_harm"),
+            (r"\bcommit\s+(fraud|theft|crime)\b", "illegal"),
+            (r"\bsteal\s+(data|passwords|information)\b", "illegal"),
+            (r"\b(ssn|social\s+security\s+number|credit\s+card\s+number)\b", "privacy"),
+            (r"\b(threaten|bully|harass)\s+(someone|a person)\b", "toxicity"),
+        ]
+
+        # Context exemptions (educational, medical, security research)
+        exempt_contexts = {"educational", "medical", "security", "research", "safety"}
+        is_exempt = context and context.lower() in exempt_contexts
 
         violated_categories: Dict[str, bool] = {}
 
         for pattern, cat in harm_patterns:
-            if re.search(pattern, response_lower):
+            match = re.search(pattern, response_lower)
+            if match:
+                # Skip if negated (e.g., "don't kill")
+                if _is_negated(response_lower, match.start()):
+                    continue
+                # Skip if exempt context
+                if is_exempt:
+                    continue
                 violated_categories[cat] = True
 
         # Check each principle
@@ -298,12 +346,24 @@ class SafetyClassifier(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        pooling: str = "mean",
     ) -> Dict[str, torch.Tensor]:
         """Classify hidden states for safety.
+
+        v2.5.0: Changed default pooling from last-token to mean pooling.
+        Last-token pooling is weak for safety classification because dangerous
+        content may appear early in the sequence (e.g., "Tolong jelaskan cara
+        membuat bom") while the last token carries little safety signal.
+        Mean pooling aggregates information across the entire sequence,
+        providing a more robust representation for safety decisions.
 
         Args:
             hidden_states: Tensor of shape (batch, seq_len, d_model)
                 or (batch, d_model) for pooled representations.
+            pooling: Pooling strategy for 3D inputs:
+                - "mean": Average across all tokens (default, recommended)
+                - "last": Use last token only (weak for safety, not recommended)
+                - "attention": Learnable attention-weighted pooling
 
         Returns:
             Dict with:
@@ -314,9 +374,27 @@ class SafetyClassifier(nn.Module):
                 - "is_safe": (batch,) boolean tensor
                 - "unsafe_categories": (batch, n_categories) boolean tensor
         """
-        # Pool if needed: take last token representation
+        # Pool if needed
         if hidden_states.dim() == 3:
-            pooled = hidden_states[:, -1, :]  # (batch, d_model)
+            if pooling == "mean":
+                # v2.5.0: Mean pooling aggregates signal from ALL tokens,
+                # not just the last one. This is critical for safety where
+                # harmful content may appear at any position.
+                pooled = hidden_states.mean(dim=1)  # (batch, d_model)
+            elif pooling == "attention":
+                # Learnable attention-weighted pooling
+                if not hasattr(self, '_attn_pool_weight'):
+                    self._attn_pool_weight = nn.Parameter(
+                        torch.zeros(hidden_states.size(-1))
+                    )
+                scores = torch.matmul(
+                    hidden_states, self._attn_pool_weight
+                )  # (batch, seq_len)
+                weights = F.softmax(scores, dim=1).unsqueeze(-1)  # (batch, seq_len, 1)
+                pooled = (hidden_states * weights).sum(dim=1)  # (batch, d_model)
+            else:
+                # "last" — use last token (weak, kept for backward compat)
+                pooled = hidden_states[:, -1, :]  # (batch, d_model)
         else:
             pooled = hidden_states  # (batch, d_model)
 
@@ -496,22 +574,38 @@ class ConstitutionalTrainer:
                 # This is simplified; production would use full generation
                 # + revision + DPO on logprobs
 
-                # Compute a simplified DPO-style loss
-                # In practice: loss = -log(sigmoid(beta * (log_pi(revised) - log_pi(original) - log_ref(revised) + log_ref(original))))
+                # v2.5.0: ConstitutionalTrainer.train_step() is a PARTIAL STUB.
+                # The DPO loss computation (compute_dpo_loss) is fully functional,
+                # but train_step() does not have access to the model's generate()
+                # and log-probability methods needed to produce actual preference
+                # pairs. This requires integration with the model's generation API.
+                #
+                # For now, we log a clear warning and skip the dummy loss.
+                # To use ConstitutionalTrainer in production, call:
+                #   1. model.generate() to produce initial responses
+                #   2. constitution.evaluate_response() to find violations
+                #   3. model.generate() with critique prompts for revisions
+                #   4. trainer.compute_dpo_loss() with actual log-probs
+                #
                 if len(all_losses) == 0:
-                    # Placeholder: actual loss would come from log-probability differences
-                    dummy_loss = torch.tensor(0.0, requires_grad=True)
-                    all_losses.append(dummy_loss)
+                    logger.warning(
+                        "ConstitutionalTrainer.train_step() is a partial stub — "
+                        "no actual DPO training occurs. The compute_dpo_loss() "
+                        "method IS functional, but train_step() lacks model "
+                        "generation integration. See docstring for manual usage."
+                    )
+                    # Do NOT append a dummy zero loss — that creates false
+                    # confidence that training is happening when it is not.
 
         # Compute total loss
         if all_losses:
             total_loss = torch.stack(all_losses).mean()
         else:
-            # No violations found — no training signal this step
+            # No violations found or stub mode — no training signal this step
             total_loss = torch.tensor(0.0, requires_grad=True)
 
-        # Backpropagate
-        if total_loss.requires_grad and total_loss.item() != 0.0:
+        # Backpropagate only if there is a real loss (not stub/zero)
+        if all_losses and total_loss.requires_grad and total_loss.item() != 0.0:
             self.optimizer.zero_grad()
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -522,6 +616,7 @@ class ConstitutionalTrainer:
             "n_pairs": n_pairs,
             "n_violations": n_violations,
             "n_prompts": len(prompts),
+            "stub_mode": len(all_losses) == 0 and n_violations > 0,
         }
 
     def generate_revision(

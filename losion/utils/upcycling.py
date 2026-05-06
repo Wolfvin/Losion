@@ -6,6 +6,38 @@ HyLo (Heterogeneous Layer Upcycling) memungkinkan transformasi efisien
 dari model dense ke model MoE dengan kualitas yang mendekati training
 dari awal.
 
+Integration with Losion (audit finding C4.1):
+----------------------------------------------
+HyLo Upcycling is a standalone utility module that operates on state dicts,
+not a module wired into the model forward path. This is by design —
+upcycling is a one-time conversion step that happens BEFORE training,
+not during it. The workflow is:
+
+1. Train a dense LosionModel (or start from a pretrained dense checkpoint)
+2. Use HyLoUpcycler to convert the dense state dict → MoE state dict
+3. Load the MoE state dict into a LosionModelV2 configured with MoE layers
+4. Fine-tune the MoE model (much cheaper than training MoE from scratch)
+
+The module is fully functional and can be used as follows:
+
+    >>> from losion.utils import HyLoUpcycler, UpcyclingConfig
+    >>> config = UpcyclingConfig(
+    ...     source_type="dense",
+    ...     num_target_experts=8,
+    ...     clustering_method="kmeans",
+    ...     router_init="activation",
+    ... )
+    >>> upcycler = HyLoUpcycler(config)
+    >>> # Analyze activations dari calibration data
+    >>> upcycler.analyze_activations(model, calibration_dataloader)
+    >>> # Convert checkpoint
+    >>> moe_state_dict = upcycler.upcycle_checkpoint(dense_state_dict)
+
+It is NOT dead code — it is a preprocessing/utility tool that is used
+outside the training loop, similar to tokenizer training or dataset
+preprocessing. The README already lists it under Training components,
+and it is properly exported from `losion.utils.__init__`.
+
 Motivasi:
 ---------
 Training MoE dari awal sangat mahal:

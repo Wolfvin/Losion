@@ -71,6 +71,9 @@ class SearchConfig:
         cache_results: Whether to cache search results.
         cache_ttl: Cache time-to-live in seconds.
         max_cache_entries: Maximum number of cached queries (LRU eviction).
+        max_query_length: Maximum query string length before caching.
+            Queries exceeding this limit are truncated. Prevents memory
+            pressure from malformed model outputs (v2.5.0).
         allow_mock_fallback: Whether to fall back to mock results on backend failure.
             In production, set to False to prevent fabricated data from being
             treated as real evidence.
@@ -84,6 +87,7 @@ class SearchConfig:
     cache_results: bool = True
     cache_ttl: float = 3600.0  # 1 hour
     max_cache_entries: int = 1000  # LRU cap
+    max_query_length: int = 1000  # v2.5.0: prevent memory pressure from huge queries
     allow_mock_fallback: bool = False  # Fail-closed by default
     language: str = "en"
     safe_search: bool = True
@@ -134,6 +138,15 @@ class WebSearchInterface:
         Returns:
             List of SearchResult objects.
         """
+        # v2.5.0: Sanitize query length to prevent memory pressure
+        # from malformed model outputs
+        if len(query) > self.config.max_query_length:
+            logger.warning(
+                f"Web search query too long ({len(query)} chars, "
+                f"max {self.config.max_query_length}). Truncating."
+            )
+            query = query[:self.config.max_query_length]
+
         # Check cache
         if self.config.cache_results:
             cached = self._check_cache(query)

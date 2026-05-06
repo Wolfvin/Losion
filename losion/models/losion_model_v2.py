@@ -23,6 +23,7 @@ Credits & References:
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -31,30 +32,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from losion.config import LosionConfig, RecurrentConfig, JEPAConfig
+from losion.models.shared import RMSNorm as _SharedRMSNorm, WeightInitMixin
 
 # --- Lazy imports for core modules (avoid circular deps) ---
 # We import at module level but catch ImportError for graceful fallback
 
 
 # ============================================================================
-# RMSNorm
+# RMSNorm — delegates to shared implementation
 # ============================================================================
 
 
-class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization."""
+class RMSNorm(_SharedRMSNorm):
+    """RMSNorm that delegates to the shared implementation.
 
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        x = x.float()
-        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        x = x / rms
-        return (self.weight * x).to(dtype)
+    Kept as a class in this module for backward compatibility — existing
+    code that imports RMSNorm from losion_model_v2 will continue to work.
+    The actual implementation lives in losion.models.shared to prevent
+    code drift between V1 and V2 models (audit finding A3.4).
+    """
+    pass
 
 
 # ============================================================================
@@ -306,7 +303,14 @@ def _build_ssm(config: LosionConfig) -> nn.Module:
         from losion.core.ssm.mamba2 import Mamba2SSD
         return Mamba2SSD(d_model=d_model, d_state=ssm_cfg.d_state, d_conv=ssm_cfg.d_conv, expand=ssm_cfg.expand)
 
-    except ImportError:
+    except ImportError as e:
+        warnings.warn(
+            f"Could not import SSM module '{e.name}' — falling back to _FallbackSSM. "
+            f"Check that losion.core.ssm is installed and importable. "
+            f"Original error: {e}",
+            ImportWarning,
+            stacklevel=3,
+        )
         return _FallbackSSM(d_model)
 
 
@@ -361,7 +365,14 @@ def _build_attention(config: LosionConfig) -> nn.Module:
         return KDAMLA(d_model=d_model, n_heads=attn_cfg.n_heads, d_kv=attn_cfg.d_kv,
                        mla_latent_dim=attn_cfg.mla_latent_dim)
 
-    except ImportError:
+    except ImportError as e:
+        warnings.warn(
+            f"Could not import Attention module '{e.name}' — falling back to _FallbackAttention. "
+            f"Check that losion.core.attention is installed and importable. "
+            f"Original error: {e}",
+            ImportWarning,
+            stacklevel=3,
+        )
         return _FallbackAttention(d_model, n_heads=attn_cfg.n_heads)
 
 
@@ -423,7 +434,14 @@ def _build_moe(config: LosionConfig) -> nn.Module:
             vocab_size=config.vocab_size,  # Fix: teruskan vocab_size aktual, bukan default 32000
         )
 
-    except ImportError:
+    except ImportError as e:
+        warnings.warn(
+            f"Could not import MoE module '{e.name}' — falling back to _FallbackMoE. "
+            f"Check that losion.core.retrieval is installed and importable. "
+            f"Original error: {e}",
+            ImportWarning,
+            stacklevel=3,
+        )
         return _FallbackMoE(d_model, d_ff=d_ff, num_experts=num_experts)
 
 
@@ -441,7 +459,14 @@ def _build_router(config: LosionConfig) -> nn.Module:
             top_k_pathways=config.router.top_k_pathways,
             bias_lr=config.router.bias_lr,
         )
-    except ImportError:
+    except ImportError as e:
+        warnings.warn(
+            f"Could not import AdaptiveRouter — falling back to nn.Linear router. "
+            f"Check that losion.core.router is installed and importable. "
+            f"Original error: {e}",
+            ImportWarning,
+            stacklevel=3,
+        )
         # Fallback to simple linear router
         return nn.Linear(config.d_model, 3, bias=False)
 
@@ -561,22 +586,26 @@ class LosionLayerV2(nn.Module):
             route_weights = route_weights.unsqueeze(1).expand(-1, seq_len, -1)
 
         # ===================================================================
-        # Inference sparse execution (v2.4.0)
-        # During inference, skip pathways where ALL tokens have routing
-        # weight below threshold. Uses max() (not mean) to avoid silently
-        # skipping a pathway that any token depends on. During training,
-        # all pathways are always computed for gradient flow.
+        # Inference sparse execution (v2.5.0)
+        # During inference, skip pathways where the p-th percentile of routing
+        # weights is below threshold. Changed from max() to percentile-based
+        # (95th) because max() was too conservative — a single outlier token
+        # with weight barely above threshold would force the entire batch to
+        # compute that pathway, negating any speedup. The 95th percentile
+        # allows skipping if >95% of tokens have weight below threshold.
+        # During training, all pathways are always computed for gradient flow.
         # ===================================================================
         compute_ssm = True
         compute_attn = True
         compute_ret = True
         if inference_sparse and not self.training:
-            w_ssm_max = route_weights[:, :, 0].max().item()
-            w_attn_max = route_weights[:, :, 1].max().item()
-            w_ret_max = route_weights[:, :, 2].max().item()
-            compute_ssm = w_ssm_max >= sparse_threshold
-            compute_attn = w_attn_max >= sparse_threshold
-            compute_ret = w_ret_max >= sparse_threshold
+            percentile = 95
+            w_ssm_p = route_weights[:, :, 0].float().quantile(percentile / 100.0).item()
+            w_attn_p = route_weights[:, :, 1].float().quantile(percentile / 100.0).item()
+            w_ret_p = route_weights[:, :, 2].float().quantile(percentile / 100.0).item()
+            compute_ssm = w_ssm_p >= sparse_threshold
+            compute_attn = w_attn_p >= sparse_threshold
+            compute_ret = w_ret_p >= sparse_threshold
 
         # ===================================================================
         # Jalur 1: SSM — Unified interface adapter
@@ -986,7 +1015,7 @@ def _checkpoint_layer_fn(
 
     A module-level function with explicit arguments avoids this entirely.
 
-    v2.4.1: Added inference_sparse and sparse_threshold parameters for
+    v2.5.0: Added inference_sparse and sparse_threshold parameters for
     architectural consistency with the non-checkpoint path.
     """
     return layer(
@@ -1054,7 +1083,13 @@ class LosionModelV2(nn.Module):
                     compression_dim=config.attn_res.compression_dim,
                 )
                 self.attn_res_manager = AttnResManager(_attn_res_cfg)
-            except ImportError:
+            except ImportError as e:
+                warnings.warn(
+                    f"AttnRes module not available — disabling AttnRes. "
+                    f"Original error: {e}",
+                    ImportWarning,
+                    stacklevel=2,
+                )
                 self.use_attn_res = False
 
         # Optional Evoformer (v0.9)
@@ -1072,7 +1107,13 @@ class LosionModelV2(nn.Module):
                     use_router_coevolve=config.evoformer.use_router_coevolve,
                 )
                 self.evoformer_manager = EvoformerManager(_evo_cfg)
-            except ImportError:
+            except ImportError as e:
+                warnings.warn(
+                    f"Evoformer module not available — disabling Evoformer. "
+                    f"Original error: {e}",
+                    ImportWarning,
+                    stacklevel=2,
+                )
                 self.use_evoformer = False
 
         # Optional Dual Memory (v0.9)
@@ -1087,7 +1128,13 @@ class LosionModelV2(nn.Module):
                     consolidation_method=config.dual_memory.consolidation_method,
                 )
                 self.dual_memory = DualMemorySystem(_dm_cfg)
-            except ImportError:
+            except ImportError as e:
+                warnings.warn(
+                    f"DualMemory module not available — disabling Dual Memory. "
+                    f"Original error: {e}",
+                    ImportWarning,
+                    stacklevel=2,
+                )
                 self.use_dual_memory = False
 
         # Optional RecurrentDepthBlock (wraps the full LosionLayerV2)
@@ -1115,7 +1162,13 @@ class LosionModelV2(nn.Module):
                     use_act=config.recurrent.use_act,
                     lora_rank=config.recurrent.depth_lora_rank,
                 )
-            except ImportError:
+            except ImportError as e:
+                warnings.warn(
+                    f"RDT module not available — disabling Recurrent Depth. "
+                    f"Original error: {e}",
+                    ImportWarning,
+                    stacklevel=2,
+                )
                 self.use_rdt = False
 
         # Final norm
@@ -1208,7 +1261,7 @@ class LosionModelV2(nn.Module):
                 # `thinking_mode` and `layer` by reference, which could cause
                 # all layers to point to the last layer in some PyTorch versions.
                 # Now uses a standalone function with explicit argument capture.
-                # v2.4.1: Also pass inference_sparse/sparse_threshold for
+                # v2.5.0: Also pass inference_sparse/sparse_threshold for
                 # architectural consistency (no effect during training since
                 # inference_sparse is only active during eval).
                 x, layer_routing = torch.utils.checkpoint.checkpoint(

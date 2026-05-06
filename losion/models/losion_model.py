@@ -23,43 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from losion.config import LosionConfig
-
-
-# ============================================================================
-# RMSNorm
-# ============================================================================
-
-
-class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization.
-
-    Simpler and faster than LayerNorm — normalizes by the RMS of the
-    input without subtracting the mean.
-
-    Args:
-        dim: Normalization dimension.
-        eps: Epsilon for numerical stability (default 1e-6).
-    """
-
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply RMS normalization.
-
-        Args:
-            x: Input tensor of any shape with last dimension == dim.
-
-        Returns:
-            Normalized tensor with same shape.
-        """
-        dtype = x.dtype
-        x = x.float()
-        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        x = x / rms
-        return (self.weight * x).to(dtype)
+from losion.models.shared import RMSNorm, WeightInitMixin
 
 
 # ============================================================================
@@ -627,19 +591,28 @@ class LosionLayer(nn.Module):
 
         # ---- Determine which pathways to compute ----
         # During training, always compute all 3 pathways (gradient flows to all).
-        # During inference with inference_sparse=True, skip pathways only if
-        # ALL tokens in the batch have weight below threshold. We use max()
-        # instead of mean() because mean can be misleading: if 5% of tokens
-        # have w_ssm=0.8 but 95% have w_ssm≈0, mean≈0.04 < threshold but
-        # those 5% tokens still NEED the SSM pathway. Using max ensures we
-        # never silently skip a pathway that any token depends on.
-        w_ssm_max = route_weights[:, :, 0].max().item()
-        w_attn_max = route_weights[:, :, 1].max().item()
-        w_ret_max = route_weights[:, :, 2].max().item()
-
-        compute_ssm = not (inference_sparse and not self.training and w_ssm_max < sparse_threshold)
-        compute_attn = not (inference_sparse and not self.training and w_attn_max < sparse_threshold)
-        compute_ret = not (inference_sparse and not self.training and w_ret_max < sparse_threshold)
+        # During inference with inference_sparse=True, skip pathways if the
+        # p-th percentile of routing weights is below threshold.
+        #
+        # v2.5.0: Changed from max() to percentile-based threshold.
+        # max() was too conservative: with a batch of 512 tokens, a single
+        # outlier token with weight 0.06 (barely above threshold 0.05) would
+        # force the entire batch to compute that pathway, negating speedup.
+        # Using the 95th percentile means: if only 5% of tokens depend on a
+        # pathway, skip it. This provides meaningful speedup while still
+        # computing pathways that the majority of tokens need.
+        if inference_sparse and not self.training:
+            percentile = 95  # Skip pathway if >95% of tokens have weight below threshold
+            w_ssm_p = route_weights[:, :, 0].float().quantile(percentile / 100.0).item()
+            w_attn_p = route_weights[:, :, 1].float().quantile(percentile / 100.0).item()
+            w_ret_p = route_weights[:, :, 2].float().quantile(percentile / 100.0).item()
+            compute_ssm = w_ssm_p >= sparse_threshold
+            compute_attn = w_attn_p >= sparse_threshold
+            compute_ret = w_ret_p >= sparse_threshold
+        else:
+            compute_ssm = True
+            compute_attn = True
+            compute_ret = True
 
         # ---- Jalur 1: SSM ----
         if compute_ssm:
@@ -689,13 +662,16 @@ class LosionLayer(nn.Module):
 # ============================================================================
 
 
-class LosionModel(nn.Module):
+class LosionModel(nn.Module, WeightInitMixin):
     """Losion backbone model with Tri-Jalur Router architecture.
 
     Consists of:
     - Token embedding
     - N × LosionLayer (Tri-Jalur routed layers)
     - Final RMS normalization
+
+    Uses WeightInitMixin from losion.models.shared for standardized
+    GPT-2 style initialization (prevents code drift with V2 model).
 
     Args:
         config: LosionConfig with model parameters.
@@ -733,35 +709,8 @@ class LosionModel(nn.Module):
         # ---- Initialize weights ----
         self.apply(lambda m: self._init_weights(m))
 
-    def _init_weights(self, module: nn.Module) -> None:
-        """LLM-standard weight initialization.
-
-        Uses GPT-2 / GPT-NeoX style initialization:
-        - Embeddings: normal(0, 0.02)
-        - Linear layers: normal(0, 0.02 / sqrt(2 * n_layers))
-          The sqrt(2 * n_layers) scaling prevents hidden state explosion
-          in deep residual networks (GPT-2 paper Section 2.3).
-        - Conv1d: normal(0, 0.02 / sqrt(2 * n_layers))
-          Consistent with Linear init (not PyTorch default kaiming).
-        - Biases: zeros
-        """
-        if isinstance(module, nn.Linear):
-            # Scaled init for residual stream stability
-            std = 0.02 / math.sqrt(2 * self.n_layers)
-            nn.init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Conv1d):
-            # Same scaled init as Linear — Conv1d is used in SimplifiedSSM
-            # for causal convolution, and should follow the same residual
-            # stream scaling as the rest of the model, not PyTorch's default
-            # kaiming_uniform_.
-            std = 0.02 / math.sqrt(2 * self.n_layers)
-            nn.init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    # _init_weights is provided by WeightInitMixin (from losion.models.shared)
+    # This ensures V1 and V2 use identical initialization logic.
 
     def get_input_embeddings(self) -> nn.Embedding:
         """Get the input token embedding layer."""
@@ -845,7 +794,7 @@ class LosionModel(nn.Module):
                     route_weights = F.softmax(route_logits, dim=-1)
 
                 # Step 2: Checkpoint the heavy computation only
-                # v2.4.1: inference_sparse and sparse_threshold are passed through
+                # v2.5.0: inference_sparse and sparse_threshold are passed through
                 # for architectural consistency. During training, inference_sparse
                 # is always False (the layer's own check: `inference_sparse and
                 # not self.training`), so this has zero effect on training.

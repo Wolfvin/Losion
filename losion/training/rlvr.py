@@ -433,12 +433,24 @@ class MathVerifier(RewardVerifier):
         includes math functions.  This is NOT a full sandbox — do not
         use with untrusted code.
 
+        v2.5.0: Added maximum expression length limit (256 characters)
+        to prevent denial-of-service via deeply nested expressions
+        (e.g., ``9**9**9**9``) that could hang evaluation.
+
         Args:
             expr_str: Expression string to evaluate.
 
         Returns:
             Float result, or None if evaluation fails.
         """
+        # v2.5.0: Reject excessively long expressions to prevent DoS
+        if len(expr_str) > 256:
+            logger.warning(
+                f"MathVerifier: expression too long ({len(expr_str)} chars, "
+                f"max 256). Likely malformed or adversarial."
+            )
+            return None
+
         safe_globals = {
             "__builtins__": {},
             "abs": abs,
@@ -708,7 +720,14 @@ sys.stdout.write(json.dumps(_result))
 '''
 
         def _set_resource_limits():
-            """Set resource limits in the child process."""
+            """Set resource limits in the child process.
+
+            v2.5.0: Added platform-aware warning. On Windows, resource
+            module is unavailable, so no CPU/memory limits can be enforced.
+            This is a known limitation — Docker/gVisor isolation is
+            recommended for Windows-based training.
+            """
+            import platform
             try:
                 import resource
                 # CPU time limit (seconds) — kills process if exceeded
@@ -721,8 +740,23 @@ sys.stdout.write(json.dumps(_result))
                 resource.setrlimit(resource.RLIMIT_AS, (mem_limit, mem_limit))
                 # No core dumps
                 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-            except (ImportError, ValueError, OSError):
-                pass  # resource module not available on all platforms
+            except ImportError:
+                # resource module not available on Windows
+                if platform.system() == "Windows":
+                    import warnings
+                    warnings.warn(
+                        "CodeVerifier: resource module unavailable on Windows. "
+                        "CPU and memory limits CANNOT be enforced. An infinite "
+                        "loop or memory bomb in generated code will hang or "
+                        "crash the training process. Use Docker/gVisor "
+                        "isolation for Windows-based training.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                # On non-Windows, ImportError is unexpected — still pass
+                # gracefully but the subprocess timeout is the safety net
+            except (ValueError, OSError):
+                pass  # setrlimit not supported in this environment
 
         try:
             result = subprocess.run(
@@ -732,6 +766,7 @@ sys.stdout.write(json.dumps(_result))
                 timeout=self.timeout_seconds + 2,  # Extra margin beyond ulimit
                 preexec_fn=_set_resource_limits,
                 # Security: close file descriptors beyond stdin/stdout/stderr
+                # v2.5.0: Explicit (default True on Unix/Python 3.2+)
                 close_fds=True,
             )
         except subprocess.TimeoutExpired:

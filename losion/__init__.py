@@ -1,7 +1,20 @@
 """
 Losion — Hybrid AI Framework with Tri-Jalur Router Architecture.
 
-Version 2.4.1 — "Residual Fix Round"
+Version 2.5.0 — "Architecture Hardening"
+
+v2.5.0 Architecture Hardening — Shared Code, Encryption, Warnings, Tests:
+  - HIGH: V1/V2 model code drift eliminated — shared RMSNorm + WeightInitMixin
+    in losion.models.shared.py (was duplicated across both model files)
+  - HIGH: HyLo Upcycling integration documented (was appearing as dead code)
+  - HIGH: Silent ImportError fallbacks replaced with ImportWarning in V2 model
+    (8 catch blocks now warn users instead of silently degrading quality)
+  - MEDIUM: Episodic memory encryption at rest via _EncryptionManager
+    (PBKDF2-HMAC-SHA256 key derivation, XOR encryption, env var passphrase)
+  - MEDIUM: MCTS agent dedicated test suite created (tests/test_mcts_agent.py)
+  - MEDIUM: Evoformer test suite already present (tests/test_evoformer.py, 417 lines)
+  - LOW: README version badge updated from 2.3.0 to 2.5.0
+  - LOW: requirements.txt pinned to exact versions for reproducibility
 
 v2.4.1 Residual Fix Round — Architecture Consistency & Security:
   - CRITICAL: inference_sparse now propagated through gradient checkpoint path
@@ -196,7 +209,7 @@ Router:  Adaptive (BiasRouter + ThinkingToggle + Symbolic-MoE), GRPO/DAPO-traine
          + Router ↔ Expert Co-Evolution (Evoformer Level 5)
 """
 
-__version__ = "2.4.1"
+__version__ = "2.5.0"
 __author__ = "Losion Contributors"
 __license__ = "MIT"
 

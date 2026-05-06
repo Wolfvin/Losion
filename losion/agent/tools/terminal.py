@@ -42,8 +42,10 @@ Container Isolation (recommended for production):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import shlex
 import subprocess
 import tempfile
 import time
@@ -109,9 +111,17 @@ class SandboxConfig:
         audit_log: Whether to log all commands for audit.
     """
 
+    # Mandatory allowlist: if non-empty, ONLY these command prefixes are allowed.
+    # In production, this MUST be populated. Empty set means all commands are
+    # allowed (INSECURE — use only for development/testing).
+    # v2.5.0: Changed from optional to recommended-mandatory. The blacklist
+    # approach is inherently bypassable (see audit finding 2.1).
     allowed_commands: Set[str] = field(default_factory=set)
+    # Require allowlist in production — if True and allowed_commands is empty,
+    # only the container execution path is allowed.
+    require_allowlist: bool = False
     blocked_commands: Set[str] = field(default_factory=lambda: {
-        # Destructive commands
+        # Destructive commands (defense-in-depth — allowlist is the real boundary)
         "rm -rf /", "mkfs", "dd if=", ":(){ :|:& };:",
         "format", "del /f /s /q C:",
         # System modification
@@ -148,6 +158,9 @@ class SandboxConfig:
     writable_paths: List[str] = field(default_factory=lambda: [
         "/tmp", "/home",
     ])
+    # Audit log persistence (v2.5.0)
+    audit_log_file: str = ""  # Path to persistent audit log file. Empty = logging.info only
+    audit_log_format: str = "json"  # "json" or "text"
 
 
 class SandboxedTerminal:
@@ -171,6 +184,58 @@ class SandboxedTerminal:
         self.config = config or SandboxConfig()
         self._execution_history: List[TerminalResult] = []
         self._temp_dir: Optional[str] = None
+        # v2.5.0: Persistent audit log file handle
+        self._audit_file: Optional[Any] = None
+
+    def _write_audit_log(self, command: str, result: Optional[TerminalResult] = None) -> None:
+        """Write audit log entry — both to logging.info and to persistent file.
+
+        v2.5.0: Previously, audit logs were only written via logging.info(),
+        which is not guaranteed to be persistent (depends on logging config)
+        and is not tamper-proof. Now also writes to a file if audit_log_file
+        is configured.
+
+        Args:
+            command: The command that was executed.
+            result: Optional execution result.
+        """
+        # Always log to standard logger
+        logger.info(f"Terminal executing: {command}")
+        if result is not None:
+            logger.info(
+                f"Terminal result: exit_code={result.exit_code}, "
+                f"time={result.execution_time:.3f}s, "
+                f"timed_out={result.timed_out}"
+            )
+
+        # Write to persistent audit file if configured
+        if self.config.audit_log_file:
+            try:
+                audit_path = Path(self.config.audit_log_file)
+                audit_path.parent.mkdir(parents=True, exist_ok=True)
+
+                if self.config.audit_log_format == "json":
+                    entry = {
+                        "timestamp": time.time(),
+                        "command": command,
+                    }
+                    if result is not None:
+                        entry.update({
+                            "exit_code": result.exit_code,
+                            "execution_time": result.execution_time,
+                            "timed_out": result.timed_out,
+                            "success": result.success,
+                        })
+                    line = json.dumps(entry)
+                else:
+                    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] cmd={command}"
+                    if result is not None:
+                        line += f" exit={result.exit_code} time={result.execution_time:.3f}s"
+
+                with open(audit_path, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except OSError as e:
+                logger.warning(f"Failed to write audit log: {e}")
 
     def execute(
         self,
@@ -201,12 +266,28 @@ class SandboxedTerminal:
         # === Security Layer 1: Command validation ===
         self._validate_command(command)
 
+        # === Security Layer 1.5: Allowlist enforcement ===
+        # v2.5.0: If require_allowlist is True and allowed_commands is empty,
+        # reject the command (production safety). Container mode is exempt
+        # because Docker provides its own isolation boundary.
+        if (
+            self.config.require_allowlist
+            and not self.config.allowed_commands
+            and not self.config.use_container
+        ):
+            raise PermissionError(
+                "Production safety: allowed_commands is empty and require_allowlist "
+                "is True. Either populate allowed_commands with permitted command "
+                "prefixes, or use use_container=True for Docker-isolated execution. "
+                "An empty allowlist with shell=False is not safe for production."
+            )
+
         # === Security Layer 2: Filesystem isolation check ===
         self._validate_filesystem_access(command)
 
-        # === Audit logging ===
+        # === Audit logging (v2.5.0: now includes persistent file logging) ===
         if self.config.audit_log:
-            logger.info(f"Terminal executing: {command}")
+            self._write_audit_log(command)
 
         # === Route to execution backend ===
         if self.config.use_container:
@@ -221,7 +302,18 @@ class SandboxedTerminal:
         working_dir: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
     ) -> TerminalResult:
-        """Execute a command as a subprocess with resource limits."""
+        """Execute a command as a subprocess with resource limits.
+
+        v2.5.0: Changed from shell=True to shell=False with shlex.split().
+        The shell=True approach was inherently insecure — even with blacklist
+        filtering, shell metacharacters and string concatenation could bypass
+        the safety checks (e.g., ``r"m -rf /``, variable references, ``chr()``
+        tricks). Using shell=False with argument splitting ensures the command
+        is executed as a direct argv list, preventing shell injection entirely.
+
+        For commands that genuinely require shell features (pipes, redirection),
+        use ``use_container=True`` which provides Docker isolation.
+        """
         effective_timeout = timeout or self.config.max_execution_time
         effective_wd = working_dir or self.config.working_dir or self._get_temp_dir()
 
@@ -231,14 +323,40 @@ class SandboxedTerminal:
         if env:
             effective_env.update(env)
 
+        # === Parse command into argv list (shell=False) ===
+        # v2.5.0: Use shlex.split() instead of shell=True to prevent
+        # shell injection. This means pipes (|), redirections (>), && etc.
+        # will NOT work in subprocess mode — use container mode for those.
+        try:
+            cmd_args = shlex.split(command)
+        except ValueError as e:
+            return TerminalResult(
+                command=command,
+                exit_code=-1,
+                stdout="",
+                stderr=f"Invalid command syntax (shlex parse error): {e}",
+                execution_time=0.0,
+                working_dir=effective_wd,
+            )
+
+        if not cmd_args:
+            return TerminalResult(
+                command=command,
+                exit_code=-1,
+                stdout="",
+                stderr="Empty command after parsing",
+                execution_time=0.0,
+                working_dir=effective_wd,
+            )
+
         # === Execute ===
         start_time = time.time()
         timed_out = False
 
         try:
             process = subprocess.Popen(
-                command,
-                shell=True,
+                cmd_args,
+                shell=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=effective_wd,
@@ -279,8 +397,10 @@ class SandboxedTerminal:
                 working_dir=effective_wd,
             )
 
-        # Record
+        # Record + audit
         self._execution_history.append(result)
+        if self.config.audit_log:
+            self._write_audit_log(command, result)
 
         return result
 
@@ -340,7 +460,11 @@ class SandboxedTerminal:
         for key, value in self.config.env_vars.items():
             docker_args.extend(["-e", f"{key}={value}"])
 
-        # Image and command
+        # Image and command — use shlex.split for the inner command too
+        # Note: Inside Docker, we DO use shell=True (sh -c) because the
+        # container provides its own isolation boundary. The shell injection
+        # risk is mitigated by: no network, read-only filesystem, resource
+        # limits, and automatic cleanup.
         docker_args.append(self.config.container_image)
         docker_args.extend(["sh", "-c", command])
 
@@ -395,8 +519,10 @@ class SandboxedTerminal:
                 working_dir=effective_wd,
             )
 
-        # Record
+        # Record + audit
         self._execution_history.append(result)
+        if self.config.audit_log:
+            self._write_audit_log(command, result)
 
         return result
 
@@ -432,6 +558,14 @@ class SandboxedTerminal:
     def _validate_command(self, command: str) -> None:
         """Validate a command against safety rules.
 
+        v2.5.0: The primary security boundary is now the allowlist (if
+        configured). The blacklist provides defense-in-depth but is not
+        sufficient on its own — string obfuscation techniques can bypass
+        substring matching.
+
+        With shell=False (v2.5.0), shell metacharacters are no longer
+        interpreted, which eliminates a large class of injection attacks.
+
         Args:
             command: Command to validate.
 
@@ -440,21 +574,21 @@ class SandboxedTerminal:
         """
         command_lower = command.lower().strip()
 
-        # Check blocked commands
+        # Check blocked commands (defense-in-depth)
         for blocked in self.config.blocked_commands:
             if blocked.lower() in command_lower:
                 raise PermissionError(
                     f"Command blocked by safety rules: matches '{blocked}'"
                 )
 
-        # Check blocked patterns
+        # Check blocked patterns (defense-in-depth)
         for pattern in self.config.blocked_patterns:
             if pattern.lower() in command_lower:
                 raise PermissionError(
                     f"Command blocked by pattern rule: matches '{pattern}'"
                 )
 
-        # Check whitelist (if defined)
+        # Check allowlist (PRIMARY security boundary if configured)
         if self.config.allowed_commands:
             command_prefix = command_lower.split()[0] if command_lower.split() else ""
             if command_prefix not in {c.lower() for c in self.config.allowed_commands}:

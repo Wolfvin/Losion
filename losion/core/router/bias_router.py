@@ -51,12 +51,18 @@ class BiasRouter(nn.Module):
         num_pathways: int = 3,
         top_k_pathways: int = 2,
         bias_lr: float = 0.01,
+        bias_update_interval: int = 1000,
+        warmup_bias_update_interval: int = 100,
+        warmup_steps: int = 2000,
     ) -> None:
         super().__init__()
         self.d_model = d_model
         self.num_pathways = num_pathways
         self.top_k_pathways = min(top_k_pathways, num_pathways)
         self.bias_lr = bias_lr
+        self.bias_update_interval = bias_update_interval
+        self.warmup_bias_update_interval = warmup_bias_update_interval
+        self.warmup_steps = warmup_steps
 
         # Gating network: proyeksi linear ke dimensi jalur
         self.gate_proj = nn.Sequential(
@@ -149,6 +155,47 @@ class BiasRouter(nn.Module):
         )
 
         return routing_weights, routing_info
+
+    def get_effective_update_interval(self, global_step: int) -> int:
+        """Get the effective bias update interval for the current training step.
+
+        v2.5.0: During warmup (early training), bias updates are more frequent
+        to prevent routing collapse. DeepSeek-V3 uses frequent updates during
+        the initial phase; a fixed interval of 1000 steps is too infrequent
+        when the model hasn't converged yet.
+
+        The interval linearly interpolates from warmup_bias_update_interval
+        to bias_update_interval over warmup_steps.
+
+        Args:
+            global_step: Current training step.
+
+        Returns:
+            Effective update interval for this step.
+        """
+        if global_step >= self.warmup_steps:
+            return self.bias_update_interval
+        # Linear interpolation from warmup to steady-state interval
+        progress = global_step / max(self.warmup_steps, 1)
+        interval = int(
+            self.warmup_bias_update_interval
+            + progress * (self.bias_update_interval - self.warmup_bias_update_interval)
+        )
+        return max(interval, 1)
+
+    def should_update_bias(self, global_step: int) -> bool:
+        """Check if bias should be updated at this training step.
+
+        Uses warmup-aware interval (more frequent during early training).
+
+        Args:
+            global_step: Current training step.
+
+        Returns:
+            True if bias should be updated this step.
+        """
+        interval = self.get_effective_update_interval(global_step)
+        return global_step > 0 and global_step % interval == 0
 
     def update_bias(
         self,

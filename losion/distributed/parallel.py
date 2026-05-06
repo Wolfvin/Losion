@@ -17,8 +17,9 @@ Provides:
 from __future__ import annotations
 
 import enum
-import pickle
 import logging
+import os
+import pickle
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -33,7 +34,7 @@ logger = logging.getLogger(__name__)
 class SecurityError(Exception):
     """Raised when a security check fails during checkpoint loading.
 
-    v2.4.1: Used by LosionDistributedTrainer.load_checkpoint() when a
+    v2.5.0: Used by LosionDistributedTrainer.load_checkpoint() when a
     checkpoint from an untrusted path requires weights_only=False fallback.
     """
 
@@ -982,6 +983,27 @@ class LosionDistributedTrainer:
         }
         return dtype_map.get(self.config.mixed_precision, torch.bfloat16)
 
+    @staticmethod
+    def _compute_file_checksum(path: str, algorithm: str = "sha256") -> str:
+        """Compute SHA-256 checksum of a file.
+
+        Used for checkpoint integrity verification before loading
+        with weights_only=False (pickle deserialization).
+
+        Args:
+            path: Path to the file to checksum.
+            algorithm: Hash algorithm name (default 'sha256').
+
+        Returns:
+            Hex digest of the file's hash.
+        """
+        import hashlib
+        h = hashlib.new(algorithm)
+        with open(path, "rb") as f:
+            while chunk := f.read(8192):
+                h.update(chunk)
+        return h.hexdigest()
+
     def save_checkpoint(
         self,
         path: str,
@@ -991,6 +1013,9 @@ class LosionDistributedTrainer:
 
         For FSDP, this requires gathering the full model state
         before saving. Only rank 0 saves the checkpoint.
+
+        v2.5.0: Also saves a SHA-256 checksum file (<path>.sha256) for
+        integrity verification on load.
 
         Args:
             path: Path to save the checkpoint.
@@ -1011,6 +1036,14 @@ class LosionDistributedTrainer:
                 checkpoint["lr_scheduler"] = self.lr_scheduler.state_dict()
 
             torch.save(checkpoint, path)
+
+            # v2.5.0: Save checksum for integrity verification on load
+            checksum = self._compute_file_checksum(path)
+            checksum_path = path + ".sha256"
+            with open(checksum_path, "w") as f:
+                f.write(f"{checksum}  {os.path.basename(path)}\n")
+            logger.info(f"Checkpoint checksum saved to {checksum_path}")
+
             logger.info(f"Checkpoint saved to {path}")
 
     def load_checkpoint(self, path: str) -> None:
@@ -1027,12 +1060,19 @@ class LosionDistributedTrainer:
             directory as our save_checkpoint or an explicitly trusted directory),
             then fall back to weights_only=False with a security warning.
 
-            v2.4.1: Phase 2 now validates file origin before falling back. A
+            v2.5.0: Phase 2 now validates file origin before falling back. A
             malicious checkpoint in an arbitrary path will NOT be loaded with
             weights_only=False — only files in the configured checkpoint directory
             or explicitly trusted paths are allowed. This prevents the scenario
             where a corrupted/tampered checkpoint triggers the fallback path and
             gains arbitrary code execution.
+
+            v2.5.0: Phase 2 now also verifies the checkpoint file's SHA-256
+            checksum against a stored .sha256 companion file (written by
+            save_checkpoint). If no checksum file exists, a warning is logged
+            but loading proceeds (backward compatibility). If the checksum does
+            not match, SecurityError is raised to prevent loading a tampered
+            file via pickle deserialization.
         """
         # Phase 1: Try safe loading first
         checkpoint = None
@@ -1041,7 +1081,6 @@ class LosionDistributedTrainer:
         except (TypeError, ValueError, pickle.UnpicklingError) as e:
             # Phase 2: Fallback with origin validation
             # Only allow weights_only=False for files in trusted directories.
-            import os
             import warnings
 
             abs_path = os.path.abspath(path)
@@ -1066,6 +1105,34 @@ class LosionDistributedTrainer:
                     f"require pickle deserialization (error: {e}). Only checkpoints "
                     f"in trusted directories are allowed for fallback loading. "
                     f"Trusted dirs: {trusted_dirs or '(none configured)'}"
+                )
+
+            # v2.5.0: Verify checkpoint integrity via SHA-256 checksum
+            checksum_path = path + ".sha256"
+            if os.path.exists(checksum_path):
+                try:
+                    with open(checksum_path, "r") as f:
+                        stored_checksum = f.read().split()[0]
+                    actual_checksum = self._compute_file_checksum(path)
+                    if stored_checksum != actual_checksum:
+                        raise SecurityError(
+                            f"Checkpoint integrity check FAILED for '{path}'. "
+                            f"Expected SHA-256: {stored_checksum}, "
+                            f"Actual SHA-256: {actual_checksum}. "
+                            f"The file may have been tampered with. "
+                            f"DO NOT load this checkpoint."
+                        )
+                    logger.info(f"Checkpoint integrity verified: {path}")
+                except (OSError, IndexError) as cs_err:
+                    logger.warning(
+                        f"Could not verify checkpoint checksum: {cs_err}. "
+                        f"Proceeding without integrity verification."
+                    )
+            else:
+                logger.warning(
+                    f"No checksum file found at {checksum_path}. "
+                    f"Cannot verify checkpoint integrity. "
+                    f"Only load checkpoints from trusted sources."
                 )
 
             warnings.warn(
