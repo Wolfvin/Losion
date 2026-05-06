@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "losion"
-version = "2.5.2"
+version = "2.5.3"
 description = "Losion — Hybrid AI Framework with Tri-Jalur Router Architecture"
 readme = "README.md"
 license = {text = "MIT"}

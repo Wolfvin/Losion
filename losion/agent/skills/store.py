@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field, asdict
@@ -237,9 +238,6 @@ class SkillEntry:
             elif condition == "result_is_non_empty":
                 if not result or not str(result).strip():
                     return False
-            elif condition in self._KNOWN_POSTCONDITIONS:
-                # Future-known conditions handled here
-                continue
             else:
                 # Unknown condition token — fail closed and alert
                 logger.error(
@@ -321,6 +319,9 @@ class SkillStore:
         auto_save: Whether to auto-save after every write operation.
         max_skills: Maximum number of skills to store (0 = unlimited).
         ttl_seconds: Time-to-live for skills in seconds (0 = no expiry).
+        strict_mode: If True, corruption on load raises RuntimeError instead
+            of silently resetting. Forces the caller to handle data loss
+            explicitly. Recommended for production deployments.
     """
 
     def __init__(
@@ -329,11 +330,13 @@ class SkillStore:
         auto_save: bool = True,
         max_skills: int = 0,
         ttl_seconds: float = 0,
+        strict_mode: bool = False,
     ) -> None:
         self.store_dir = Path(store_dir).expanduser()
         self.auto_save = auto_save
         self.max_skills = max_skills
         self.ttl_seconds = ttl_seconds
+        self.strict_mode = strict_mode
 
         # In-memory index: name → SkillEntry
         self._skills: Dict[str, SkillEntry] = {}
@@ -354,6 +357,9 @@ class SkillStore:
         (renamed to .corrupt.<timestamp>) instead of silently discarding data.
         The in-memory store is still reset so the process can continue, but
         the error is surfaced via logging so operators can investigate.
+
+        In strict_mode, corruption raises instead of silently resetting,
+        forcing the caller to handle data loss explicitly.
         """
         skills_dir = self.store_dir / "skills"
         if not skills_dir.exists():
@@ -391,22 +397,63 @@ class SkillStore:
                 self._skills = {}
                 self._hash_index = {}
                 self._domain_index = {}
+                # In strict mode, raise so the caller MUST handle data loss
+                if self.strict_mode:
+                    raise RuntimeError(
+                        f"SkillStore: corrupt index at {index_path}: {exc!r}. "
+                        f"Broken file preserved as .corrupt.<ts>. "
+                        f"Strict mode requires explicit handling of data loss."
+                    ) from exc
+
+    def _atomic_write(self, path: Path, content: str) -> None:
+        """Write content to a file atomically using temp file + rename.
+
+        This prevents partial writes on crash: if the process is killed
+        mid-write, the original file remains intact. The rename is atomic
+        on POSIX filesystems.
+
+        Args:
+            path: Target file path.
+            content: String content to write.
+        """
+        fd, tmp_path = tempfile.mkstemp(
+            dir=path.parent, prefix=".tmp_", suffix=".json"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.replace(tmp_path, path)
+        except BaseException:
+            # Clean up temp file on any failure (including crash)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def _save(self) -> None:
-        """Save skills to persistent storage."""
+        """Save skills to persistent storage using atomic writes.
+
+        Each file is written to a temp file first, then atomically renamed.
+        This prevents partial writes from corrupting data on crash.
+        The index is written LAST so that a crash mid-save leaves the
+        old index pointing to a mix of old and new skill files — all
+        of which are valid (skills are self-contained JSON objects).
+        """
         skills_dir = self.store_dir / "skills"
         skills_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save index
-        index = {name: entry.hash_key for name, entry in self._skills.items()}
-        with open(self.store_dir / "index.json", "w", encoding="utf-8") as f:
-            json.dump(index, f, indent=2, ensure_ascii=False)
-
-        # Save each skill
+        # Save each skill FIRST (before index — so index always
+        # points to valid skill files even if crash mid-save)
         for name, entry in self._skills.items():
             skill_path = skills_dir / f"{entry.hash_key}.json"
-            with open(skill_path, "w", encoding="utf-8") as f:
-                json.dump(entry.to_dict(), f, indent=2, ensure_ascii=False)
+            content = json.dumps(entry.to_dict(), indent=2, ensure_ascii=False)
+            self._atomic_write(skill_path, content)
+
+        # Save index LAST (so it points to the latest skill files)
+        index = {name: entry.hash_key for name, entry in self._skills.items()}
+        index_content = json.dumps(index, indent=2, ensure_ascii=False)
+        self._atomic_write(self.store_dir / "index.json", index_content)
 
         # Save global metadata
         meta = {
@@ -414,8 +461,8 @@ class SkillStore:
             "domains": list(self._domain_index.keys()),
             "last_updated": time.time(),
         }
-        with open(self.store_dir / "meta.json", "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2)
+        meta_content = json.dumps(meta, indent=2)
+        self._atomic_write(self.store_dir / "meta.json", meta_content)
 
     def lookup(self, name: str) -> Optional[SkillEntry]:
         """Look up a skill by name (O(1) via hash index).

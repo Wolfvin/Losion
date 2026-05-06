@@ -1,5 +1,5 @@
 # ============================================================================
-# Losion v2.5.2 — Python Dependencies
+# Losion v2.5.3 — Python Dependencies
 # ============================================================================
 # Pinned exact versions for reproducibility (audit finding C4.5).
 # Update with care — major version bumps may break compatibility.

@@ -162,8 +162,18 @@ class WebSearchInterface:
         elif self.config.backend == "custom":
             results = self._search_custom(query, num_results or self.config.max_results)
         else:
-            logger.warning(f"Unknown search backend: {self.config.backend}, using mock")
-            results = self._search_mock(query, num_results)
+            if self.config.allow_mock_fallback:
+                logger.warning(f"Unknown search backend: {self.config.backend}, falling back to mock")
+                results = self._search_mock(query, num_results)
+            else:
+                logger.error(
+                    f"Unknown search backend: {self.config.backend} and mock fallback is disabled"
+                )
+                raise ValueError(
+                    f"Unknown search backend: {self.config.backend}. "
+                    f"Set backend to 'zai', 'mock', or 'custom'. "
+                    f"Set allow_mock_fallback=True for development."
+                )
 
         # Score relevance
         results = self._score_relevance(query, results)

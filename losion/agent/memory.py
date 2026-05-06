@@ -45,6 +45,7 @@ import json
 import logging
 import math
 import os
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field, asdict
@@ -415,11 +416,13 @@ class EpisodicMemory:
         activation_decay: float = 0.5,
         auto_save: bool = True,
         encryption_passphrase: Optional[str] = None,
+        strict_mode: bool = False,
     ) -> None:
         self.store_dir = Path(store_dir).expanduser()
         self.max_episodes = max_episodes
         self.activation_decay = activation_decay
         self.auto_save = auto_save
+        self.strict_mode = strict_mode
 
         # Encryption at rest (audit finding A3.5)
         self._encryption = _EncryptionManager(encryption_passphrase)
@@ -677,6 +680,68 @@ class EpisodicMemory:
             if not self._domain_index[episode.domain]:
                 del self._domain_index[episode.domain]
 
+    @staticmethod
+    def _compute_checksum(data: bytes) -> str:
+        """Compute SHA-256 checksum of raw episode data.
+
+        Used for per-episode integrity verification on load. Stored in
+        the index alongside the episode ID, so that corruption or
+        tampering of individual episode files is detected without
+        nuking the entire store.
+
+        Args:
+            data: Raw bytes of the episode JSON (before encryption).
+
+        Returns:
+            Hex digest string (first 16 chars of SHA-256).
+        """
+        return hashlib.sha256(data).hexdigest()[:16]
+
+    def _atomic_write_text(self, path: Path, content: str) -> None:
+        """Write text content to a file atomically using temp file + rename.
+
+        Prevents partial writes on crash: if the process is killed mid-write,
+        the original file remains intact. The rename is atomic on POSIX.
+
+        Args:
+            path: Target file path.
+            content: String content to write.
+        """
+        fd, tmp_path = tempfile.mkstemp(
+            dir=path.parent, prefix=".tmp_", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    def _atomic_write_bytes(self, path: Path, data: bytes) -> None:
+        """Write binary content to a file atomically using temp file + rename.
+
+        Args:
+            path: Target file path.
+            data: Bytes to write.
+        """
+        fd, tmp_path = tempfile.mkstemp(
+            dir=path.parent, prefix=".tmp_", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
     def _load(self) -> None:
         """Load episodes from persistent storage.
 
@@ -684,9 +749,16 @@ class EpisodicMemory:
         PBKDF2 key derivation. Files are read and decrypted first, then the
         lock is acquired briefly to populate the in-memory store.
 
-        On corruption, preserves the broken file for forensic analysis
+        v2.5.3: Added per-episode checksum verification. Each episode's
+        JSON content is hashed on save and the checksum is stored in the
+        index. On load, checksums are verified — corrupted or tampered
+        episodes are skipped individually with an error log instead of
+        causing a full-store reset.
+
+        On index corruption, preserves the broken file for forensic analysis
         (renamed to .corrupt.<timestamp>) and skips bad entries individually
-        instead of nuking the full store. Errors are surfaced via logging.
+        instead of nuking the full store. In strict_mode, raises instead
+        of silently resetting.
         """
         episodes_dir = self.store_dir / "episodes"
         if not episodes_dir.exists():
@@ -712,12 +784,19 @@ class EpisodicMemory:
                     self._episodes = {}
                     self._query_index = {}
                     self._domain_index = {}
+                if self.strict_mode:
+                    raise RuntimeError(
+                        f"EpisodicMemory: corrupt index at {index_path}: {exc!r}. "
+                        f"Broken file preserved as .corrupt.<ts>. "
+                        f"Strict mode requires explicit handling of data loss."
+                    ) from exc
                 return
 
             # === Phase 1: Read and decrypt all files (outside lock) ===
             # This is the slow part — PBKDF2 + Fernet decryption per file.
             loaded_episodes: List[Episode] = []
             episode_ids = index.get("episode_ids", [])
+            checksums = index.get("checksums", {})  # episode_id → sha256[:16]
             for episode_id in episode_ids:
                 ep_path = episodes_dir / f"{episode_id}.json"
                 salt_path = episodes_dir / f"{episode_id}.salt"
@@ -730,11 +809,34 @@ class EpisodicMemory:
                             with open(ep_path, "rb") as f:
                                 encrypted_data = f.read()
                             decrypted_data = self._encryption.decrypt(encrypted_data, salt)
-                            episode = Episode.from_dict(json.loads(decrypted_data.decode("utf-8")))
+                            raw_json = decrypted_data.decode("utf-8")
+                            # Verify checksum (if available in index)
+                            expected = checksums.get(episode_id)
+                            if expected:
+                                actual = self._compute_checksum(decrypted_data)
+                                if actual != expected:
+                                    logger.error(
+                                        f"EpisodicMemory: checksum mismatch for "
+                                        f"episode {episode_id}: expected {expected}, "
+                                        f"got {actual}. Skipping corrupt/tampered entry."
+                                    )
+                                    continue
+                            episode = Episode.from_dict(json.loads(raw_json))
                         else:
                             # Load plain JSON episode
-                            with open(ep_path, "r", encoding="utf-8") as f:
-                                episode = Episode.from_dict(json.load(f))
+                            raw_json = ep_path.read_text(encoding="utf-8")
+                            # Verify checksum (if available in index)
+                            expected = checksums.get(episode_id)
+                            if expected:
+                                actual = self._compute_checksum(raw_json.encode("utf-8"))
+                                if actual != expected:
+                                    logger.error(
+                                        f"EpisodicMemory: checksum mismatch for "
+                                        f"episode {episode_id}: expected {expected}, "
+                                        f"got {actual}. Skipping corrupt/tampered entry."
+                                    )
+                                    continue
+                            episode = Episode.from_dict(json.loads(raw_json))
                         loaded_episodes.append(episode)
                     except (json.JSONDecodeError, KeyError, TypeError) as ep_exc:
                         # Skip this bad entry but continue loading others
@@ -777,8 +879,16 @@ class EpisodicMemory:
             episodes_snapshot = {
                 eid: ep.to_dict() for eid, ep in self._episodes.items()
             }
+            # Compute per-episode checksums for integrity verification.
+            # The checksum is computed on the SAME serialized bytes that will be
+            # written to disk (with indent=2) so that the load verification matches.
+            checksums = {}
+            for eid, ep_dict in episodes_snapshot.items():
+                raw = json.dumps(ep_dict, indent=2, ensure_ascii=False).encode("utf-8")
+                checksums[eid] = self._compute_checksum(raw)
             index_data = {
                 "episode_ids": list(self._episodes.keys()),
+                "checksums": checksums,
                 "last_updated": time.time(),
             }
             stats_data = {
@@ -791,12 +901,11 @@ class EpisodicMemory:
             }
 
         # === Phase 2: Encrypt + write to disk (outside lock, can be slow) ===
+        # Uses atomic writes (temp file + rename) to prevent partial writes on crash.
+        # Episode files are written BEFORE the index so that a crash mid-save
+        # leaves the old index pointing to a valid mix of old/new episodes.
         episodes_dir = self.store_dir / "episodes"
         episodes_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save index
-        with open(self.store_dir / "index.json", "w", encoding="utf-8") as f:
-            json.dump(index_data, f, indent=2)
 
         # Save each episode (with optional encryption — this is the slow part)
         for episode_id, episode_dict in episodes_snapshot.items():
@@ -808,22 +917,27 @@ class EpisodicMemory:
                 data_bytes = episode_json.encode("utf-8")
                 encrypted_bytes, salt = self._encryption.encrypt(data_bytes)
 
-                # Save salt alongside the encrypted data
+                # Save salt alongside the encrypted data (atomic)
                 salt_path = episodes_dir / f"{episode_id}.salt"
-                with open(salt_path, "wb") as sf:
-                    sf.write(salt)
+                self._atomic_write_bytes(salt_path, salt)
 
-                # Save encrypted data as binary
-                with open(ep_path, "wb") as f:
-                    f.write(encrypted_bytes)
+                # Save encrypted data as binary (atomic)
+                self._atomic_write_bytes(ep_path, encrypted_bytes)
             else:
-                # Save as plain JSON
-                with open(ep_path, "w", encoding="utf-8") as f:
-                    f.write(episode_json)
+                # Save as plain JSON (atomic)
+                self._atomic_write_text(ep_path, episode_json)
+
+        # Save index LAST (so it references valid episode files)
+        self._atomic_write_text(
+            self.store_dir / "index.json",
+            json.dumps(index_data, indent=2)
+        )
 
         # Save stats
-        with open(self.store_dir / "stats.json", "w", encoding="utf-8") as f:
-            json.dump(stats_data, f, indent=2)
+        self._atomic_write_text(
+            self.store_dir / "stats.json",
+            json.dumps(stats_data, indent=2)
+        )
 
     def get_stats(self) -> Dict[str, Any]:
         """Get memory statistics."""

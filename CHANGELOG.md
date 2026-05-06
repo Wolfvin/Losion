@@ -5,6 +5,41 @@ All notable changes to the Losion project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.3] — 2026-05-06
+
+### "Concurrency, Crash Safety & Data Integrity — Agent Layer Hardening"
+
+Follow-up patch addressing 8 findings from the v2.5.2 hostile audit focusing on concurrency, silent failure, invariant breakage, and data-loss risk in the agent layer's data flow paths. Four findings were already fully addressed by prior patches (#1 race condition, #4 executable fields, #6 CalibrationEngine locks, #8 LRU cache); this patch completes the remaining 4 plus a bonus threshold mapping gap.
+
+#### Fixed — MENENGAH (3 issues)
+
+- **#2: Silent destructive recovery on load corruption (`SkillStore._load`)** (`agent/skills/store.py`): When `index.json` was corrupt, `_load()` would reset all in-memory data (`_skills`, `_hash_index`, `_domain_index`) with only a log message. The next auto-save could then overwrite healthy files, making the data loss permanent. Fix: Added `strict_mode: bool = False` parameter to `SkillStore.__init__`. In strict mode, corruption raises `RuntimeError` instead of silently resetting, forcing the caller to handle data loss explicitly. The corrupt file is still preserved (renamed to `.corrupt.<timestamp>`) for forensic recovery. Also added atomic writes (`_atomic_write()`) using temp file + `os.replace()` to prevent partial writes on crash — the index is written LAST so that a crash mid-save leaves old index pointing to valid skill files.
+
+- **#3: Silent destructive recovery on load corruption (`EpisodicMemory._load`)** (`agent/memory.py`): Same pattern as #2 — a single malformed index could wipe the entire active memory view with no guaranteed error surface to caller. Fix: Added `strict_mode: bool = False` parameter with same behavior as SkillStore (raises in strict mode, resets in lenient mode). Added per-episode SHA-256 checksums stored in the index (`checksums` dict: `episode_id → sha256[:16]`). On load, each episode's JSON content is verified against its checksum — corrupted or tampered episodes are skipped individually with an error log instead of causing a full-store reset. Checksums are backward-compatible: old indexes without `checksums` simply skip verification. Also added atomic writes for both text and binary files (`_atomic_write_text()`, `_atomic_write_bytes()`), with episode files written before the index to maintain crash safety ordering.
+
+- **#5: Missing verification + logic inversion in postcondition checker** (`agent/skills/store.py`): `_verify_postconditions()` had an unreachable dead code branch: `elif condition in self._KNOWN_POSTCONDITIONS: continue`. Since both known conditions (`result_is_valid_json`, `result_is_non_empty`) are already handled by the `if`/`elif` branches above it, this branch could never be hit. Unknown tokens were already handled correctly (fail-closed with `logger.error` + `return False`), so the dead branch was merely misleading. Fix: Removed the unreachable `elif` branch entirely. The logic now flows directly from the two recognized conditions to the `else` fail-closed branch for unknown tokens.
+
+#### Fixed — RENDAH (2 issues)
+
+- **#7: Silent fallback hides upstream outages in web search** (`agent/tools/web_search.py`): The unknown-backend branch in `search()` fell back to `_search_mock()` unconditionally, bypassing `allow_mock_fallback`. A typo in the backend config (e.g., `"zia"` instead of `"zai"`) would silently produce fabricated `example.com` results that downstream planners might treat as real evidence. Fix: Added `allow_mock_fallback` check for the unknown-backend case. If `allow_mock_fallback=True` (development mode), falls back to mock with a warning. If `allow_mock_fallback=False` (production default), raises `ValueError` with guidance to fix the backend config. This closes the last gap where mock results could be produced without explicit opt-in.
+
+- **Bonus: CalibrationEngine `threshold_map` missing `"terminal"` key** (`agent/calibration.py`): `record_outcome()` callers may pass `action="terminal"` but `_adapt_profile()`'s `threshold_map` only mapped `"terminal_execute"` → `terminal_threshold`. This meant outcomes from the commonly-used `"terminal"` action name were silently discarded during profile adaptation — load balancing for terminal execution was never actually adapting. Fix: Added `"terminal": "terminal_threshold"` as an alias in the `threshold_map`, so both forms are accepted. Added a comment noting that both forms map to the same trust score key.
+
+#### Already Fixed (4 findings — no code changes needed)
+
+- **#1: Race condition in `SkillStore.search`**: Both `_skills` and `_domain_index` are already snapshotted atomically under lock (fixed in a prior version). No change needed.
+- **#4: `SkillEntry.to_dict()` omits executable fields**: All executable fields (`executable_code`, `preconditions`, `postconditions`, `error_patterns`) are already included in `to_dict()` and `from_dict()` with backward-compatible `.get()` defaults (fixed in a prior version). No change needed.
+- **#6: `CalibrationEngine` mutates shared dicts without locks**: `self._lock = threading.RLock()` is already defined and used in all read/write methods (`get_thresholds`, `record_outcome`, `get_tool_trust`, `get_stats`). No change needed.
+- **#8: Unbounded cache in `WebSearchInterface`**: Already uses `OrderedDict`-based LRU with `max_cache_entries` cap (default 1000), TTL expiry on both read and write, and `popitem(last=False)` eviction. No change needed.
+
+#### Version Updates
+
+- `losion/__init__.py`: `__version__` bumped to `"2.5.3"`
+- `setup.py`: version bumped to `"2.5.3"`
+- `pyproject.toml`: version bumped to `"2.5.3"`
+- `README.md`: badge updated to `2.5.3`
+- `requirements.txt`: header updated to `v2.5.3`
+
 ## [2.5.2] — 2026-05-06
 
 ### "Code Quality & Performance — Weight Init Fix, Lock Contention, Dead Code, Silent Swallows"

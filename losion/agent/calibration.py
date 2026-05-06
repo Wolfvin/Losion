@@ -306,6 +306,10 @@ class CalibrationEngine:
                 "verify": "verify_output",
             }
 
+            # Note: both "terminal" and "terminal_execute" callers map to
+            # the same trust score key. The threshold_map in _adapt_profile
+            # also accepts both forms.
+
             for action, tool_name in tool_action_map.items():
                 trust = self._tool_trust.get(tool_name)
                 if trust and trust.total_uses >= self.min_samples:
@@ -404,6 +408,7 @@ class CalibrationEngine:
             "tool_search": "tool_search_threshold",
             "verify": "verify_threshold",
             "terminal_execute": "terminal_threshold",
+            "terminal": "terminal_threshold",  # Alias: callers may use either form
         }
 
         field_name = threshold_map.get(action)
