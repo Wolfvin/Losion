@@ -162,11 +162,18 @@ def ssd_chunk_scan(
     #   h = cumsum(xB / cumprod_dA) * cumprod_dA
 
     # Log-space parallel scan
+    # Numerical stability: clamp cum_log_dA so that running_prod stays in
+    # [exp(-80), exp(20)] and inv_running_prod in [exp(-20), exp(80)].
+    # This prevents the 1/x backward gradient (-1/x^2) from overflowing
+    # when running_prod underflows toward zero on long sequences.
     log_dA = torch.log(dA.clamp(min=1e-20))  # (batch, seq_len, d_inner, d_state)
     cum_log_dA = torch.cumsum(log_dA, dim=1)  # accumulate along seq dim
+    cum_log_dA = torch.clamp(cum_log_dA, min=-80.0, max=20.0)  # numerical stability
     running_prod = torch.exp(cum_log_dA)  # cumprod of dA
 
-    inv_running_prod = 1.0 / running_prod.clamp(min=1e-20)
+    # Use exp(-cum_log_dA) instead of 1/exp(cum_log_dA) to avoid the
+    # reciprocal backward path that produces -1/x^2 overflow gradients.
+    inv_running_prod = torch.exp(-cum_log_dA)
     weighted_xB = xB * inv_running_prod
     cumsum_weighted = torch.cumsum(weighted_xB, dim=1)
 

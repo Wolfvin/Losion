@@ -422,7 +422,6 @@ class TestSSMTerpaduLayer:
         logits = ssm_terpadu_layer.get_routing_logits(x)
         assert logits.shape == (2, 16, 3)
 
-    @pytest.mark.xfail(reason="Known numerical issue: NaN gradient in SSMTerpaduLayer (pre-existing bug)")
     def test_gradient_flow(self, ssm_terpadu_layer):
         """Test bahwa gradient mengalir melalui layer."""
         x = torch.randn(2, 16, 64, requires_grad=True)

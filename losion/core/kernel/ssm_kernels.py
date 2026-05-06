@@ -109,7 +109,13 @@ def _pytorch_associative_scan(
         # Using: y_t = sum_{i=0}^{t} (b_i * prod_{j=i+1}^{t} a_j)
         # This can be computed as:
         #   y = cumsum(b / running_prod) * running_prod
-        inv_running_prod = 1.0 / torch.clamp(running_prod, min=1e-20)
+        #
+        # Numerical stability: clamp log_cumsum to prevent running_prod underflow
+        # and use exp(-log_cumsum) instead of 1/exp(log_cumsum) to avoid the
+        # reciprocal backward path that produces -1/x^2 overflow gradients.
+        log_cumsum = torch.clamp(log_cumsum, min=-80.0, max=80.0)
+        running_prod = torch.exp(log_cumsum)
+        inv_running_prod = torch.exp(-log_cumsum)
         weighted_values = values * inv_running_prod
         cumsum_weighted = torch.cumsum(weighted_values, dim=1)
         result = cumsum_weighted * running_prod
@@ -358,11 +364,14 @@ def _intra_chunk_scan_per_channel(
         Hidden states (batch, n_chunks, chunk_size, d_inner, d_state).
     """
     # Use cumsum-based parallel scan within each chunk
+    # Numerical stability: clamp cum_log_A and use exp(-cum_log_A) instead of
+    # 1/exp(cum_log_A) to avoid reciprocal backward overflow.
     log_A = torch.log(torch.clamp(A, min=1e-20))
     cum_log_A = torch.cumsum(log_A, dim=2)  # accumulate along chunk dim
+    cum_log_A = torch.clamp(cum_log_A, min=-80.0, max=80.0)  # numerical stability
 
     running_prod = torch.exp(cum_log_A)
-    inv_running_prod = 1.0 / torch.clamp(running_prod, min=1e-20)
+    inv_running_prod = torch.exp(-cum_log_A)
 
     weighted_xB = xB * inv_running_prod
     cumsum_weighted = torch.cumsum(weighted_xB, dim=2)
@@ -412,8 +421,10 @@ def _inter_chunk_propagate_per_channel(
     # (batch, n_chunks, d_inner, d_state) -> scan along dim=1
     log_A_prod = torch.log(torch.clamp(A_chunk_prod, min=1e-20))  # (batch, n_chunks, d_inner, d_state)
     cum_log_A_prod = torch.cumsum(log_A_prod, dim=1)  # (batch, n_chunks, d_inner, d_state)
+    # Numerical stability: clamp and use exp(-x) instead of 1/exp(x)
+    cum_log_A_prod = torch.clamp(cum_log_A_prod, min=-80.0, max=80.0)
     running_A_prod = torch.exp(cum_log_A_prod)  # (batch, n_chunks, d_inner, d_state)
-    inv_running_A_prod = 1.0 / torch.clamp(running_A_prod, min=1e-20)
+    inv_running_A_prod = torch.exp(-cum_log_A_prod)
 
     # Weighted cumsum of h_final terms
     weighted_h_final = h_final * inv_running_A_prod
@@ -517,12 +528,21 @@ def rwkv7_parallel_wkv(
 
     # Compute running product of decay factors: D_t = prod_{j=0}^{t} decay_j
     # In log space: log_D_t = cumsum(log(decay_t))
+    #
+    # Numerical stability (v1.6.1 fix): clamp cum_log_decay to [-80, 0] so that
+    # running_decay_prod stays in [exp(-80), 1] and inv_running_prod in [1, exp(80)].
+    # Without this clamp, long sequences with small decay cause running_decay_prod to
+    # underflow to 0, making 1/running_decay_prod overflow → inf → NaN gradients.
+    # exp(80) ≈ 5e34 and exp(-80) ≈ 2e-35 are well within float32 range.
     log_decay = torch.log(torch.clamp(decay, min=1e-20))  # (batch, seq_len, d_head)
     cum_log_decay = torch.cumsum(log_decay, dim=1)          # (batch, seq_len, d_head)
+    cum_log_decay = torch.clamp(cum_log_decay, max=0.0, min=-80.0)  # numerical stability
     running_decay_prod = torch.exp(cum_log_decay)            # (batch, seq_len, d_head)
 
-    # Inverse of running product for the weighted cumsum
-    inv_running_prod = 1.0 / torch.clamp(running_decay_prod, min=1e-20)
+    # Inverse of running product — use exp(-cum_log_decay) instead of 1/exp(cum_log_decay)
+    # to avoid the reciprocal backward path which produces -1/x^2 gradients that overflow
+    # when x (running_decay_prod) is very small.
+    inv_running_prod = torch.exp(-cum_log_decay)             # (batch, seq_len, d_head)
 
     # --- wkv_state parallel scan ---
     # wkv_state_t = sum_{i=0}^{t} kv_i * prod_{j=i+1}^{t} decay_j
