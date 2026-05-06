@@ -8,6 +8,7 @@ Covers three critical areas identified in audit V-09:
 """
 
 import json
+import math
 import os
 import tempfile
 from pathlib import Path
@@ -19,7 +20,11 @@ import torch.nn.functional as F
 
 from losion.agent.tools.terminal import SandboxedTerminal, SandboxConfig, TerminalResult
 from losion.agent.memory import EpisodicMemory, Episode, _FERNET_AVAILABLE, _FernetInvalidToken
-from losion.inference.generation import SpeculativeDecoder, GenerationConfig
+from losion.inference.generation import (
+    SpeculativeDecoder,
+    GenerationConfig,
+    ContinuousBatcher,
+)
 
 
 # ============================================================================
@@ -926,3 +931,524 @@ class TestV254Integration:
         results = reloaded.retrieve_similar("new query")
         assert len(results) > 0
         assert results[0][0].query == "new query"
+
+
+# ============================================================================
+# 4. Rejection Sampling — Statistical verification (W-03)
+# ============================================================================
+
+
+class TestRejectionSamplingStatistical:
+    """Statistically verify that rejection sampling uses min(1, p_target/p_draft).
+
+    The previous implementation used a fixed threshold of 0.5 for acceptance.
+    The correct formula is accept_prob = min(1, p_target(x) / p_draft(x)).
+
+    These tests run many trials with controlled probability distributions and
+    verify that the observed acceptance rate is consistent with the ratio-based
+    formula and inconsistent with a fixed threshold or always-accept behavior.
+    """
+
+    @staticmethod
+    def _make_target_model(target_logits_vec, vocab_size):
+        """Create a mock model that returns controlled logits at every position.
+
+        Args:
+            target_logits_vec: List/tensor of logits [vocab_size] to return at
+                every sequence position.
+            vocab_size: Vocabulary size.
+
+        Returns:
+            MagicMock model whose forward() returns .logits with the given
+            target_logits_vec at every position.
+        """
+        model = MagicMock()
+        logits_template = torch.tensor(target_logits_vec, dtype=torch.float32)
+
+        def forward(input_ids=None, **kwargs):
+            batch_size, seq_len = input_ids.shape
+            # Expand the template to [batch, seq_len, vocab_size]
+            logits = logits_template.unsqueeze(0).unsqueeze(0).expand(
+                batch_size, seq_len, vocab_size
+            ).contiguous().clone()
+            output = MagicMock()
+            output.logits = logits
+            return output
+
+        model.side_effect = forward
+        model.__call__ = forward
+        return model
+
+    def test_acceptance_rate_low_target_high_draft(self):
+        """With p_target=0.01 and p_draft=0.9, acceptance rate should be ~1.1%.
+
+        This is statistically distinguishable from:
+        - Fixed threshold 0.5: since p_target=0.01 < 0.5, always reject → 0%
+        - Always accept: 100%
+
+        The correct formula min(1, 0.01/0.9) ≈ 0.0111 gives ~1.1% acceptance.
+        With 1000 trials, the probability of observing 0 acceptances is
+        (1 - 0.0111)^1000 ≈ 10^{-5}, so this test is not flaky.
+        """
+        vocab_size = 3
+        draft_token = 0
+
+        # Target distribution: p_target = [0.01, 0.495, 0.495]
+        # Construct logits: softmax([0, ln(49.5), ln(49.5)]) = [0.01, 0.495, 0.495]
+        # Verification: exp(0) / (exp(0) + exp(ln(49.5)) + exp(ln(49.5)))
+        #             = 1 / (1 + 49.5 + 49.5) = 1/100 = 0.01 ✓
+        target_logits = [0.0, math.log(49.5), math.log(49.5)]
+        model = self._make_target_model(target_logits, vocab_size)
+
+        # Draft distribution: p_draft = [0.9, 0.05, 0.05]
+        draft_probs = torch.tensor([[0.9, 0.05, 0.05]])
+
+        decoder = SpeculativeDecoder(model, draft_steps=1, temperature=1.0)
+
+        num_trials = 1000
+        num_accepted = 0
+
+        for _ in range(num_trials):
+            # Set draft probs directly on the decoder (simulating what
+            # _generate_draft_tokens_ssm would set)
+            decoder._last_draft_probs = draft_probs.clone()
+
+            input_ids = torch.tensor([[1, 2]])
+            draft_tokens = [draft_token]
+
+            _, _, num_accepted_i = decoder._verify_draft_tokens(
+                input_ids, draft_tokens
+            )
+
+            if num_accepted_i >= 1:
+                num_accepted += 1
+
+        acceptance_rate = num_accepted / num_trials
+
+        # Expected acceptance rate: min(1, 0.01/0.9) ≈ 0.0111 → ~1.1%
+        # With 1000 trials, 99% CI for binomial(p=0.0111): roughly [0.4%, 2.2%]
+
+        # Must be > 0%: rules out fixed threshold 0.5
+        # (where p_target=0.01 < 0.5 → always reject → 0%)
+        assert acceptance_rate > 0.0, (
+            f"Acceptance rate should be > 0% with min(1, p_target/p_draft) formula, "
+            f"got {acceptance_rate:.4f}. A fixed threshold of 0.5 would give 0% "
+            f"(since p_target=0.01 < 0.5)."
+        )
+
+        # Must be < 10%: rules out always-accept behavior
+        assert acceptance_rate < 0.10, (
+            f"Acceptance rate should be < 10% with min(1, 0.01/0.9) ≈ 1.1%, "
+            f"got {acceptance_rate:.4f}. Always-accept would give 100%."
+        )
+
+        # Must be roughly around 1.1% (wide interval to avoid flakiness)
+        assert 0.003 < acceptance_rate < 0.03, (
+            f"Acceptance rate should be roughly 1.1% (min(1, 0.01/0.9)), "
+            f"got {acceptance_rate:.4f}"
+        )
+
+    def test_acceptance_rate_high_target_low_draft(self):
+        """With p_target=0.9 and p_draft=0.1, acceptance should be 100%.
+
+        min(1, 0.9/0.1) = min(1, 9) = 1.0, so every draft token should be
+        accepted. This distinguishes the correct formula from both:
+        - A broken implementation that caps the ratio
+        - A formula that inverts the ratio (would give min(1, 0.1/0.9) ≈ 11%)
+        """
+        vocab_size = 3
+        draft_token = 0
+
+        # Target distribution: p_target = [0.9, 0.05, 0.05]
+        # Construct logits: softmax([ln(18), 0, 0]) = [18/20, 1/20, 1/20] = [0.9, 0.05, 0.05]
+        target_logits = [math.log(18.0), 0.0, 0.0]
+        model = self._make_target_model(target_logits, vocab_size)
+
+        # Draft distribution: p_draft = [0.1, 0.45, 0.45]
+        draft_probs = torch.tensor([[0.1, 0.45, 0.45]])
+
+        decoder = SpeculativeDecoder(model, draft_steps=1, temperature=1.0)
+
+        num_trials = 200
+        num_accepted = 0
+
+        for _ in range(num_trials):
+            decoder._last_draft_probs = draft_probs.clone()
+
+            input_ids = torch.tensor([[1, 2]])
+            draft_tokens = [draft_token]
+
+            _, _, num_accepted_i = decoder._verify_draft_tokens(
+                input_ids, draft_tokens
+            )
+
+            if num_accepted_i >= 1:
+                num_accepted += 1
+
+        acceptance_rate = num_accepted / num_trials
+
+        # Should be 100% (or very close — allowing for floating-point edge cases)
+        assert acceptance_rate >= 0.95, (
+            f"Acceptance rate should be ~100% with min(1, 0.9/0.1)=1.0, "
+            f"got {acceptance_rate:.4f}. "
+            f"An inverted ratio (min(1, 0.1/0.9) ≈ 11%) would give ~11%."
+        )
+
+    def test_acceptance_rate_distinguishes_from_fixed_threshold(self):
+        """Verify that the acceptance rate is inconsistent with fixed threshold 0.5.
+
+        With p_target=0.3 and p_draft=0.6:
+        - Correct formula: accept_prob = min(1, 0.3/0.6) = 0.5 → ~50% acceptance
+        - Fixed threshold 0.5: since p_target=0.3 < 0.5, always reject → 0%
+
+        This test confirms the two give different results, ruling out the
+        fixed-threshold interpretation.
+        """
+        vocab_size = 3
+        draft_token = 0
+
+        # Target distribution: p_target = [0.3, 0.35, 0.35]
+        # softmax([0, x, x]) = [0.3, 0.35, 0.35]
+        # exp(0) / (exp(0) + 2*exp(x)) = 0.3
+        # 1 / (1 + 2*exp(x)) = 0.3 → 2*exp(x) = 7/3 → exp(x) = 7/6
+        logit_ratio = math.log(7.0 / 6.0)
+        target_logits = [0.0, logit_ratio, logit_ratio]
+        model = self._make_target_model(target_logits, vocab_size)
+
+        # Draft distribution: p_draft = [0.6, 0.2, 0.2]
+        draft_probs = torch.tensor([[0.6, 0.2, 0.2]])
+
+        decoder = SpeculativeDecoder(model, draft_steps=1, temperature=1.0)
+
+        num_trials = 500
+        num_accepted = 0
+
+        for _ in range(num_trials):
+            decoder._last_draft_probs = draft_probs.clone()
+
+            input_ids = torch.tensor([[1, 2]])
+            draft_tokens = [draft_token]
+
+            _, _, num_accepted_i = decoder._verify_draft_tokens(
+                input_ids, draft_tokens
+            )
+
+            if num_accepted_i >= 1:
+                num_accepted += 1
+
+        acceptance_rate = num_accepted / num_trials
+
+        # Correct formula: ~50% acceptance rate
+        # Fixed threshold 0.5: 0% (since p_target=0.3 < 0.5, always reject)
+        assert acceptance_rate > 0.2, (
+            f"Acceptance rate should be ~50% with min(1, 0.3/0.6)=0.5, "
+            f"got {acceptance_rate:.4f}. "
+            f"A fixed threshold of 0.5 would give 0% (p_target=0.3 < 0.5)."
+        )
+        assert acceptance_rate < 0.8, (
+            f"Acceptance rate should be ~50%, got {acceptance_rate:.4f}"
+        )
+
+
+# ============================================================================
+# 5. ContinuousBatcher — Iteration-level scheduling (W-07)
+# ============================================================================
+
+
+class TestContinuousBatcher:
+    """Test the ContinuousBatcher class for concurrent generation requests.
+
+    Tests verify:
+    - Request tracking (add/remove/count)
+    - Token generation per step
+    - Attention mask creation during padding
+    - Repetition penalty uses actual sequence (not padded input)
+    - End-to-end run_until_complete
+    """
+
+    @staticmethod
+    def _make_batcher_model(vocab_size=100):
+        """Create a mock model for ContinuousBatcher tests.
+
+        Returns logits of shape [batch, seq_len, vocab_size] with random
+        values so that greedy decoding picks different tokens each step.
+        """
+        model = MagicMock()
+
+        def forward(input_ids=None, **kwargs):
+            batch_size, seq_len = input_ids.shape
+            logits = torch.randn(batch_size, seq_len, vocab_size)
+            output = MagicMock()
+            output.logits = logits
+            return output
+
+        model.side_effect = forward
+        model.__call__ = forward
+        return model
+
+    def test_add_request_increments_count(self):
+        """Adding a request should increment the active request count."""
+        model = self._make_batcher_model()
+        batcher = ContinuousBatcher(model, max_batch_size=8)
+
+        assert batcher.num_active == 0
+        assert batcher.active_requests == []
+
+        rid1 = batcher.add_request(torch.tensor([1, 2, 3]))
+        assert batcher.num_active == 1
+        assert rid1 in batcher.active_requests
+
+        rid2 = batcher.add_request(torch.tensor([4, 5, 6]))
+        assert batcher.num_active == 2
+        assert rid2 in batcher.active_requests
+
+        # Request IDs should be distinct and monotonically increasing
+        assert rid1 != rid2
+        assert rid2 > rid1
+
+    def test_step_produces_tokens(self):
+        """After adding a request and calling step(), a token should be generated."""
+        model = self._make_batcher_model()
+        batcher = ContinuousBatcher(model, max_batch_size=8)
+
+        config = GenerationConfig(
+            max_new_tokens=5,
+            do_sample=False,
+            eos_token_id=999,  # Avoid early stopping
+        )
+        rid = batcher.add_request(torch.tensor([1, 2, 3]), config)
+
+        # Before step: no tokens generated
+        req = batcher.get_request(rid)
+        assert req.num_generated == 0
+        assert len(req.generated_ids) == 0
+
+        # Run one step
+        finished = batcher.step()
+
+        # With max_new_tokens=5, the request should still be active after 1 step
+        if rid in finished:
+            # If it finished (unlikely with eos_token_id=999), verify tokens
+            result = finished[rid]
+            assert result.num_generated >= 1
+        else:
+            # Should still be active with 1 token generated
+            req = batcher.get_request(rid)
+            assert req is not None
+            assert req.num_generated == 1
+            assert len(req.generated_ids) == 1
+            # The generated token should be a valid integer
+            assert isinstance(req.generated_ids[0], int)
+
+    def test_attention_mask_created_during_padding(self):
+        """When sequences have different lengths, an attention_mask should be
+        created and passed to the model.
+
+        The mask should have 1s for real tokens and 0s for padding, ensuring
+        that padding tokens do not contaminate hidden states via attention.
+        Without an attention_mask, the model treats padding tokens as real
+        input, producing incorrect representations.
+        """
+        vocab_size = 50
+        captured_masks = []
+
+        model = MagicMock()
+
+        def forward(input_ids=None, **kwargs):
+            batch_size, seq_len = input_ids.shape
+            # Capture the attention_mask passed to the model
+            captured_masks.append(kwargs.get("attention_mask"))
+            logits = torch.randn(batch_size, seq_len, vocab_size)
+            output = MagicMock()
+            output.logits = logits
+            return output
+
+        model.side_effect = forward
+        model.__call__ = forward
+
+        batcher = ContinuousBatcher(model, max_batch_size=8)
+
+        # Add two requests with different sequence lengths to force padding
+        config = GenerationConfig(
+            max_new_tokens=1,
+            do_sample=False,
+            eos_token_id=999,
+        )
+        short_ids = torch.tensor([10, 20, 30])  # length 3
+        long_ids = torch.tensor([10, 20, 30, 40, 49])  # length 5
+
+        batcher.add_request(short_ids, config)
+        batcher.add_request(long_ids, config)
+
+        # Run step — will pad short_ids to match long_ids length
+        batcher.step()
+
+        # The model should have been called with attention_mask
+        assert len(captured_masks) >= 1, "Model should have been called at least once"
+
+        mask = captured_masks[-1]
+        assert mask is not None, "attention_mask should be passed to the model"
+
+        # Mask shape should be [batch=2, max_len=5]
+        assert mask.shape[0] == 2, f"Batch size should be 2, got {mask.shape[0]}"
+        assert mask.shape[1] == 5, f"Max sequence length should be 5, got {mask.shape[1]}"
+
+        # Short sequence (left-padded): first 2 positions are padding (0),
+        # last 3 positions are real tokens (1)
+        short_mask = mask[0]
+        assert short_mask[:2].sum().item() == 0, (
+            f"First 2 positions of short seq mask should be 0 (padding), "
+            f"got {short_mask[:2].tolist()}"
+        )
+        assert short_mask[2:].sum().item() == 3, (
+            f"Last 3 positions of short seq mask should be 1 (real tokens), "
+            f"got {short_mask[2:].tolist()}"
+        )
+
+        # Long sequence (no padding): all positions are real tokens (1)
+        long_mask = mask[1]
+        assert long_mask.sum().item() == 5, (
+            f"All positions of long seq mask should be 1 (no padding), "
+            f"got {long_mask.tolist()}"
+        )
+
+    def test_repetition_penalty_uses_actual_sequence_not_padding(self):
+        """Repetition penalty should be computed against the original sequence,
+        not the padded input.
+
+        When sequences of different lengths are batched together, shorter
+        sequences are left-padded with 0s. If the logits processor used the
+        padded sequence, token 0 (the pad value) would be falsely penalized,
+        changing which token is selected by greedy decoding.
+
+        The v2.5.5 fix passes the actual (unpadded) sequence to the processor,
+        so only tokens that genuinely appear in the input are penalized.
+        """
+        vocab_size = 10
+        model = MagicMock()
+
+        # Model always returns logits where token 0 has the highest value
+        # and token 1 is second-highest. All other tokens have logit 0.
+        def forward(input_ids=None, **kwargs):
+            batch_size, seq_len = input_ids.shape
+            logits = torch.zeros(batch_size, seq_len, vocab_size)
+            logits[:, :, 0] = 10.0  # Token 0 has highest logit
+            logits[:, :, 1] = 1.0  # Token 1 is second highest
+            output = MagicMock()
+            output.logits = logits
+            return output
+
+        model.side_effect = forward
+        model.__call__ = forward
+
+        batcher = ContinuousBatcher(model, max_batch_size=8)
+
+        # Add a request with a sequence that does NOT contain token 0.
+        # Token 0 is the pad value, so it would appear in the padded input
+        # (as left-padding) but NOT in the actual sequence.
+        input_ids = torch.tensor([5, 6, 7])  # No token 0 present
+        config = GenerationConfig(
+            max_new_tokens=1,
+            repetition_penalty=100.0,  # Very high penalty
+            do_sample=False,  # Greedy decoding
+            eos_token_id=999,  # Avoid early stopping
+        )
+
+        # Add a longer request to force padding of the short sequence
+        longer_input = torch.tensor([3, 4, 5, 6, 7])
+        batcher.add_request(
+            longer_input,
+            GenerationConfig(
+                max_new_tokens=1,
+                do_sample=False,
+                eos_token_id=999,
+                repetition_penalty=100.0,
+            ),
+        )
+
+        rid = batcher.add_request(input_ids, config)
+
+        # Run step
+        finished = batcher.step()
+
+        # With the ACTUAL sequence [5, 6, 7] (no token 0):
+        #   token 0 is NOT in the unique set → NOT penalized → logit stays 10.0
+        #   → greedy picks token 0 ✓
+        #
+        # With the PADDED sequence [0, 0, 5, 6, 7] (includes token 0):
+        #   token 0 IS in the unique set → penalized → logit becomes 10.0/100 = 0.1
+        #   → token 1 (logit 1.0, not penalized) wins → picks token 1 ✗
+        if rid in finished:
+            result = finished[rid]
+            assert 0 in result.new_token_ids, (
+                f"Token 0 should be generated (not in actual seq, so not penalized). "
+                f"This verifies repetition penalty uses the actual sequence, not padding. "
+                f"Got tokens: {result.new_token_ids}"
+            )
+        else:
+            req = batcher.get_request(rid)
+            assert req is not None
+            assert 0 in req.generated_ids, (
+                f"Token 0 should be generated (not in actual seq, so not penalized). "
+                f"This verifies repetition penalty uses the actual sequence, not padding. "
+                f"Got tokens: {req.generated_ids}"
+            )
+
+    def test_run_until_complete(self):
+        """Adding a request with short max_new_tokens and running until complete
+        should produce the expected number of tokens.
+        """
+        vocab_size = 100
+        model = MagicMock()
+
+        # Model returns logits where token 5 always has the highest logit
+        # so greedy decoding deterministically picks token 5 every step.
+        def forward(input_ids=None, **kwargs):
+            batch_size, seq_len = input_ids.shape
+            logits = torch.zeros(batch_size, seq_len, vocab_size)
+            logits[:, :, 5] = 10.0  # Token 5 always wins with greedy
+            output = MagicMock()
+            output.logits = logits
+            return output
+
+        model.side_effect = forward
+        model.__call__ = forward
+
+        batcher = ContinuousBatcher(model, max_batch_size=8)
+
+        config = GenerationConfig(
+            max_new_tokens=3,
+            do_sample=False,
+            eos_token_id=999,  # Avoid early stopping
+        )
+        rid = batcher.add_request(torch.tensor([1, 2, 3]), config)
+
+        results = batcher.run_until_complete(max_iterations=100)
+
+        assert rid in results, f"Request {rid} should be in results"
+        result = results[rid]
+
+        # Should generate exactly 3 tokens
+        assert result.num_generated == 3, (
+            f"Should generate exactly 3 tokens, got {result.num_generated}"
+        )
+        assert len(result.new_token_ids) == 3, (
+            f"new_token_ids should have 3 tokens, got {len(result.new_token_ids)}"
+        )
+
+        # With greedy decoding and our model, all generated tokens should be 5
+        assert all(t == 5 for t in result.new_token_ids), (
+            f"All generated tokens should be 5 (greedy + fixed logits), "
+            f"got {result.new_token_ids}"
+        )
+
+        # The complete sequence should be input (3 tokens) + generated (3 tokens)
+        assert len(result.generated_ids) == 6, (
+            f"generated_ids should have 6 tokens (3 input + 3 generated), "
+            f"got {len(result.generated_ids)}"
+        )
+
+        # Finish reason should be "length" (hit max_new_tokens)
+        assert result.finish_reason == "length", (
+            f"Finish reason should be 'length', got '{result.finish_reason}'"
+        )

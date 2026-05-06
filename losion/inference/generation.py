@@ -806,13 +806,23 @@ class ContinuousBatcher:
             len(sequences), max_len,
             dtype=sequences[0].dtype, device=self.device,
         )
+        # v2.5.5: Build attention_mask so the model knows which tokens
+        # are real (1) vs padding (0). Without this, padding tokens
+        # contaminate hidden states via attention and SSM state, and
+        # token ID 0 (the pad value) gets incorrectly penalized by
+        # repetition penalty.
+        attention_mask = torch.zeros(
+            len(sequences), max_len,
+            dtype=torch.long, device=self.device,
+        )
         for i, seq in enumerate(sequences):
             offset = max_len - seq.shape[0]
             padded[i, offset:] = seq
+            attention_mask[i, offset:] = 1
 
-        # Forward pass
+        # Forward pass with attention_mask
         with torch.no_grad():
-            output = self.model(input_ids=padded)
+            output = self.model(input_ids=padded, attention_mask=attention_mask)
             logits = output.logits[:, -1, :]  # [batch, vocab_size]
 
         # Process each request individually
@@ -823,9 +833,12 @@ class ContinuousBatcher:
             # Get logits for this request
             req_logits = logits[i:i + 1]  # [1, vocab_size]
 
-            # Build input_ids for repetition penalty
-            full_input = padded[i:i + 1]
-            processed_logits = processor.process(req_logits, full_input)
+            # v2.5.5: Use the ORIGINAL sequence (without padding) for
+            # repetition penalty. Previously used padded[i:i+1] which
+            # included padding token ID 0, causing false penalty on
+            # the padding token.
+            actual_seq = sequences[i].unsqueeze(0)  # [1, real_seq_len]
+            processed_logits = processor.process(req_logits, actual_seq)
 
             # Sample or greedy
             next_token = processor.sample(processed_logits)
@@ -937,6 +950,7 @@ class LosionGenerator:
         self,
         input_ids: torch.Tensor,
         config: Optional[GenerationConfig] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[List[int], List[float]]:
         """Generate tokens from input_ids.
 
@@ -946,6 +960,10 @@ class LosionGenerator:
         Args:
             input_ids: Input token IDs [seq_len] or [1, seq_len].
             config: Generation configuration (uses default if None).
+            attention_mask: Optional attention mask [seq_len] or [1, seq_len].
+                1 = real token, 0 = padding. Forwarded to the model's
+                forward pass so that padding tokens are properly masked.
+                v2.5.5: Previously silently ignored; now forwarded.
 
         Returns:
             Tuple of (generated_ids, scores):
@@ -960,23 +978,30 @@ class LosionGenerator:
             input_ids = input_ids.unsqueeze(0)
 
         input_ids = input_ids.to(self.device)
+
+        if attention_mask is not None:
+            if attention_mask.dim() == 1:
+                attention_mask = attention_mask.unsqueeze(0)
+            attention_mask = attention_mask.to(self.device)
+
         original_len = input_ids.shape[1]
 
         # Route to the appropriate generation method
         if config.speculative_enabled and config.num_beams == 1:
-            return self._generate_speculative(input_ids, config)
+            return self._generate_speculative(input_ids, config, attention_mask)
         elif config.num_beams > 1:
-            return self._generate_beam_search(input_ids, config)
+            return self._generate_beam_search(input_ids, config, attention_mask)
         elif config.do_sample:
-            return self._generate_sampling(input_ids, config)
+            return self._generate_sampling(input_ids, config, attention_mask)
         else:
-            return self._generate_greedy(input_ids, config, original_len)
+            return self._generate_greedy(input_ids, config, original_len, attention_mask)
 
     def _generate_greedy(
         self,
         input_ids: torch.Tensor,
         config: GenerationConfig,
         original_len: int,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[List[int], List[float]]:
         """Greedy decoding: always pick the highest probability token.
 
@@ -984,6 +1009,8 @@ class LosionGenerator:
             input_ids: Input token IDs [1, seq_len].
             config: Generation configuration.
             original_len: Length of the original input.
+            attention_mask: Optional attention mask [1, seq_len].
+                v2.5.5: Forwarded to model. Grows with each new token.
 
         Returns:
             Tuple of (generated_ids, scores).
@@ -993,9 +1020,10 @@ class LosionGenerator:
         scores: List[float] = []
 
         current_ids = input_ids.clone()
+        current_mask = attention_mask.clone() if attention_mask is not None else None
 
         for _ in range(config.max_new_tokens):
-            output = self.model(input_ids=current_ids)
+            output = self.model(input_ids=current_ids, attention_mask=current_mask)
             next_logits = output.logits[:, -1, :]  # [1, vocab_size]
 
             # Process logits
@@ -1016,6 +1044,12 @@ class LosionGenerator:
                 [[next_token]], device=self.device, dtype=current_ids.dtype
             )
             current_ids = torch.cat([current_ids, next_tensor], dim=1)
+            # v2.5.5: Extend attention_mask for the new token (always real)
+            if current_mask is not None:
+                current_mask = torch.cat([
+                    current_mask,
+                    torch.ones(1, 1, dtype=current_mask.dtype, device=self.device),
+                ], dim=1)
 
         return generated_ids, scores
 
@@ -1023,12 +1057,15 @@ class LosionGenerator:
         self,
         input_ids: torch.Tensor,
         config: GenerationConfig,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[List[int], List[float]]:
         """Sampling-based generation with temperature, top-k, top-p.
 
         Args:
             input_ids: Input token IDs [1, seq_len].
             config: Generation configuration.
+            attention_mask: Optional attention mask [1, seq_len].
+                v2.5.5: Forwarded to model. Grows with each new token.
 
         Returns:
             Tuple of (generated_ids, scores).
@@ -1038,9 +1075,10 @@ class LosionGenerator:
         scores: List[float] = []
 
         current_ids = input_ids.clone()
+        current_mask = attention_mask.clone() if attention_mask is not None else None
 
         for _ in range(config.max_new_tokens):
-            output = self.model(input_ids=current_ids)
+            output = self.model(input_ids=current_ids, attention_mask=current_mask)
             next_logits = output.logits[:, -1, :]
 
             # Process logits
@@ -1064,6 +1102,11 @@ class LosionGenerator:
                 [[token_id]], device=self.device, dtype=current_ids.dtype
             )
             current_ids = torch.cat([current_ids, next_tensor], dim=1)
+            if current_mask is not None:
+                current_mask = torch.cat([
+                    current_mask,
+                    torch.ones(1, 1, dtype=current_mask.dtype, device=self.device),
+                ], dim=1)
 
         return generated_ids, scores
 
@@ -1071,6 +1114,7 @@ class LosionGenerator:
         self,
         input_ids: torch.Tensor,
         config: GenerationConfig,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[List[int], List[float]]:
         """Beam search generation.
 
@@ -1080,6 +1124,9 @@ class LosionGenerator:
         Args:
             input_ids: Input token IDs [1, seq_len].
             config: Generation configuration.
+            attention_mask: Optional attention mask [1, seq_len].
+                v2.5.5: Forwarded to model. Note: for beam search, the mask
+                is expanded to [num_beams, seq_len] and grown per step.
 
         Returns:
             Tuple of (generated_ids, scores) for the best beam.
@@ -1096,10 +1143,15 @@ class LosionGenerator:
         beam_score_lists: List[List[float]] = [[] for _ in range(num_beams)]
         current_ids = input_ids.repeat(num_beams, 1)  # [num_beams, seq_len]
 
+        # v2.5.5: Expand attention_mask for beam search
+        current_mask = None
+        if attention_mask is not None:
+            current_mask = attention_mask.repeat(num_beams, 1)  # [num_beams, seq_len]
+
         processor = LogitsProcessor(config)
 
         for step in range(config.max_new_tokens):
-            output = self.model(input_ids=current_ids)
+            output = self.model(input_ids=current_ids, attention_mask=current_mask)
             next_logits = output.logits[:, -1, :]  # [num_beams, vocab_size]
 
             # Process logits per beam
@@ -1168,6 +1220,13 @@ class LosionGenerator:
             )
             current_ids = torch.cat(new_current_ids_list, dim=0)
 
+            # v2.5.5: Update attention_mask — each beam gets a new token (all real)
+            if current_mask is not None:
+                current_mask = torch.cat([
+                    current_mask,
+                    torch.ones(num_beams, 1, dtype=current_mask.dtype, device=self.device),
+                ], dim=1)
+
             # Check if all beams have reached EOS
             all_eos = all(
                 seq[-1] == config.eos_token_id
@@ -1187,6 +1246,7 @@ class LosionGenerator:
         self,
         input_ids: torch.Tensor,
         config: GenerationConfig,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[List[int], List[float]]:
         """Speculative decoding with SSM-pathway draft model.
 
@@ -1197,6 +1257,11 @@ class LosionGenerator:
         Args:
             input_ids: Input token IDs [1, seq_len].
             config: Generation configuration.
+            attention_mask: Optional attention mask [1, seq_len].
+                v2.5.5: Note — speculative decoder's internal forward passes
+                currently do not use attention_mask (they operate on
+                unpadded single sequences). This parameter is forwarded to
+                the fallback single-token generation path.
 
         Returns:
             Tuple of (generated_ids, scores).
@@ -1220,7 +1285,8 @@ class LosionGenerator:
 
             if not accepted_tokens:
                 # Fallback: generate one token normally
-                output = self.model(input_ids=current_ids)
+                # v2.5.5: Forward attention_mask to fallback path
+                output = self.model(input_ids=current_ids, attention_mask=attention_mask)
                 next_logits = output.logits[:, -1, :]
                 processor = LogitsProcessor(config)
                 processed = processor.process(next_logits, current_ids)
@@ -1295,6 +1361,7 @@ class LosionGenerator:
         self,
         input_ids: torch.Tensor,
         config: Optional[GenerationConfig] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Generator[Tuple[int, float], None, None]:
         """Streaming generation: yields tokens one at a time.
 
@@ -1304,6 +1371,8 @@ class LosionGenerator:
         Args:
             input_ids: Input token IDs [seq_len] or [1, seq_len].
             config: Generation configuration.
+            attention_mask: Optional attention mask [seq_len] or [1, seq_len].
+                v2.5.5: Forwarded to model. Grows with each new token.
 
         Yields:
             Tuple of (token_id, score) for each generated token.
@@ -1315,12 +1384,19 @@ class LosionGenerator:
             input_ids = input_ids.unsqueeze(0)
 
         input_ids = input_ids.to(self.device)
+
+        if attention_mask is not None:
+            if attention_mask.dim() == 1:
+                attention_mask = attention_mask.unsqueeze(0)
+            attention_mask = attention_mask.to(self.device)
+
         processor = LogitsProcessor(config)
         current_ids = input_ids.clone()
+        current_mask = attention_mask.clone() if attention_mask is not None else None
         num_generated = 0
 
         while num_generated < config.max_new_tokens:
-            output = self.model(input_ids=current_ids)
+            output = self.model(input_ids=current_ids, attention_mask=current_mask)
             next_logits = output.logits[:, -1, :]
 
             processed = processor.process(next_logits, current_ids)
@@ -1344,6 +1420,11 @@ class LosionGenerator:
                 [[token_id]], device=self.device, dtype=current_ids.dtype
             )
             current_ids = torch.cat([current_ids, next_tensor], dim=1)
+            if current_mask is not None:
+                current_mask = torch.cat([
+                    current_mask,
+                    torch.ones(1, 1, dtype=current_mask.dtype, device=self.device),
+                ], dim=1)
 
     def _should_stop(
         self,

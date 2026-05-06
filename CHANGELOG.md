@@ -5,6 +5,38 @@ All notable changes to the Losion project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.5] — 2026-05-06
+
+### "Inference Pipeline — Attention Mask, Continuous Batching, Documentation Accuracy"
+
+Follow-up patch addressing 6 findings from the v2.5.4 audit. Focus on the inference pipeline's complete lack of `attention_mask` support (causing incorrect output in `ContinuousBatcher` with mixed-length sequences), statistical test weakness, and documentation accuracy for `ExpertPrefetcher`.
+
+#### Fixed — TINGGI (2 issues)
+
+- **W-01: `ContinuousBatcher` left-pads without `attention_mask` — repetition penalty wrong & pad contamination** (`inference/generation.py`): `ContinuousBatcher.step()` padded shorter sequences with token ID 0 on the left to create equal-length batches, but never passed an `attention_mask` to the model. This caused two problems: (1) the model processed padding tokens through all layers — SSM stored state from padding, attention attended to padding — contaminating the hidden states of real tokens, and (2) the repetition penalty was computed against the padded input (which included many zeros), causing token ID 0 to be unfairly penalized. Fix: Added `attention_mask` tensor creation alongside padding (1 for real tokens, 0 for padding), passed it to `self.model(input_ids=padded, attention_mask=attention_mask)`, and changed repetition penalty to use the original unpadded sequence `sequences[i]` instead of `padded[i]`.
+
+- **W-02 + W-06: Entire `generation.py` never passes `attention_mask` to model** (`inference/generation.py`): All 8 forward-pass call sites in the generation pipeline used `self.model(input_ids=...)` without ever forwarding an `attention_mask`. `LosionGenerator.generate()` accepted `attention_mask` in its signature through `**kwargs` but silently ignored it. Fix: Added `attention_mask: Optional[torch.Tensor] = None` parameter to `generate()`, `_generate_greedy()`, `_generate_sampling()`, `_generate_beam_search()`, `_generate_speculative()`, and `generate_stream()`. Each method now tracks `current_mask` alongside `current_ids`, extends it with `1` for each new generated token, and forwards it to the model's forward pass. Beam search expands the mask from `[1, seq_len]` to `[num_beams, seq_len]` and grows it per step.
+
+#### Fixed — SEDANG (2 issues)
+
+- **W-03: Test rejection sampling only verifies `[0,1]` range — cannot distinguish formula** (`tests/test_v2_5_4.py`): The `test_acceptance_formula_with_known_probs` test only asserted that `accept_prob` was in `[0, 1]`, which is true for ANY formula including the old fixed threshold 0.5. The `test_acceptance_probability_is_ratio_not_fixed` test used `inspect.getsource()` which is fragile and doesn't test runtime behavior. Fix: Added `TestRejectionSamplingStatistical` class with 3 statistical tests that run 200–1000 trials each and verify acceptance rates match `min(1, p_target/p_draft)`: (1) `p_target=0.01, p_draft=0.9` → acceptance ≈ 1.1% (vs 0% for fixed threshold), (2) `p_target=0.9, p_draft=0.1` → acceptance = 100% (rules out inverted ratio), (3) `p_target=0.3, p_draft=0.6` → acceptance ≈ 50% (vs 0% for fixed threshold since 0.3 < 0.5).
+
+- **W-05: `ExpertPrefetcher` claims "async prefetch" but implementation is synchronous** (`inference/expert_prefetch.py`): Module documentation and code comments consistently described "async prefetch" and "overlapping prefetch with computation", but `predict()` operates synchronously with no `asyncio`, `threading.Thread`, `concurrent.futures`, or CUDA streams. Fix: Updated module-level docstring to clarify that the current implementation is synchronous and that true async overlap requires CUDA streams or a separate prefetch thread (planned future enhancement). Updated class docstring with a `.. note::` block explaining the current limitation and speedup source (pre-identification of experts, not compute/IO overlap). Changed code comments from "Issue async prefetch" to "Issue prefetch (currently synchronous; async planned)".
+
+#### Fixed — RENDAH (2 issues)
+
+- **W-07: Zero test coverage for `ContinuousBatcher`** (`tests/test_v2_5_4.py`): `ContinuousBatcher` is one of the main inference components (managing concurrent requests, batching, padding) but had zero test coverage, especially concerning given the W-01 bug found in it. Fix: Added `TestContinuousBatcher` class with 5 tests: (1) add request increments count, (2) step produces tokens, (3) attention_mask is created during padding and passed to model, (4) repetition penalty uses actual sequence not padding, (5) run_until_complete end-to-end with 3 tokens.
+
+- **W-04: Clarification — `convert_checkpoint.py` uses `weights_only=True`** (not a bug): The v2.5.4 audit grep reported `weights_only=True` usage in `scripts/convert_checkpoint.py` as potentially problematic. Direct file inspection confirms both calls at lines 117 and 123 use `weights_only=True` — this is safe and correct. The grep pattern matched in a different context. No code change needed; this entry documents the verification.
+
+#### Version Updates
+
+- `losion/__init__.py`: `__version__` bumped to `"2.5.5"`
+- `setup.py`: version bumped to `"2.5.5"`
+- `pyproject.toml`: version bumped to `"2.5.5"`
+- `README.md`: badge updated to `2.5.5`
+- `requirements.txt`: header updated to `v2.5.5`
+
 ## [2.5.4] — 2026-05-06
 
 ### "Security & Correctness — Trusted Path, Speculative Decoding, Credential Isolation, Encryption Resilience"

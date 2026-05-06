@@ -52,8 +52,12 @@ For each layer L during inference::
 
     1. Receive hidden_states_L from the attention sublayer.
     2. Feed hidden_states_L into predictor[L] → predicted expert set for L+1.
-    3. Issue async prefetch for predicted experts (overlap with expert compute
-       at layer L).
+    3. Issue prefetch for predicted experts.  v2.5.5 note: the current
+       implementation issues prefetch requests synchronously — true
+       async overlap with computation requires CUDA streams or a separate
+       prefetch thread, which is a future enhancement.  When async
+       prefetch is implemented, it will overlap expert loading with
+       ongoing computation at layer L.
     4. When layer L+1 begins, check if needed experts are already loaded.
        - Hit: use prefetched expert (zero loading latency).
        - Miss: load on-demand (fallback, same as no-prefetch baseline).
@@ -648,6 +652,16 @@ class ExpertPrefetcher(nn.Module):
     During inference, predictors are used to speculate which experts
     will be needed, enabling early (prefetch) loading.
 
+    .. note::
+       v2.5.5: The current ``predict()`` method operates synchronously.
+       True async prefetch (overlapping expert loading with computation)
+       requires CUDA streams or a separate prefetch thread and is planned
+       for a future release.  The speedup from this module currently
+       comes from the predictor's ability to pre-identify which experts
+       to load, reducing the decision latency — not from compute/IO
+       overlap.  When async prefetch is implemented, the API will remain
+       the same; only the internal execution model will change.
+
     Usage — Training
     -----------------
     ::
@@ -682,10 +696,10 @@ class ExpertPrefetcher(nn.Module):
                 # Speculate experts for the next layer
                 predicted = prefetcher.predict(layer_idx, hidden_states)
 
-                # Issue async prefetch
+                # Issue prefetch (currently synchronous; async planned)
                 model.prefetch_experts(layer_idx + 1, predicted)
 
-            # ... compute current layer (prefetch overlaps with this) ...
+            # ... compute current layer (when async: prefetch overlaps with this) ...
 
     Args:
         config: :class:`PrefetchConfig` instance.
