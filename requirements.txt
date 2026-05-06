@@ -1,5 +1,5 @@
 # ============================================================================
-# Losion v2.5.0 — Python Dependencies
+# Losion v2.5.1 — Python Dependencies
 # ============================================================================
 # Pinned exact versions for reproducibility (audit finding C4.5).
 # Update with care — major version bumps may break compatibility.
@@ -8,6 +8,9 @@
 torch==2.5.1
 numpy==2.2.3
 einops==0.8.1
+
+# Security — Authenticated encryption for episodic memory at rest
+cryptography==44.0.1
 
 # Configuration
 pyyaml==6.0.2

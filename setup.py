@@ -8,7 +8,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="losion",
-    version="2.5.0",
+    version="2.5.1",
     packages=find_packages(include=["losion*"]),
     python_requires=">=3.10",
     install_requires=[

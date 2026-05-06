@@ -117,9 +117,11 @@ class SandboxConfig:
     # v2.5.0: Changed from optional to recommended-mandatory. The blacklist
     # approach is inherently bypassable (see audit finding 2.1).
     allowed_commands: Set[str] = field(default_factory=set)
-    # Require allowlist in production — if True and allowed_commands is empty,
-    # only the container execution path is allowed.
-    require_allowlist: bool = False
+    # v2.5.1: Changed default to True (audit finding 2.6). Secure-by-default:
+    # if no allowlist is configured, subprocess execution is blocked. Set to
+    # False only for development/testing, or use use_container=True for
+    # Docker-isolated execution which has its own security boundary.
+    require_allowlist: bool = True
     blocked_commands: Set[str] = field(default_factory=lambda: {
         # Destructive commands (defense-in-depth — allowlist is the real boundary)
         "rm -rf /", "mkfs", "dd if=", ":(){ :|:& };:",
@@ -186,6 +188,17 @@ class SandboxedTerminal:
         self._temp_dir: Optional[str] = None
         # v2.5.0: Persistent audit log file handle
         self._audit_file: Optional[Any] = None
+
+        # v2.5.1: Warn if allowlist is not enforced (audit finding 2.6).
+        # Secure-by-default means require_allowlist=True is now the default.
+        # If someone explicitly sets it to False, warn them.
+        if not self.config.require_allowlist and not self.config.use_container:
+            logger.warning(
+                "SandboxedTerminal: require_allowlist=False without container "
+                "isolation. Any command not in the blacklist can be executed. "
+                "This is INSECURE for production. Either set require_allowlist=True "
+                "with an allowed_commands set, or use use_container=True."
+            )
 
     def _write_audit_log(self, command: str, result: Optional[TerminalResult] = None) -> None:
         """Write audit log entry — both to logging.info and to persistent file.
@@ -427,9 +440,15 @@ class SandboxedTerminal:
         effective_wd = working_dir or self.config.working_dir or self._get_temp_dir()
 
         # Build Docker command
+        # v2.5.1: Removed --pid=host (audit finding 2.1). This flag REMOVES
+        # PID namespace isolation — the opposite of what the previous comment
+        # claimed. --pid=host gives the container full access to the host's
+        # PID namespace, allowing it to see and signal host processes, which
+        # is a container escape vector. The default Docker PID namespace
+        # (no flag) is already properly isolated.
         docker_args = [
             "docker", "run", "--rm",  # Auto-remove after execution
-            "--pid=host",             # PID namespace isolation
+            # No --pid=host — default PID namespace is already isolated
             f"--cpus={self.config.container_cpus}",
             f"--memory={self.config.container_memory_mb}m",
             f"--stop-timeout={int(effective_timeout)}",

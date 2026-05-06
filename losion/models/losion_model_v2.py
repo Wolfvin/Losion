@@ -546,6 +546,7 @@ class LosionLayerV2(nn.Module):
         labels: Optional[torch.Tensor] = None,
         inference_sparse: bool = False,
         sparse_threshold: float = 0.05,
+        sparse_percentile: int = 95,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Forward pass through the Tri-Jalur layer.
 
@@ -553,6 +554,7 @@ class LosionLayerV2(nn.Module):
         their callers. SSM, Attention, and MoE modules now all properly
         connect regardless of their internal parameter naming conventions.
         v1.6.1: Added labels parameter for MTP loss computation in MoE layers.
+        v2.5.1: Added sparse_percentile parameter (audit finding 2.5).
         """
         batch, seq_len, _ = x.shape
 
@@ -599,10 +601,12 @@ class LosionLayerV2(nn.Module):
         compute_attn = True
         compute_ret = True
         if inference_sparse and not self.training:
-            percentile = 95
-            w_ssm_p = route_weights[:, :, 0].float().quantile(percentile / 100.0).item()
-            w_attn_p = route_weights[:, :, 1].float().quantile(percentile / 100.0).item()
-            w_ret_p = route_weights[:, :, 2].float().quantile(percentile / 100.0).item()
+            # v2.5.1: sparse_percentile is now configurable via LosionConfig
+            # (audit finding 2.5). Default 95 means skip pathway if >95% of
+            # tokens have weight below threshold.
+            w_ssm_p = route_weights[:, :, 0].float().quantile(sparse_percentile / 100.0).item()
+            w_attn_p = route_weights[:, :, 1].float().quantile(sparse_percentile / 100.0).item()
+            w_ret_p = route_weights[:, :, 2].float().quantile(sparse_percentile / 100.0).item()
             compute_ssm = w_ssm_p >= sparse_threshold
             compute_attn = w_attn_p >= sparse_threshold
             compute_ret = w_ret_p >= sparse_threshold
@@ -1004,6 +1008,7 @@ def _checkpoint_layer_fn(
     l: Optional[torch.Tensor],
     inf_sparse: bool = False,
     sparse_thresh: float = 0.05,
+    sparse_pct: int = 95,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """Standalone function for gradient checkpointing.
 
@@ -1017,10 +1022,12 @@ def _checkpoint_layer_fn(
 
     v2.5.0: Added inference_sparse and sparse_threshold parameters for
     architectural consistency with the non-checkpoint path.
+    v2.5.1: Added sparse_percentile parameter (audit finding 2.5).
     """
     return layer(
         h, attention_mask=m, position_ids=p, thinking_mode=thinking_mode,
         labels=l, inference_sparse=inf_sparse, sparse_threshold=sparse_thresh,
+        sparse_percentile=sparse_pct,
     )
 
 
@@ -1231,11 +1238,13 @@ class LosionModelV2(nn.Module):
         labels: Optional[torch.Tensor] = None,
         inference_sparse: bool = False,
         sparse_threshold: float = 0.05,
+        sparse_percentile: int = 95,
     ) -> Dict[str, Any]:
         """Forward pass through the Losion V2 backbone.
 
         v1.6.1: Added labels parameter for MTP loss computation in MoE layers.
         v2.4.0: Added inference_sparse and sparse_threshold parameters.
+        v2.5.1: Added sparse_percentile parameter (audit finding 2.5).
         """
         batch, seq_len = input_ids.shape
 
@@ -1267,7 +1276,7 @@ class LosionModelV2(nn.Module):
                 x, layer_routing = torch.utils.checkpoint.checkpoint(
                     _checkpoint_layer_fn,
                     layer, x, attention_mask, position_ids, thinking_mode, labels,
-                    inference_sparse, sparse_threshold,
+                    inference_sparse, sparse_threshold, sparse_percentile,
                     use_reentrant=False,
                 )
             else:
@@ -1280,6 +1289,7 @@ class LosionModelV2(nn.Module):
                     labels=labels,
                     inference_sparse=inference_sparse,
                     sparse_threshold=sparse_threshold,
+                    sparse_percentile=sparse_percentile,
                 )
 
             # Update SSM states for next forward call
@@ -1627,6 +1637,7 @@ class LosionForCausalLMV2(nn.Module):
         thinking_mode: Optional[bool] = None,
         inference_sparse: bool = False,
         sparse_threshold: float = 0.05,
+        sparse_percentile: int = 95,
     ) -> Dict[str, Any]:
         """Forward pass with optional loss computation.
 
@@ -1639,6 +1650,8 @@ class LosionForCausalLMV2(nn.Module):
                 during inference (saves compute, training always computes all).
             sparse_threshold: Minimum routing weight to compute a pathway.
                 Default 0.05 (5%). Only used when inference_sparse=True.
+            sparse_percentile: Percentile threshold for sparse execution.
+                Default 95. Configurable via LosionConfig (v2.5.1).
 
         Returns:
             Dict with logits, loss, and optional aux info.
@@ -1651,6 +1664,7 @@ class LosionForCausalLMV2(nn.Module):
             labels=labels,  # v1.6.1: Forward labels to MoE layers for MTP loss
             inference_sparse=inference_sparse,
             sparse_threshold=sparse_threshold,
+            sparse_percentile=sparse_percentile,
         )
         hidden_states = outputs["hidden_states"]
 

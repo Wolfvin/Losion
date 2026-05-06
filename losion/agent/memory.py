@@ -55,44 +55,66 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# Encryption at Rest (audit finding A3.5)
+# Encryption at Rest (v2.5.1: upgraded from XOR to Fernet/AES)
 # ============================================================================
 
+# Try to import cryptography.fernet for proper authenticated encryption.
+# Fernet provides AES-128-CBC + HMAC-SHA256 with built-in IV and tamper
+# detection — a significant upgrade over the previous XOR cipher which
+# was vulnerable to known-plaintext attacks and provided no authentication.
+#
+# If cryptography is not installed, we fall back to the legacy XOR mode
+# with an explicit deprecation warning.
+try:
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    import base64 as _base64
+    _FERNET_AVAILABLE = True
+except ImportError:
+    _FERNET_AVAILABLE = False
 
-def _derive_key(passphrase: str, salt: bytes) -> bytes:
-    """Derive a 32-byte encryption key from passphrase and salt using PBKDF2.
 
-    Uses hashlib.pbkdf2_hmac with SHA-256 and 100,000 iterations for
-    key derivation. This is computationally expensive enough to resist
-    brute-force attacks while remaining fast for legitimate use.
+def _derive_fernet_key(passphrase: str, salt: bytes) -> bytes:
+    """Derive a Fernet-compatible key from passphrase and salt.
+
+    Uses PBKDF2-HMAC-SHA256 with 100,000 iterations for key derivation.
+    The derived key is base64-encoded to match Fernet's expected format.
 
     Args:
         passphrase: The encryption passphrase.
-        salt: Random salt bytes (16+ bytes recommended).
+        salt: Random salt bytes (16 bytes).
 
     Returns:
-        32-byte derived key.
+        Base64-encoded 32-byte key suitable for Fernet.
     """
-    return hashlib.pbkdf2_hmac(
-        "sha256",
-        passphrase.encode("utf-8"),
-        salt,
-        iterations=100_000,
-    )
+    if _FERNET_AVAILABLE:
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100_000,
+        )
+        key = kdf.derive(passphrase.encode("utf-8"))
+        return _base64.urlsafe_b64encode(key)
+    else:
+        # Fallback: derive 32 bytes using stdlib hashlib
+        raw = hashlib.pbkdf2_hmac(
+            "sha256",
+            passphrase.encode("utf-8"),
+            salt,
+            iterations=100_000,
+        )
+        return _base64.urlsafe_b64encode(raw)
 
 
 def _xor_encrypt_decrypt(data: bytes, key: bytes) -> bytes:
-    """XOR-based encrypt/decrypt (symmetric — same operation for both).
+    """Legacy XOR-based encrypt/decrypt (DEPRECATED — kept for backward compat).
 
-    This is a simple but effective encryption for data at rest when
-    the threat model is casual file inspection rather than a determined
-    cryptanalyst. For production deployments requiring strong encryption,
-    replace with AES-256 via the `cryptography` package.
-
-    The XOR cipher is used here because:
-    1. No external dependencies (pure Python stdlib)
-    2. Symmetric — same function for encrypt and decrypt
-    3. Adequate for protecting episodic memory from casual file reads
+    XOR with a repeating key is vulnerable to known-plaintext attacks and
+    provides no authentication. This function is retained ONLY for reading
+    episode files encrypted with the v2.5.0 XOR scheme. New encryptions
+    always use Fernet (AES-128-CBC + HMAC-SHA256).
 
     Args:
         data: Data to encrypt/decrypt.
@@ -101,7 +123,6 @@ def _xor_encrypt_decrypt(data: bytes, key: bytes) -> bytes:
     Returns:
         Encrypted/decrypted bytes.
     """
-    # Cycle the key to match data length
     key_cycle = key * (len(data) // len(key) + 1)
     return bytes(a ^ b for a, b in zip(data, key_cycle[:len(data)]))
 
@@ -109,23 +130,34 @@ def _xor_encrypt_decrypt(data: bytes, key: bytes) -> bytes:
 class _EncryptionManager:
     """Manages encryption at rest for episodic memory.
 
-    Provides a simple encryption layer for JSON episode files stored on disk.
-    This prevents casual file inspection from revealing sensitive episode
-    data (queries, actions, reflections).
+    v2.5.1: Upgraded from XOR to Fernet (AES-128-CBC + HMAC-SHA256).
+    The previous XOR cipher was vulnerable to known-plaintext attacks:
+    episode JSON always starts with a predictable format ("episode_id",
+    "query", etc.), so an attacker with access to both the encrypted file
+    and the salt could XOR the known plaintext with the ciphertext to
+    recover the keystream and decrypt the rest. Fernet eliminates this
+    class of attack entirely by using proper AES-CBC with random IV and
+    HMAC-SHA256 for authentication (tamper detection).
 
-    Security model:
-    - Protects against casual file reads (e.g., shared filesystem)
-    - Does NOT protect against determined attackers with memory access
-    - For production: replace with AES-256 via `cryptography` package
+    Security model (with Fernet):
+    - AES-128-CBC encryption — semantic security via random IV per token
+    - HMAC-SHA256 authentication — tampering is detected before decryption
+    - PBKDF2-HMAC-SHA256 key derivation — 100k iterations resist brute-force
+    - Random salt per file — rainbow table attacks infeasible
 
-    The encryption key is derived from a passphrase using PBKDF2-HMAC-SHA256
-    with 100,000 iterations and a random salt. The salt is stored alongside
-    the encrypted data (standard practice — salt is not secret).
+    Backward compatibility:
+    - Can decrypt v2.5.0 XOR-encrypted episode files (auto-detected)
+    - New encryptions always use Fernet
+    - If `cryptography` package is not installed, falls back to XOR with
+      a deprecation warning
 
     Args:
         passphrase: Encryption passphrase. If None, encryption is disabled.
             Passphrase can also be set via LOSION_MEMORY_PASSPHRASE env var.
     """
+
+    # Magic bytes to identify Fernet-encrypted data (v2.5.1+)
+    _FERNET_MAGIC = b"FRNT"
 
     def __init__(self, passphrase: Optional[str] = None) -> None:
         # Check environment variable if no passphrase provided
@@ -133,17 +165,21 @@ class _EncryptionManager:
             passphrase = os.environ.get("LOSION_MEMORY_PASSPHRASE", None)
 
         self.enabled = passphrase is not None
-        self._key: Optional[bytes] = None
         self._passphrase = passphrase
 
-    def _get_or_derive_key(self, salt: bytes) -> bytes:
-        """Get cached key or derive from passphrase."""
-        if self._key is None and self._passphrase is not None:
-            self._key = _derive_key(self._passphrase, salt)
-        return self._key or b""
+        if self.enabled and not _FERNET_AVAILABLE:
+            logger.warning(
+                "EpisodicMemory: 'cryptography' package not installed. "
+                "Falling back to legacy XOR encryption (deprecated, insecure). "
+                "Install with: pip install cryptography"
+            )
 
     def encrypt(self, data: bytes) -> Tuple[bytes, bytes]:
         """Encrypt data, returning (encrypted_data, salt).
+
+        v2.5.1: Uses Fernet (AES-128-CBC + HMAC-SHA256) when available.
+        Falls back to XOR with deprecation warning if cryptography is
+        not installed.
 
         Args:
             data: Plaintext bytes to encrypt.
@@ -156,12 +192,31 @@ class _EncryptionManager:
             return data, b""
 
         salt = os.urandom(16)
-        key = _derive_key(self._passphrase, salt)
-        encrypted = _xor_encrypt_decrypt(data, key)
-        return encrypted, salt
+
+        if _FERNET_AVAILABLE:
+            # Fernet encryption: AES-128-CBC + HMAC-SHA256
+            key = _derive_fernet_key(self._passphrase, salt)
+            f = Fernet(key)
+            encrypted = f.encrypt(data)
+            # Prepend magic bytes so decrypt() can identify the format
+            return self._FERNET_MAGIC + encrypted, salt
+        else:
+            # Legacy XOR fallback (deprecated)
+            raw_key = hashlib.pbkdf2_hmac(
+                "sha256",
+                self._passphrase.encode("utf-8"),
+                salt,
+                iterations=100_000,
+            )
+            encrypted = _xor_encrypt_decrypt(data, raw_key)
+            return encrypted, salt
 
     def decrypt(self, data: bytes, salt: bytes) -> bytes:
         """Decrypt data using the stored salt.
+
+        v2.5.1: Auto-detects encryption format:
+        - If data starts with _FERNET_MAGIC, uses Fernet decryption
+        - Otherwise, falls back to legacy XOR (for v2.5.0 compat)
 
         Args:
             data: Encrypted bytes.
@@ -173,8 +228,20 @@ class _EncryptionManager:
         if not self.enabled:
             return data
 
-        key = _derive_key(self._passphrase, salt)
-        return _xor_encrypt_decrypt(data, key)
+        # Auto-detect: Fernet-encrypted data starts with magic bytes
+        if data[:4] == self._FERNET_MAGIC and _FERNET_AVAILABLE:
+            key = _derive_fernet_key(self._passphrase, salt)
+            f = Fernet(key)
+            return f.decrypt(data[4:])  # Strip magic bytes before decryption
+        else:
+            # Legacy XOR (v2.5.0 compatibility)
+            raw_key = hashlib.pbkdf2_hmac(
+                "sha256",
+                self._passphrase.encode("utf-8"),
+                salt,
+                iterations=100_000,
+            )
+            return _xor_encrypt_decrypt(data, raw_key)
 
 
 @dataclass

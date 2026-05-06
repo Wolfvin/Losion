@@ -223,14 +223,25 @@ class Constitution:
         violated_categories: Dict[str, bool] = {}
 
         for pattern, cat in harm_patterns:
-            match = re.search(pattern, response_lower)
-            if match:
-                # Skip if negated (e.g., "don't kill")
+            # v2.5.1: Changed from re.search() to re.finditer() (audit finding 2.3).
+            # re.search() only finds the FIRST match. If the first match is
+            # negated (e.g., "Don't kill someone"), the entire category is
+            # skipped — even if a later genuine match exists (e.g., "Also,
+            # here's how to kill someone"). re.finditer() evaluates EVERY match
+            # individually, and a category is flagged if AT LEAST ONE match is
+            # not negated.
+            found_genuine = False
+            for match in re.finditer(pattern, response_lower):
+                # Skip this specific match if negated (e.g., "don't kill")
                 if _is_negated(response_lower, match.start()):
-                    continue
+                    continue  # Only skip THIS match, not the whole category
                 # Skip if exempt context
                 if is_exempt:
                     continue
+                # At least one non-negated match found — category is violated
+                found_genuine = True
+                break
+            if found_genuine:
                 violated_categories[cat] = True
 
         # Check each principle

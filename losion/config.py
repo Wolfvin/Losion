@@ -642,6 +642,8 @@ class LosionConfig:
         vocab_size: Vocabulary size.
         max_seq_len: Maximum sequence length.
         dropout: Dropout rate.
+        sparse_percentile: Percentile threshold for inference sparse execution
+            (0-100). Default 95. Higher = more aggressive pathway skipping.
         ssm: SSM pathway configuration.
         attention: Attention pathway configuration.
         retrieval: Retrieval/MoE pathway configuration.
@@ -658,6 +660,11 @@ class LosionConfig:
     vocab_size: int = 32000
     max_seq_len: int = 4096
     dropout: float = 0.0
+    # v2.5.1: Configurable sparse percentile for inference (audit finding 2.5).
+    # When inference_sparse=True, pathways are skipped if the p-th percentile
+    # of routing weights is below sparse_threshold. Higher values = more
+    # aggressive skipping (e.g., 99 = skip if 99% of tokens don't need it).
+    sparse_percentile: int = 95
 
     # Sub-configurations
     ssm: SSMConfig = field(default_factory=SSMConfig)
@@ -689,6 +696,10 @@ class LosionConfig:
             raise ValueError(f"vocab_size must be positive, got {self.vocab_size}")
         if self.max_seq_len <= 0:
             raise ValueError(f"max_seq_len must be positive, got {self.max_seq_len}")
+        if not (0 < self.sparse_percentile <= 100):
+            raise ValueError(
+                f"sparse_percentile must be in (0, 100], got {self.sparse_percentile}"
+            )
 
         # Auto-set d_ff if zero
         if self.retrieval.d_ff == 0:
@@ -742,6 +753,7 @@ class LosionConfig:
         kwargs["vocab_size"] = model_raw.get("vocab_size", 32000)
         kwargs["max_seq_len"] = model_raw.get("max_seq_len", 4096)
         kwargs["dropout"] = model_raw.get("dropout", 0.0)
+        kwargs["sparse_percentile"] = model_raw.get("sparse_percentile", 95)
 
         # SSM config
         ssm_raw = model_raw.get("ssm", {})

@@ -549,6 +549,7 @@ class LosionLayer(nn.Module):
         thinking_mode: Optional[bool] = None,
         inference_sparse: bool = False,
         sparse_threshold: float = 0.05,
+        sparse_percentile: int = 95,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, Any]]]:
         """Forward pass through the Tri-Jalur layer.
 
@@ -567,6 +568,10 @@ class LosionLayer(nn.Module):
                 to 3x when a pathway is completely deactivated.
             sparse_threshold: Minimum routing weight to compute a pathway.
                 Default 0.05 (5%). Only used when inference_sparse=True.
+            sparse_percentile: Percentile threshold for sparse execution.
+                Pathway is skipped if this percentile of routing weights is
+                below sparse_threshold. Default 95. Configurable via
+                LosionConfig.sparse_percentile (v2.5.1).
 
         Returns:
             Tuple (output, routing_info).
@@ -602,10 +607,12 @@ class LosionLayer(nn.Module):
         # pathway, skip it. This provides meaningful speedup while still
         # computing pathways that the majority of tokens need.
         if inference_sparse and not self.training:
-            percentile = 95  # Skip pathway if >95% of tokens have weight below threshold
-            w_ssm_p = route_weights[:, :, 0].float().quantile(percentile / 100.0).item()
-            w_attn_p = route_weights[:, :, 1].float().quantile(percentile / 100.0).item()
-            w_ret_p = route_weights[:, :, 2].float().quantile(percentile / 100.0).item()
+            # v2.5.1: sparse_percentile is now configurable via LosionConfig
+            # (audit finding 2.5). Default 95 means skip pathway if >95% of
+            # tokens have weight below threshold.
+            w_ssm_p = route_weights[:, :, 0].float().quantile(sparse_percentile / 100.0).item()
+            w_attn_p = route_weights[:, :, 1].float().quantile(sparse_percentile / 100.0).item()
+            w_ret_p = route_weights[:, :, 2].float().quantile(sparse_percentile / 100.0).item()
             compute_ssm = w_ssm_p >= sparse_threshold
             compute_attn = w_attn_p >= sparse_threshold
             compute_ret = w_ret_p >= sparse_threshold

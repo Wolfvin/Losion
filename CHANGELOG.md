@@ -5,6 +5,42 @@ All notable changes to the Losion project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.1] — 2026-05-06
+
+### "Security & Correctness Patch — Docker, Encryption, Negation Detection, Secure Defaults"
+
+Follow-up patch addressing 5 new findings from the v2.5.0 audit (score 9.2/10). All findings stem from the v2.5.0 changes themselves — no pre-existing bugs from earlier versions.
+
+#### Fixed — CRITICAL (1 issue)
+
+- **2.1: `--pid=host` in Docker container is a security misconfiguration** (`agent/tools/terminal.py`): The `_execute_in_container()` method passed `--pid=host` to `docker run`, which REMOVES PID namespace isolation — the opposite of what the comment claimed. This flag gives the container full access to the host's PID namespace, enabling process inspection, signal sending, and potential container escape via ptrace. Fix: Removed `--pid=host`. The default Docker PID namespace (no flag) is already properly isolated. Added detailed comment explaining why this flag must never be re-added without strong justification.
+
+#### Fixed — HIGH (2 issues)
+
+- **2.2: XOR encryption vulnerable to known-plaintext attack** (`agent/memory.py`): The v2.5.0 XOR cipher with PBKDF2 key derivation was vulnerable to known-plaintext attacks: episode JSON always starts with a predictable format (`"episode_id"`, `"query"`), allowing an attacker with access to the encrypted file and salt to recover the keystream. XOR also provides no authentication (tampering goes undetected). Fix: Replaced with `cryptography.fernet` (AES-128-CBC + HMAC-SHA256), which provides both semantic security via random IV and tamper detection via HMAC. Fernet-encrypted data is prepended with a `FRNT` magic byte for format auto-detection. Backward compatible: can still decrypt v2.5.0 XOR-encrypted files. Falls back to XOR with deprecation warning if `cryptography` package is not installed. Added `cryptography==44.0.1` to `requirements.txt`.
+
+- **2.3: Negation detection only checks first regex match** (`safety/alignment.py`): `evaluate_response()` used `re.search()` which only finds the first match. If the first match was negated (e.g., "Don't kill someone"), the entire pattern category was skipped — even if a later genuine harmful match existed (e.g., "Also, here's how to kill someone"). Fix: Changed from `re.search()` to `re.finditer()`, evaluating every match individually. A category is now flagged if at least one match is not negated, rather than being skipped entirely based on the first match.
+
+#### Fixed — MEDIUM (1 issue)
+
+- **2.4: `_get_or_derive_key()` is dead code** (`agent/memory.py`): The method was never called from anywhere in the codebase. Its caching logic was also broken: it cached `self._key` derived from the first salt, but encrypt/decrypt use different random salts per file, making the cached key invalid. Fix: Removed the dead method entirely during the `_EncryptionManager` rewrite for finding 2.2.
+
+#### Fixed — LOW (1 issue)
+
+- **2.5: `inference_sparse` percentile 95 hardcoded, not configurable** (`models/losion_model.py`, `models/losion_model_v2.py`, `config.py`): The value 95 was hardcoded with no way to override it via `LosionConfig` or `forward()` parameters. Users wanting a different trade-off (e.g., more aggressive skipping for latency-critical deployments) had to modify source code. Fix: Added `sparse_percentile: int = 95` to `LosionConfig` with validation (must be in (0, 100]). Propagated through V1 `LosionLayer.forward()`, V2 `LosionLayerV2.forward()`, V2 `LosionModelV2.forward()`, V2 `LosionForCausalLMV2.forward()`, and the checkpoint helper `_checkpoint_layer_fn()`. Also supported in YAML config loading.
+
+#### Fixed — MINOR (1 issue)
+
+- **2.6: `require_allowlist` defaults to `False` — production unprotected by default** (`agent/tools/terminal.py`): Despite the v2.5.0 `shell=False` improvement, an empty `allowed_commands` with `require_allowlist=False` meant the sandbox would execute any command not in the blacklist out-of-the-box. Fix: Changed `require_allowlist` default to `True` (secure-by-default). Added runtime warning in `SandboxedTerminal.__init__()` when `require_allowlist=False` without container isolation. Users must now explicitly opt into the less-secure mode.
+
+#### Version Updates
+
+- `losion/__init__.py`: `__version__` bumped to `"2.5.1"`
+- `setup.py`: version bumped to `"2.5.1"`
+- `pyproject.toml`: version bumped to `"2.5.1"`
+- `README.md`: badge updated to `2.5.1`
+- `requirements.txt`: header updated to `v2.5.1`, added `cryptography==44.0.1`
+
 ## [2.5.0] — 2026-05-06
 
 ### "Architecture Hardening — Shared Code, Encryption, Warnings, Tests"
