@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/Wolfvin/Losion/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"/></a>
-  <a href="https://github.com/Wolfvin/Losion/releases"><img src="https://img.shields.io/badge/version-2.2.0-brightgreen.svg" alt="Version 2.2.0"/></a>
+  <a href="https://github.com/Wolfvin/Losion/releases"><img src="https://img.shields.io/badge/version-2.3.0-brightgreen.svg" alt="Version 2.3.0"/></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"/></a>
   <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.1%2B-red.svg" alt="PyTorch"/></a>
 </p>
@@ -288,6 +288,9 @@ The router learns to allocate compute where it matters most, achieving both effi
 | **v1.8.0** | Per-Channel Selectivity | Per-channel selectivity, ThinkingToggle soft-blending, entropy from all layers | 3 |
 | **v1.9.0** | Complete Gradient Flow | Evoformer+DualMemory gradient fix, vectorized attention, 10.0/10 score | 3 |
 | **v2.0.0** | Alive Gradients | AuxFreeMoE MTP loss propagated (was 32.2% dead params), production ready | 1 |
+| **v2.1.0** | Honest Code & Real Kernels | Real Triton kernel, functional use_cache, fixed Evoformer gradient, iRoPE, vectorized scan | 6 |
+| **v2.2.0** | Deep Audit & Bug Purge | 40+ bug fixes (10 critical, 14 high, 17 medium, 1 low) across all modules | 40+ |
+| **v2.3.0** | Security & Correctness | 12 audit fixes: 3 RCE vulnerabilities, sandbox hardening, vectorized MoE, double softmax fix, sparse inference, LLM init, FSDP thread safety | 12 |
 
 ---
 

@@ -137,23 +137,19 @@ class AdaptiveRouter(nn.Module):
         device = x.device
         dtype = x.dtype
 
-        # v1.8.0: Apply thinking_mode override WITHOUT state mutation
-        # Save and restore force_mode for thread safety
-        prev_force_mode = None
+        # v2.3.0: Apply thinking_mode via kwarg only — NO state mutation.
+        # The old save/restore pattern (prev_force_mode = clone();
+        # set_force_mode(); try:...finally: copy_()) was not thread-safe
+        # for FSDP async — two overlapping forward passes on different
+        # workers could clobber _force_mode_code. The thinking_mode kwarg
+        # is already passed through to ThinkingToggle.forward() directly.
         if thinking_mode is not None:
-            # Temporarily set force mode for this forward call only
-            prev_force_mode = self.thinking_toggle._force_mode_code.clone()
+            # Directly compute thinking assessment with forced mode
             from .thinking_toggle import ThinkingMode as TM
             forced_mode = TM.THINKING if thinking_mode else TM.NON_THINKING
-            self.thinking_toggle.set_force_mode(forced_mode)
-
-        try:
-            # === Tahap 1: Classification via ThinkingToggle ===
+            thinking_assessment = self.thinking_toggle(x, force_mode=forced_mode)
+        else:
             thinking_assessment = self.thinking_toggle(x)
-        finally:
-            # v1.8.0: Always restore previous mode — no lasting state mutation
-            if thinking_mode is not None:
-                self.thinking_toggle._force_mode_code.copy_(prev_force_mode)
 
         # === Tahap 2: Allocation via BiasRouter ===
         routing_weights, routing_info = self.bias_router(x)
@@ -269,11 +265,25 @@ class AdaptiveRouter(nn.Module):
         """
         Force thinking mode untuk semua input.
 
+        .. deprecated:: v2.3.0
+            This method uses state mutation (``_force_mode_code`` buffer)
+            which is NOT thread-safe for FSDP async. Use the
+            ``thinking_mode`` kwarg in ``forward()`` instead, which passes
+            the mode directly without any shared state.
+
         Set None untuk kembali ke automatic detection.
 
         Args:
             mode: ThinkingMode untuk force, atau None untuk auto
         """
+        import warnings
+        warnings.warn(
+            "set_force_thinking() is deprecated since v2.3.0 — it uses "
+            "state mutation that is not thread-safe for FSDP. Use the "
+            "thinking_mode kwarg in AdaptiveRouter.forward() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.thinking_toggle.set_force_mode(mode)
 
     def set_thinking_threshold(self, threshold: float) -> None:

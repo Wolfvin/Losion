@@ -575,6 +575,13 @@ class CodeVerifier(RewardVerifier):
         "sorted", "str", "sum", "tuple", "type", "zip",
     }
 
+    # Dangerous dunder attributes that allow sandbox escape
+    _BLOCKED_ATTRS: frozenset = frozenset({
+        "__class__", "__bases__", "__mro__", "__subclasses__",
+        "__globals__", "__code__", "__func__", "__self__",
+        "__dict__", "__weakref__", "__module__", "__import__",
+    })
+
     def __init__(
         self,
         name: str = "code",
@@ -625,9 +632,42 @@ class CodeVerifier(RewardVerifier):
 
         stdout_capture = io.StringIO()
 
+        # Compile the code first — this catches syntax errors before exec
+        try:
+            compiled = compile(code, "<rlvr_sandbox>", "exec")
+        except SyntaxError:
+            error_msg = traceback.format_exc()
+            return None, error_msg, False
+
+        # Check for dangerous attribute access patterns in the compiled bytecode.
+        # This is NOT a full sandbox (as the comment above acknowledges) but
+        # blocks the most common escape routes: __class__.__mro__,
+        # __subclasses__(), __globals__, etc.
+        # For production: use subprocess with ulimit/seccomp or Docker.
+        code_text = code
+        for attr in self._BLOCKED_ATTRS:
+            if attr in code_text:
+                # Allow some safe uses (e.g., isinstance uses __class__
+                # internally but isn't an escape). Block direct attribute access.
+                import re
+                # Match patterns like obj.__class__, obj["__class__"], getattr(obj, "__class__")
+                patterns = [
+                    rf"""\.\s*{re.escape(attr)}\b""",  # obj.__class__
+                    rf"""\[\s*['\"]\s*{re.escape(attr)}\s*['\"]\s*\]""",  # obj["__class__"]
+                    rf"""getattr\s*\([^,]+,\s*['\"]\s*{re.escape(attr)}\s*['\"]""",  # getattr(obj, "__class__")
+                ]
+                for pattern in patterns:
+                    if re.search(pattern, code_text):
+                        error_msg = (
+                            f"Sandbox violation: access to '{attr}' is blocked. "
+                            f"This is a security restriction to prevent sandbox escape "
+                            f"via Python's object introspection chain."
+                        )
+                        return None, error_msg, False
+
         try:
             with redirect_stdout(stdout_capture):
-                exec(code, safe_globals, local_vars)  # noqa: S102
+                exec(compiled, safe_globals, local_vars)  # noqa: S102
             output = stdout_capture.getvalue()[: self.max_output_length]
             return output, None, True
         except Exception:

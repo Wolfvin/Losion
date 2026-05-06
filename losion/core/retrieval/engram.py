@@ -445,7 +445,7 @@ class EngramMemory(nn.Module):
         Args:
             path: Path file sumber
         """
-        save_dict = torch.load(path, map_location="cpu", weights_only=False)
+        save_dict = torch.load(path, map_location="cpu", weights_only=True)
 
         # Verifikasi kompatibilitas
         assert save_dict["num_buckets"] == self.num_buckets, (

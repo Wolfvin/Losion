@@ -17,6 +17,7 @@ Provides:
 from __future__ import annotations
 
 import enum
+import pickle
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -1010,7 +1011,24 @@ class LosionDistributedTrainer:
         Args:
             path: Path to the checkpoint file.
         """
-        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        # Two-phase loading for security:
+        # Phase 1: Try weights_only=True first (safe — no pickle deserialization).
+        # Phase 2: If checkpoint contains optimizer/scheduler state (non-tensor
+        # objects that require pickle), fall back to weights_only=False with
+        # an explicit security warning.
+        checkpoint = None
+        try:
+            checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        except (TypeError, ValueError, pickle.UnpicklingError):
+            import warnings
+            warnings.warn(
+                f"Checkpoint at {path} contains non-tensor objects (likely optimizer/"
+                "scheduler state). Falling back to weights_only=False. "
+                "Only load checkpoints from TRUSTED sources to prevent RCE.",
+                UserWarning,
+                stacklevel=2,
+            )
+            checkpoint = torch.load(path, map_location="cpu", weights_only=False)
 
         self._wrapped_model.load_state_dict(checkpoint["model"])
         self._step = checkpoint.get("step", 0)

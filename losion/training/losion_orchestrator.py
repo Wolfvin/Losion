@@ -1573,24 +1573,28 @@ class LosionTrainingOrchestrator:
         Args:
             path: Directory path containing the checkpoint files.
         """
-        # Model state
+        # Model state — weights_only=True for security (RCE prevention)
         model_path = os.path.join(path, "model.pt")
         if os.path.exists(model_path):
-            state_dict = torch.load(model_path, map_location=self.device)
+            state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
             self.model.load_state_dict(state_dict, strict=False)
 
-        # Optimizer state
+        # Optimizer state — weights_only=False required because optimizer
+        # state dicts contain non-tensor objects (e.g., step count tensors,
+        # param_groups with complex nested dicts). This is SAFE when loading
+        # from trusted checkpoints (self-saved during training). NEVER load
+        # optimizer state from untrusted sources.
         optimizer_path = os.path.join(path, "optimizer.pt")
         if os.path.exists(optimizer_path):
             self.optimizer.load_state_dict(
-                torch.load(optimizer_path, map_location=self.device)
+                torch.load(optimizer_path, map_location=self.device, weights_only=False)
             )
 
-        # LR scheduler state
+        # LR scheduler state — same rationale as optimizer above.
         scheduler_path = os.path.join(path, "lr_scheduler.pt")
         if os.path.exists(scheduler_path):
             self.lr_scheduler.load_state(
-                torch.load(scheduler_path, map_location="cpu")
+                torch.load(scheduler_path, map_location="cpu", weights_only=False)
             )
 
         # Training state

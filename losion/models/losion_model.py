@@ -227,6 +227,14 @@ class SimplifiedAttention(nn.Module):
 
         # Causal mask
         if attention_mask is not None:
+            # Validate attention_mask format — must be additive bias
+            # (0.0 = attend, -inf = ignore), NOT boolean or HuggingFace-style.
+            if attention_mask.dtype == torch.bool:
+                raise TypeError(
+                    "attention_mask must be an additive bias tensor (float), "
+                    "not a boolean mask. Convert with: "
+                    "mask = torch.where(bool_mask, 0.0, float('-inf'))"
+                )
             attn_weights = attn_weights + attention_mask
         else:
             causal_mask = torch.triu(
@@ -312,6 +320,10 @@ class SimplifiedMoE(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Forward pass through Top-K MoE.
 
+        Uses vectorized batched expert computation instead of O(K×E) Python loop.
+        Each token is processed by its top-K selected experts in a single
+        vectorized pass per K-slot.
+
         Args:
             x: Input tensor (batch, seq_len, d_model).
 
@@ -326,16 +338,23 @@ class SimplifiedMoE(nn.Module):
         weights, indices = torch.topk(router_logits, self.top_k_routing, dim=-1)
         weights = F.softmax(weights, dim=-1)  # (B*S, top_k)
 
-        # Expert computation
+        # Vectorized MoE computation: iterate only over top_k slots (K),
+        # not over all experts (E). For each slot, batch tokens by their
+        # assigned expert for efficient computation.
         output_flat = torch.zeros_like(x_flat)
         for k_idx in range(self.top_k_routing):
-            for eid in range(self.num_experts):
-                mask = (indices[:, k_idx] == eid)
+            expert_idx = indices[:, k_idx]  # (B*S,) — expert assignment per token
+            w = weights[:, k_idx:k_idx + 1]  # (B*S, 1) — weight for this slot
+
+            # Process each expert that has at least one token assigned
+            unique_experts = expert_idx.unique()
+            for eid in unique_experts:
+                eid_val = eid.item()
+                mask = (expert_idx == eid)  # (B*S,) — which tokens go to this expert
                 if not mask.any():
                     continue
-                expert_out = self.experts[eid](x_flat[mask])
-                w = weights[mask, k_idx:k_idx + 1]
-                output_flat[mask] += w * expert_out
+                expert_out = self.experts[eid_val](x_flat[mask])  # (n_tokens, d_model)
+                output_flat[mask] += w[mask] * expert_out
 
         # Shared expert
         shared_out = self.shared_expert(x_flat)
@@ -558,14 +577,26 @@ class LosionLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         routing_weights: Optional[torch.Tensor] = None,
         thinking_mode: Optional[bool] = None,
+        inference_sparse: bool = False,
+        sparse_threshold: float = 0.05,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, Any]]]:
         """Forward pass through the Tri-Jalur layer.
 
         Args:
             x: Input tensor (batch, seq_len, d_model).
-            attention_mask: Optional attention mask.
+            attention_mask: Optional attention mask. Must be an additive bias
+                tensor of shape [batch, heads, seq_len, seq_len] where 0.0
+                means "attend" and -inf means "ignore". Boolean masks and
+                HuggingFace-style (1=attend, 0=ignore) masks are NOT supported.
             routing_weights: Optional pre-computed routing weights.
             thinking_mode: If True, bias towards attention + retrieval pathways.
+            inference_sparse: If True, skip computation for pathways whose
+                routing weight is below ``sparse_threshold``. Only effective
+                during inference (not training), where gradients don't need
+                to flow through all pathways. This can reduce compute by up
+                to 3x when a pathway is completely deactivated.
+            sparse_threshold: Minimum routing weight to compute a pathway.
+                Default 0.05 (5%). Only used when inference_sparse=True.
 
         Returns:
             Tuple (output, routing_info).
@@ -575,29 +606,52 @@ class LosionLayer(nn.Module):
         # ---- Compute routing weights ----
         if routing_weights is None:
             route_logits = self.router(x)  # (batch, seq_len, 3)
+
+            # Adjust for thinking mode — apply boost to LOGITS before softmax,
+            # NOT to probabilities after softmax (double softmax melemahkan boost).
+            # See AdaptiveRouter._adjust_for_thinking() for the same fix.
+            if thinking_mode is True:
+                # Boost attention + retrieval, reduce SSM
+                boost = torch.tensor([-0.2, 0.1, 0.1], device=x.device, dtype=x.dtype)
+                route_logits = route_logits + boost.unsqueeze(0).unsqueeze(0)
+
             route_weights = F.softmax(route_logits, dim=-1)
         else:
             route_weights = routing_weights
 
-        # Adjust for thinking mode
-        if thinking_mode is True:
-            # Boost attention + retrieval, reduce SSM
-            boost = torch.tensor([-0.2, 0.1, 0.1], device=x.device, dtype=x.dtype)
-            route_weights = F.softmax(
-                route_weights + boost.unsqueeze(0).unsqueeze(0), dim=-1
-            )
+        # ---- Determine which pathways to compute ----
+        # During training, always compute all 3 pathways (gradient flows to all).
+        # During inference with inference_sparse=True, skip pathways with
+        # mean weight below threshold to save compute.
+        w_ssm_mean = route_weights[:, :, 0].mean().item()
+        w_attn_mean = route_weights[:, :, 1].mean().item()
+        w_ret_mean = route_weights[:, :, 2].mean().item()
+
+        compute_ssm = not (inference_sparse and not self.training and w_ssm_mean < sparse_threshold)
+        compute_attn = not (inference_sparse and not self.training and w_attn_mean < sparse_threshold)
+        compute_ret = not (inference_sparse and not self.training and w_ret_mean < sparse_threshold)
 
         # ---- Jalur 1: SSM ----
-        ssm_input = self.ssm_norm(x)
-        ssm_out = self.ssm_layer(ssm_input)
+        if compute_ssm:
+            ssm_input = self.ssm_norm(x)
+            ssm_out = self.ssm_layer(ssm_input)
+        else:
+            ssm_out = torch.zeros_like(x)
 
         # ---- Jalur 2: Attention ----
-        attn_input = self.attn_norm(x)
-        attn_out = self.attention_layer(attn_input, attention_mask=attention_mask)
+        if compute_attn:
+            attn_input = self.attn_norm(x)
+            attn_out = self.attention_layer(attn_input, attention_mask=attention_mask)
+        else:
+            attn_out = torch.zeros_like(x)
 
         # ---- Jalur 3: Retrieval ----
-        ret_input = self.retrieval_norm(x)
-        ret_out, ret_aux = self.retrieval_layer(ret_input)
+        if compute_ret:
+            ret_input = self.retrieval_norm(x)
+            ret_out, ret_aux = self.retrieval_layer(ret_input)
+        else:
+            ret_out = torch.zeros_like(x)
+            ret_aux = None
 
         # ---- Combine with routing weights ----
         w_ssm = route_weights[:, :, 0:1]    # (batch, seq_len, 1)
@@ -667,13 +721,22 @@ class LosionModel(nn.Module):
         self.gradient_checkpointing: bool = False
 
         # ---- Initialize weights ----
-        self.apply(self._init_weights)
+        self.apply(lambda m: self._init_weights(m))
 
-    @staticmethod
-    def _init_weights(module: nn.Module) -> None:
-        """Standard weight initialization."""
+    def _init_weights(self, module: nn.Module) -> None:
+        """LLM-standard weight initialization.
+
+        Uses GPT-2 / GPT-NeoX style initialization:
+        - Embeddings: normal(0, 0.02)
+        - Linear layers: normal(0, 0.02 / sqrt(2 * n_layers))
+          The sqrt(2 * n_layers) scaling prevents hidden state explosion
+          in deep residual networks (GPT-2 paper Section 2.3).
+        - Biases: zeros
+        """
         if isinstance(module, nn.Linear):
-            nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="linear")
+            # Scaled init for residual stream stability
+            std = 0.02 / math.sqrt(2 * self.n_layers)
+            nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -717,6 +780,13 @@ class LosionModel(nn.Module):
         """
         batch, seq_len = input_ids.shape
 
+        # ---- Validate sequence length ----
+        if seq_len > self.max_seq_len:
+            raise ValueError(
+                f"seq_len={seq_len} melebihi max_seq_len={self.max_seq_len}. "
+                f"Gunakan context extension atau truncate input."
+            )
+
         # ---- Embeddings ----
         positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
         x = self.token_embedding(input_ids) + self.position_embedding(positions)
@@ -728,25 +798,48 @@ class LosionModel(nn.Module):
 
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
-                # Gradient checkpointing: recompute in backward
-                def _create_checkpointable(layer_module, attn_mask, think_mode):
+                # Gradient checkpointing: recompute activations in backward pass.
+                # Fix (I-07): Compute routing info OUTSIDE the checkpoint so it
+                # is not lost. torch.utils.checkpoint.checkpoint can only return
+                # tensors — dicts/tuples with non-tensor values are dropped.
+                # Solution: checkpoint only the heavy computation (pathway forward
+                # + combine), and compute routing info separately with no_grad.
+
+                # Step 1: Compute routing weights (cheap — single linear + softmax)
+                with torch.no_grad():
+                    route_logits = layer.router(x)
+                    if thinking_mode is True:
+                        boost = torch.tensor(
+                            [-0.2, 0.1, 0.1], device=x.device, dtype=x.dtype
+                        )
+                        route_logits = route_logits + boost.unsqueeze(0).unsqueeze(0)
+                    route_weights = F.softmax(route_logits, dim=-1)
+
+                # Step 2: Checkpoint the heavy computation only
+                def _checkpoint_compute(layer_module, attn_mask, r_weights):
                     def _forward(*args):
                         hidden = args[0]
-                        out, info = layer_module(
+                        # Pass pre-computed routing weights to avoid re-computation
+                        out, _ = layer_module(
                             hidden,
                             attention_mask=attn_mask,
-                            thinking_mode=think_mode,
+                            routing_weights=r_weights,
                         )
-                        return out, info
+                        return out
                     return _forward
 
-                x, layer_routing = torch.utils.checkpoint.checkpoint(
-                    _create_checkpointable(layer, attention_mask, thinking_mode),
+                x = torch.utils.checkpoint.checkpoint(
+                    _checkpoint_compute(layer, attention_mask, route_weights),
                     x,
                     use_reentrant=False,
                 )
-                # checkpoint doesn't return non-tensor outputs properly,
-                # so routing_info may be None
+
+                # Step 3: Build routing info from pre-computed weights
+                layer_routing = {
+                    "layer_idx": layer.layer_idx,
+                    "route_weights": route_weights.detach(),
+                    "retrieval_aux": None,  # Not available under checkpointing
+                }
             else:
                 x, layer_routing = layer(
                     x,

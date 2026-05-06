@@ -131,13 +131,16 @@ class ThinkingToggle(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor
+        self, x: torch.Tensor, force_mode: Optional["ThinkingMode"] = None
     ) -> ThinkingAssessment:
         """
         Assess apakah input memerlukan thinking mode.
 
         Args:
             x: Input tensor [batch, seq_len, d_model]
+            force_mode: Optional ThinkingMode override. If provided, this is
+                used directly instead of reading from _force_mode_code buffer.
+                This is thread-safe (no state mutation) for FSDP/DDP.
 
         Returns:
             ThinkingAssessment dengan detail keputusan
@@ -167,26 +170,31 @@ class ThinkingToggle(nn.Module):
         ).squeeze(-1)  # [batch]
 
         # 5. Determine mode
-        force_mode = self._get_force_mode()
+        # v2.3.0: Use force_mode kwarg if provided (thread-safe, no state mutation).
+        # Falls back to _get_force_mode() for backward compatibility.
         if force_mode is not None:
             mode = force_mode
         else:
-            # v1.8.0: Menggunakan straight-through estimator agar gradien
-            # bisa mengalir kembali ke threshold lewat thinking_score.
-            # Sebelumnya .item() memutus graph sepenuhnya — sekarang
-            # kita menghitung mode sebagai tensor untuk branching, tapi
-            # menggunakan hard threshold untuk control flow (yang memang
-            # harus non-differentiable), sambil mempertahankan differentiable
-            # path melalui depth_multiplier yang TIDAK bergantung pada mode.
-            #
-            # Straight-through trick: forward pass uses hard threshold,
-            # backward pass passes gradient through as if it were soft.
-            avg_score_val = thinking_score.mean().item()  # Only for control flow
-            mode = (
-                ThinkingMode.THINKING
-                if avg_score_val > self.threshold
-                else ThinkingMode.NON_THINKING
-            )
+            persistent_mode = self._get_force_mode()
+            if persistent_mode is not None:
+                mode = persistent_mode
+            else:
+                # v1.8.0: Menggunakan straight-through estimator agar gradien
+                # bisa mengalir kembali ke threshold lewat thinking_score.
+                # Sebelumnya .item() memutus graph sepenuhnya — sekarang
+                # kita menghitung mode sebagai tensor untuk branching, tapi
+                # menggunakan hard threshold untuk control flow (yang memang
+                # harus non-differentiable), sambil mempertahankan differentiable
+                # path melalui depth_multiplier yang TIDAK bergantung pada mode.
+                #
+                # Straight-through trick: forward pass uses hard threshold,
+                # backward pass passes gradient through as if it were soft.
+                avg_score_val = thinking_score.mean().item()  # Only for control flow
+                mode = (
+                    ThinkingMode.THINKING
+                    if avg_score_val > self.threshold
+                    else ThinkingMode.NON_THINKING
+                )
 
         # 6. Determine dominant task type
         overall_task_probs = task_probs.mean(dim=(0, 1))  # [num_task_types]

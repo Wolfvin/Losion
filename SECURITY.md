@@ -153,7 +153,24 @@ processing. Follow these guidelines to use Losion securely.
 
 ---
 
-## 7. Contact
+## 7. Security Fixes by Version
+
+### v2.3.0 (2026-05-06)
+
+Three critical RCE vulnerabilities were identified and fixed:
+
+| Issue | Severity | Description |
+|-------|----------|-------------|
+| I-01 | CRITICAL | `torch.load()` without `weights_only` in `training/losion_orchestrator.py` — model checkpoints now loaded with `weights_only=True` |
+| I-02 | CRITICAL | Explicit `torch.load(weights_only=False)` in `distributed/parallel.py` — two-phase loading with safe default + fallback warning |
+| I-03 | CRITICAL | Explicit `torch.load(weights_only=False)` in `core/retrieval/engram.py` — now uses `weights_only=True` (format only contains tensors + primitives) |
+| I-04 | HIGH | `exec()` sandbox in `training/rlvr.py` vulnerable to escape via `__class__.__mro__` chain — 12 dangerous dunder attributes now blocked via regex |
+
+**Note:** Optimizer and scheduler state dicts still require `weights_only=False` due to PyTorch's non-tensor objects in param groups. This is documented in-code and safe for self-saved checkpoints. Never load optimizer state from untrusted sources.
+
+---
+
+## 8. Contact
 
 | Role                | Contact                        |
 |---------------------|--------------------------------|
