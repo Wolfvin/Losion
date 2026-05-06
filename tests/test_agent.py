@@ -464,7 +464,13 @@ class TestSandboxedTerminal(unittest.TestCase):
 
     def test_simple_command(self):
         """Should execute a simple safe command."""
-        terminal = SandboxedTerminal()
+        # v2.5.4: require_allowlist=True is now default — must configure
+        # allowed_commands for subprocess execution.
+        config = SandboxConfig(
+            allowed_commands=["echo"],
+            require_allowlist=True,
+        )
+        terminal = SandboxedTerminal(config)
         result = terminal.execute("echo hello")
         self.assertTrue(result.success)
         self.assertIn("hello", result.stdout)
@@ -477,7 +483,13 @@ class TestSandboxedTerminal(unittest.TestCase):
 
     def test_timeout(self):
         """Should timeout long-running commands."""
-        config = SandboxConfig(max_execution_time=1.0)
+        # v2.5.4: require_allowlist=True is now default — must configure
+        # allowed_commands for subprocess execution.
+        config = SandboxConfig(
+            max_execution_time=1.0,
+            allowed_commands=["sleep"],
+            require_allowlist=True,
+        )
         terminal = SandboxedTerminal(config)
         result = terminal.execute("sleep 10")
         self.assertTrue(result.timed_out)

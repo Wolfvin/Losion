@@ -67,13 +67,14 @@ logger = logging.getLogger(__name__)
 # If cryptography is not installed, we fall back to the legacy XOR mode
 # with an explicit deprecation warning.
 try:
-    from cryptography.fernet import Fernet
+    from cryptography.fernet import Fernet, InvalidToken as _FernetInvalidToken
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
     import base64 as _base64
     _FERNET_AVAILABLE = True
 except ImportError:
     _FERNET_AVAILABLE = False
+    _FernetInvalidToken = Exception  # type: ignore[misc,assignment]
 
 
 def _derive_fernet_key(passphrase: str, salt: bytes) -> bytes:
@@ -838,8 +839,13 @@ class EpisodicMemory:
                                     continue
                             episode = Episode.from_dict(json.loads(raw_json))
                         loaded_episodes.append(episode)
-                    except (json.JSONDecodeError, KeyError, TypeError) as ep_exc:
+                    except (json.JSONDecodeError, KeyError, TypeError,
+                            _FernetInvalidToken) as ep_exc:
                         # Skip this bad entry but continue loading others
+                        # v2.5.4: Added _FernetInvalidToken — if the passphrase
+                        # changed or the file was tampered with, Fernet.decrypt()
+                        # raises InvalidToken which was NOT caught before, causing
+                        # the entire _load() to crash instead of skipping one episode.
                         logger.error(
                             f"EpisodicMemory: skipping corrupt episode "
                             f"{episode_id} at {ep_path}: {ep_exc!r}"
@@ -848,6 +854,13 @@ class EpisodicMemory:
 
             # === Phase 2: Populate in-memory store (inside lock, fast) ===
             with self._lock:
+                # v2.5.4: Clear existing state before repopulating. Previously,
+                # _load() only added new episodes without removing old ones.
+                # If reload() was called at runtime, episodes deleted from disk
+                # (e.g. expired) would remain in memory as ghosts.
+                self._episodes.clear()
+                self._query_index.clear()
+                self._domain_index.clear()
                 for episode in loaded_episodes:
                     self._episodes[episode.episode_id] = episode
                     query_hash = self._hash_query(episode.query)

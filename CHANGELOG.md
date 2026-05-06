@@ -5,6 +5,46 @@ All notable changes to the Losion project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.4] — 2026-05-06
+
+### "Security & Correctness — Trusted Path, Speculative Decoding, Credential Isolation, Encryption Resilience"
+
+Follow-up patch addressing 9 findings from the v2.5.3 deep audit. Focus on two critical security vulnerabilities (trusted-path bypass, credential exfiltration), a statistically incorrect inference component (speculative decoding), and several correctness issues across encryption, alignment, and upcycling.
+
+#### Fixed — KRITIS (2 issues)
+
+- **V-01: Speculative Decoding uses fixed threshold 0.5 instead of rejection sampling** (`inference/generation.py`): The `SpeculativeDecoder._verify_draft_tokens()` used a hardcoded `accept_threshold = 0.5`, which broke the fundamental statistical guarantee of speculative decoding — the output distribution was NOT equivalent to the target model's distribution. Tokens with `p_target=0.4` (highly confident on a 50k vocab) were always rejected, while tokens with `p_draft=0.99, p_target=0.51` were always accepted despite a 48.5% rejection probability being correct. Fix: Implemented proper rejection sampling following Chen et al. 2023 and Leviathan et al. 2023: `accept_prob = min(1, p_target / p_draft)`. On rejection, resample from the corrected distribution `max(0, p_target - p_draft) / Z`. Also updated `_generate_draft_tokens_ssm()` to store draft probability distributions in `_last_draft_probs` for use during verification. When draft probs are unavailable (e.g. pure greedy SSM), acceptance defaults to 1.0 (always accept), which preserves the target distribution since rejected tokens are resampled from the target model.
+
+- **V-02: `parallel.py` defaults `is_trusted=True` when no trusted directories configured** (`distributed/parallel.py`): When `_save_dir` and `checkpoint_dir` were both unset (common for newly created `DistributedTrainer` or pure inference usage), `trusted_dirs` was empty and the expression `if trusted_dirs else True` defaulted to `is_trusted = True`. This meant ANY file path — including `/tmp/malicious.pt` downloaded from the internet — would pass the origin check and reach `torch.load(..., weights_only=False)`, completely bypassing the I-02 trusted-path safeguard. Fix: Changed the empty-set case to raise `SecurityError` with guidance on configuring trusted directories. Also replaced the `startswith()` check with `os.path.commonpath()` to prevent prefix-collision attacks (e.g. `/tmp/out` matching `/tmp/outputs_evil`).
+
+#### Fixed — TINGGI (2 issues)
+
+- **V-03: Subprocess inherits entire `os.environ` — credential exfiltration risk** (`agent/tools/terminal.py`): `SandboxedTerminal.execute()` used `os.environ.copy()` to build the subprocess environment, leaking ALL parent process environment variables — including `AWS_ACCESS_KEY_ID`, `OPENAI_API_KEY`, `DATABASE_URL`, `SSH_AUTH_SOCK`, and other secrets — into every subprocess command. An LLM agent could exfiltrate these via `python3 -c "import os; print(os.environ['API_KEY'])"`. Fix: Replaced with a minimal safe environment containing only `PATH`, `HOME`, `LANG`, `TERM`, and `XDG_RUNTIME_DIR`. Config-level `env_vars` (developer-reviewed) and per-call `env` overrides are still merged on top. This ensures credentials are not leaked by default while preserving intentional environment configuration.
+
+- **V-04: `Fernet.decrypt()` `InvalidToken` not caught in `_load()`** (`agent/memory.py`): The `_load()` method's per-episode exception handler caught `json.JSONDecodeError, KeyError, TypeError` but NOT `cryptography.fernet.InvalidToken`. If the passphrase changed (e.g. after key rotation) or a file was tampered with, `Fernet.decrypt()` would raise `InvalidToken`, which would bubble up and crash the entire `_load()` instead of skipping just the affected episode. One corrupted episode could prevent loading ALL episodic memory. Fix: Imported `InvalidToken` (with fallback to `Exception` if cryptography is not installed) and added it to the per-episode exception tuple.
+
+#### Fixed — SEDANG (3 issues)
+
+- **V-05: `ConstitutionalTrainer.train_step()` returns misleading `loss=0.0` in stub mode** (`safety/alignment.py`): When violations were found but no training signal could be produced (because `train_step()` lacks model generation integration), the method returned `{"loss": 0.0, "stub_mode": True}`. Callers that didn't check `stub_mode` would see loss decreasing and believe training was progressing normally. Fix: Changed to raise `RuntimeError` with a clear message directing callers to use `compute_dpo_loss()` directly or implement custom generation integration. The `stub_mode` return key is now always `False` (the error path replaces the silent-return path).
+
+- **V-06: `SafetyClassifier._attn_pool_weight` not registered as a proper parameter** (`safety/alignment.py`): The attention pooling weight was created lazily via `hasattr()` check in `forward()` instead of being declared in `__init__()`. This meant it was invisible to `self.parameters()` (not optimized), `state_dict()` (not saved to checkpoints), and `.to(device)` (not moved to GPU). Fix: Moved `_attn_pool_weight = nn.Parameter(torch.zeros(d_model))` to `__init__()` where `d_model` is already available as a constructor parameter. Removed the lazy `hasattr` check in `forward()`.
+
+- **V-07: Empty expert receives `d_ff=1` in metadata but `d_ff//n_experts` in weight tensor** (`utils/upcycling.py`): When clustering produced an empty expert (`n_assigned=0`), the weight tensor was created with dimension `expert_d_ff = max(d_ff // n_experts, 1)` (e.g. 512) but the metadata recorded `max(n_assigned, 1) = 1`. This shape mismatch caused `RuntimeError` when `load_state_dict()` tried to load the weight into a model expecting `d_ff=1`. Fix: Empty experts now record `expert_d_ff` (the actual dimension used for the random weight) in metadata instead of `max(n_assigned, 1)`.
+
+#### Fixed — RENDAH (2 issues)
+
+- **V-08: `_load()` two-phase repopulate doesn't clear stale state** (`agent/memory.py`): Phase 2 of `_load()` added episodes to `_episodes` without clearing existing entries first. If `reload()` was called at runtime, episodes that had been deleted from disk (e.g. expired) would remain in memory as "ghosts." Fix: Added `self._episodes.clear()`, `self._query_index.clear()`, and `self._domain_index.clear()` before the Phase 2 population loop.
+
+- **V-09: Test coverage gaps for sandbox bypass, wrong passphrase, speculative decoding** (`tests/test_v2_5_4.py`): Three critical areas had zero test coverage: (1) `SandboxedTerminal` injection resistance with `shell=False` + minimal env, (2) `EpisodicMemory._load()` with wrong Fernet passphrase, (3) `SpeculativeDecoder` rejection sampling correctness. Fix: Added 24 new tests across 5 test classes covering all three areas plus integration scenarios.
+
+#### Version Updates
+
+- `losion/__init__.py`: `__version__` bumped to `"2.5.4"`
+- `setup.py`: version bumped to `"2.5.4"`
+- `pyproject.toml`: version bumped to `"2.5.4"`
+- `README.md`: badge updated to `2.5.4`
+- `requirements.txt`: header updated to `v2.5.4`
+
 ## [2.5.3] — 2026-05-06
 
 ### "Concurrency, Crash Safety & Data Integrity — Agent Layer Hardening"

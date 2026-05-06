@@ -827,11 +827,21 @@ class HyLoUpcycler:
                     moe_state_dict[expert_key] = expert_W.to(weight.dtype)
 
                 # Simpan metadata: jumlah neuron per expert
+                # v2.5.4: For empty experts (n_assigned==0), record the actual
+                # expert_d_ff used for the random weight tensor, NOT max(0,1)=1.
+                # Previously, metadata recorded d_ff=1 for empty experts while
+                # the weight tensor had shape (d_ff//n_experts, d_model), causing
+                # RuntimeError on load_state_dict due to shape mismatch.
                 for expert_id in range(n_experts):
                     mask = (assignments == expert_id)
                     n_assigned = mask.sum().item()
                     meta_key = f"{layer_name}.experts.{expert_id}.d_ff"
-                    moe_state_dict[meta_key] = torch.tensor(max(n_assigned, 1))
+                    if n_assigned == 0:
+                        # Use the same dimension as the random weight tensor
+                        expert_d_ff = max(d_ff // n_experts, 1)
+                        moe_state_dict[meta_key] = torch.tensor(expert_d_ff)
+                    else:
+                        moe_state_dict[meta_key] = torch.tensor(n_assigned)
 
             # Tambahkan bias keys jika ada
             for weight_key in weight_keys:

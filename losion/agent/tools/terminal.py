@@ -330,11 +330,24 @@ class SandboxedTerminal:
         effective_timeout = timeout or self.config.max_execution_time
         effective_wd = working_dir or self.config.working_dir or self._get_temp_dir()
 
-        # Build environment
-        effective_env = os.environ.copy()
-        effective_env.update(self.config.env_vars)
+        # Build environment — v2.5.4: minimal safe environment instead of
+        # os.environ.copy(). The previous approach leaked ALL parent env vars
+        # (AWS_ACCESS_KEY_ID, OPENAI_API_KEY, DATABASE_URL, SSH_AUTH_SOCK,
+        # etc.) into every subprocess, enabling credential exfiltration via
+        # commands like: python3 -c "import os; print(os.environ['API_KEY'])"
+        safe_env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": os.environ.get("HOME", "/tmp"),
+            "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+            "TERM": "xterm",
+            # XDG_RUNTIME_DIR is needed by some tools (e.g. pip, dbus)
+            "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", ""),
+        }
+        # Config env_vars are developer-reviewed, safe to pass through
+        safe_env.update(self.config.env_vars)
         if env:
-            effective_env.update(env)
+            safe_env.update(env)
+        effective_env = safe_env
 
         # === Parse command into argv list (shell=False) ===
         # v2.5.0: Use shlex.split() instead of shell=True to prevent

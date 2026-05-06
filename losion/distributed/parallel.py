@@ -1096,7 +1096,23 @@ class LosionDistributedTrainer:
                 trusted_dirs.add(os.path.abspath(checkpoint_dir))
 
             # Validate origin: the file must be in a trusted directory
-            is_trusted = any(abs_path.startswith(td) for td in trusted_dirs) if trusted_dirs else True
+            # v2.5.4: If no trusted directories are configured, we MUST reject
+            # rather than default to True — otherwise loading /tmp/malicious.pt
+            # would bypass the entire I-02 trusted-path safeguard.
+            if not trusted_dirs:
+                raise SecurityError(
+                    f"Cannot load '{path}' with weights_only=False: no trusted "
+                    f"directories configured. Set self._save_dir or "
+                    f"self.checkpoint_dir before loading checkpoints that "
+                    f"require pickle deserialization."
+                )
+
+            # Use os.path commonpath check to avoid prefix-collision attacks
+            # (e.g. /tmp/out matching /tmp/outputs_evil via startswith)
+            is_trusted = any(
+                os.path.commonpath([abs_path, td]) == td
+                for td in trusted_dirs
+            )
 
             if not is_trusted:
                 raise SecurityError(

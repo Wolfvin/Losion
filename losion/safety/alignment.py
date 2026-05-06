@@ -354,6 +354,15 @@ class SafetyClassifier(nn.Module):
         self.binary_threshold = 0.5
         self.category_threshold = 0.5
 
+        # v2.5.4: Attention pooling weight declared in __init__ (not lazily
+        # in forward()) so that it is:
+        #   1. Included in self.parameters() and thus the optimizer
+        #   2. Saved in state_dict() / loaded by load_state_dict()
+        #   3. Moved to GPU by .to(device)
+        # Previously created via hasattr() check in forward(), which meant it
+        # was invisible to the optimizer and serialization.
+        self._attn_pool_weight = nn.Parameter(torch.zeros(d_model))
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -393,11 +402,8 @@ class SafetyClassifier(nn.Module):
                 # harmful content may appear at any position.
                 pooled = hidden_states.mean(dim=1)  # (batch, d_model)
             elif pooling == "attention":
-                # Learnable attention-weighted pooling
-                if not hasattr(self, '_attn_pool_weight'):
-                    self._attn_pool_weight = nn.Parameter(
-                        torch.zeros(hidden_states.size(-1))
-                    )
+                # v2.5.4: _attn_pool_weight is now declared in __init__()
+                # so it is properly registered as a parameter.
                 scores = torch.matmul(
                     hidden_states, self._attn_pool_weight
                 )  # (batch, seq_len)
@@ -598,15 +604,22 @@ class ConstitutionalTrainer:
                 #   3. model.generate() with critique prompts for revisions
                 #   4. trainer.compute_dpo_loss() with actual log-probs
                 #
+                # v2.5.4: Raise RuntimeError instead of silently returning
+                # loss=0.0 with stub_mode=True. Returning loss=0.0 could
+                # mislead monitoring systems into thinking training was
+                # progressing normally. Fail-fast forces the caller to either
+                # integrate proper model generation or explicitly acknowledge
+                # the stub by catching the error.
                 if len(all_losses) == 0:
-                    logger.warning(
-                        "ConstitutionalTrainer.train_step() is a partial stub — "
-                        "no actual DPO training occurs. The compute_dpo_loss() "
-                        "method IS functional, but train_step() lacks model "
-                        "generation integration. See docstring for manual usage."
+                    raise RuntimeError(
+                        "ConstitutionalTrainer.train_step() cannot produce "
+                        "training signal: the method is a partial stub that "
+                        "lacks model generation integration. To train with "
+                        "constitutional AI, use compute_dpo_loss() directly "
+                        "with model-generated preference pairs, or implement "
+                        "a custom train_step that calls model.generate(). "
+                        "See the class docstring for the 4-step manual workflow."
                     )
-                    # Do NOT append a dummy zero loss — that creates false
-                    # confidence that training is happening when it is not.
 
         # Compute total loss
         if all_losses:
@@ -627,7 +640,7 @@ class ConstitutionalTrainer:
             "n_pairs": n_pairs,
             "n_violations": n_violations,
             "n_prompts": len(prompts),
-            "stub_mode": len(all_losses) == 0 and n_violations > 0,
+            "stub_mode": False,  # v2.5.4: Always False — stub mode now raises RuntimeError
         }
 
     def generate_revision(
