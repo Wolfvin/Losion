@@ -363,10 +363,16 @@ class SimplifiedMoE(nn.Module):
         output = output_flat.view(batch, seq_len, self.d_model)
 
         # Aux info
+        # Convention note: softmax is applied ONLY to top-k logits (not all-E
+        # logits then top-k). This means expert_weights sum to 1 within the
+        # top-k set but do NOT reflect probability relative to the full expert
+        # pool. If downstream code (e.g., load balancing loss) needs the full
+        # distribution, use router_logits instead. The field is named
+        # normalized_topk_weights (not expert_weights) to make this explicit.
         aux = {
             "router_logits": router_logits.view(batch, seq_len, self.num_experts),
             "expert_indices": indices.view(batch, seq_len, self.top_k_routing),
-            "expert_weights": weights.view(batch, seq_len, self.top_k_routing),
+            "normalized_topk_weights": weights.view(batch, seq_len, self.top_k_routing),
         }
 
         return output, aux
@@ -621,15 +627,19 @@ class LosionLayer(nn.Module):
 
         # ---- Determine which pathways to compute ----
         # During training, always compute all 3 pathways (gradient flows to all).
-        # During inference with inference_sparse=True, skip pathways with
-        # mean weight below threshold to save compute.
-        w_ssm_mean = route_weights[:, :, 0].mean().item()
-        w_attn_mean = route_weights[:, :, 1].mean().item()
-        w_ret_mean = route_weights[:, :, 2].mean().item()
+        # During inference with inference_sparse=True, skip pathways only if
+        # ALL tokens in the batch have weight below threshold. We use max()
+        # instead of mean() because mean can be misleading: if 5% of tokens
+        # have w_ssm=0.8 but 95% have w_ssm≈0, mean≈0.04 < threshold but
+        # those 5% tokens still NEED the SSM pathway. Using max ensures we
+        # never silently skip a pathway that any token depends on.
+        w_ssm_max = route_weights[:, :, 0].max().item()
+        w_attn_max = route_weights[:, :, 1].max().item()
+        w_ret_max = route_weights[:, :, 2].max().item()
 
-        compute_ssm = not (inference_sparse and not self.training and w_ssm_mean < sparse_threshold)
-        compute_attn = not (inference_sparse and not self.training and w_attn_mean < sparse_threshold)
-        compute_ret = not (inference_sparse and not self.training and w_ret_mean < sparse_threshold)
+        compute_ssm = not (inference_sparse and not self.training and w_ssm_max < sparse_threshold)
+        compute_attn = not (inference_sparse and not self.training and w_attn_max < sparse_threshold)
+        compute_ret = not (inference_sparse and not self.training and w_ret_max < sparse_threshold)
 
         # ---- Jalur 1: SSM ----
         if compute_ssm:
@@ -731,10 +741,21 @@ class LosionModel(nn.Module):
         - Linear layers: normal(0, 0.02 / sqrt(2 * n_layers))
           The sqrt(2 * n_layers) scaling prevents hidden state explosion
           in deep residual networks (GPT-2 paper Section 2.3).
+        - Conv1d: normal(0, 0.02 / sqrt(2 * n_layers))
+          Consistent with Linear init (not PyTorch default kaiming).
         - Biases: zeros
         """
         if isinstance(module, nn.Linear):
             # Scaled init for residual stream stability
+            std = 0.02 / math.sqrt(2 * self.n_layers)
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Conv1d):
+            # Same scaled init as Linear — Conv1d is used in SimplifiedSSM
+            # for causal convolution, and should follow the same residual
+            # stream scaling as the rest of the model, not PyTorch's default
+            # kaiming_uniform_.
             std = 0.02 / math.sqrt(2 * self.n_layers)
             nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
@@ -765,6 +786,8 @@ class LosionModel(nn.Module):
         thinking_mode: Optional[bool] = None,
         return_routing_info: bool = False,
         return_all_hidden_states: bool = False,
+        inference_sparse: bool = False,
+        sparse_threshold: float = 0.05,
     ) -> LosionLayerOutput:
         """Forward pass through the Losion backbone.
 
@@ -774,6 +797,12 @@ class LosionModel(nn.Module):
             thinking_mode: If True, bias towards thinking pathways.
             return_routing_info: If True, return routing info per layer.
             return_all_hidden_states: If True, return all intermediate hidden states.
+            inference_sparse: If True, skip computation for pathways whose
+                routing weight is below ``sparse_threshold`` during inference.
+                Only effective when not training. Can reduce compute by up
+                to 3x when a pathway is completely deactivated.
+            sparse_threshold: Minimum routing weight to compute a pathway.
+                Default 0.05 (5%). Only used when inference_sparse=True.
 
         Returns:
             LosionLayerOutput with hidden_states and optional routing/states info.
@@ -845,6 +874,8 @@ class LosionModel(nn.Module):
                     x,
                     attention_mask=attention_mask,
                     thinking_mode=thinking_mode,
+                    inference_sparse=inference_sparse,
+                    sparse_threshold=sparse_threshold,
                 )
 
             if all_routing_info is not None:

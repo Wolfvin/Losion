@@ -600,7 +600,27 @@ class CodeVerifier(RewardVerifier):
         code: str,
         test_inputs: Optional[List[Any]] = None,
     ) -> Tuple[Optional[str], Optional[str], bool]:
-        """Execute code in a sandboxed environment.
+        """Execute code in a subprocess sandboxed environment.
+
+        v2.4.0: Replaced the previous regex-based static analysis + in-process
+        ``exec()`` sandbox with subprocess isolation. The regex approach was
+        fundamentally flawed — it operates on source code as a string, but
+        Python can construct attribute names dynamically via string concatenation
+        (``getattr(x, '__cla' + 'ss__')``), variables (``attr = '__class__';
+        getattr(x, attr)``), or ``chr()`` encoding (``getattr(x, chr(95)*2 +
+        'class' + chr(95)*2)``). All three bypasses were verified against the
+        previous implementation.
+
+        The new approach runs code in a **separate subprocess** with:
+        - CPU time limit (``resource.RLIMIT_CPU``) via ``preexec_fn``
+        - Memory limit (``resource.RLIMIT_AS``) to prevent OOM attacks
+        - No file descriptor inheritance beyond stdin/stdout/stderr
+        - Timeout enforced by both ``subprocess.run(timeout=)`` and ``ulimit``
+        - Restricted builtins still applied as a defense-in-depth layer
+
+        For production deployments, Docker/gVisor isolation is still
+        recommended for defense against kernel exploits and sophisticated
+        attacks. See SECURITY.md for the full threat model.
 
         Args:
             code: Python code string to execute.
@@ -613,51 +633,23 @@ class CodeVerifier(RewardVerifier):
             - ``error_message``: Error traceback (or None on success).
             - ``success``: Whether execution completed without error.
         """
-        import io
-        import signal
-        from contextlib import redirect_stdout
+        import json
+        import subprocess
+        import sys
 
-        # Build restricted globals
-        safe_builtins = {
-            name: __builtins__[name] if isinstance(__builtins__, dict) else getattr(__builtins__, name)
-            for name in self.allowed_builtins
-            if (name in __builtins__ if isinstance(__builtins__, dict) else hasattr(__builtins__, name))
-        }
-        safe_globals = {"__builtins__": safe_builtins}
-
-        # Add test inputs to the namespace
-        local_vars: Dict[str, Any] = {}
-        if test_inputs is not None:
-            local_vars["test_input"] = test_inputs
-
-        stdout_capture = io.StringIO()
-
-        # Compile the code first — this catches syntax errors before exec
-        try:
-            compiled = compile(code, "<rlvr_sandbox>", "exec")
-        except SyntaxError:
-            error_msg = traceback.format_exc()
-            return None, error_msg, False
-
-        # Check for dangerous attribute access patterns in the compiled bytecode.
-        # This is NOT a full sandbox (as the comment above acknowledges) but
-        # blocks the most common escape routes: __class__.__mro__,
-        # __subclasses__(), __globals__, etc.
-        # For production: use subprocess with ulimit/seccomp or Docker.
-        code_text = code
+        # --- Defense in depth: still block obvious dunder attrs ---
+        # This catches casual misuse (not malicious bypass). The real
+        # security boundary is the subprocess isolation below.
         for attr in self._BLOCKED_ATTRS:
-            if attr in code_text:
-                # Allow some safe uses (e.g., isinstance uses __class__
-                # internally but isn't an escape). Block direct attribute access.
+            if attr in code:
                 import re
-                # Match patterns like obj.__class__, obj["__class__"], getattr(obj, "__class__")
                 patterns = [
-                    rf"""\.\s*{re.escape(attr)}\b""",  # obj.__class__
-                    rf"""\[\s*['\"]\s*{re.escape(attr)}\s*['\"]\s*\]""",  # obj["__class__"]
-                    rf"""getattr\s*\([^,]+,\s*['\"]\s*{re.escape(attr)}\s*['\"]""",  # getattr(obj, "__class__")
+                    rf"""\.\s*{re.escape(attr)}\b""",
+                    rf"""\[\s*['\"]\s*{re.escape(attr)}\s*['\"]\s*\]""",
+                    rf"""getattr\s*\([^,]+,\s*['\"]\s*{re.escape(attr)}\s*['\"]""",
                 ]
                 for pattern in patterns:
-                    if re.search(pattern, code_text):
+                    if re.search(pattern, code):
                         error_msg = (
                             f"Sandbox violation: access to '{attr}' is blocked. "
                             f"This is a security restriction to prevent sandbox escape "
@@ -665,14 +657,105 @@ class CodeVerifier(RewardVerifier):
                         )
                         return None, error_msg, False
 
+        # --- Subprocess sandbox ---
+        # Build a wrapper script that:
+        # 1. Restricts builtins (defense in depth)
+        # 2. Runs the user code
+        # 3. Returns results as JSON on stdout
+        allowed_builtins_json = json.dumps(sorted(self.allowed_builtins))
+        test_inputs_json = json.dumps(test_inputs)
+
+        sandbox_script = f'''
+import sys
+import json
+import io
+from contextlib import redirect_stdout
+
+# Restricted builtins (defense in depth — real isolation is the subprocess)
+_allowed = set({allowed_builtins_json})
+_safe_builtins = {{}}
+_b = __builtins__
+if isinstance(_b, dict):
+    for _name in _allowed:
+        if _name in _b:
+            _safe_builtins[_name] = _b[_name]
+else:
+    for _name in _allowed:
+        if hasattr(_b, _name):
+            _safe_builtins[_name] = getattr(_b, _name)
+__builtins__ = _safe_builtins
+
+_test_inputs = {test_inputs_json}
+
+_stdout = io.StringIO()
+_local_vars = {{"test_input": _test_inputs}}
+_success = False
+_output = None
+_error = None
+
+try:
+    _compiled = compile({repr(code)}, "<rlvr_sandbox>", "exec")
+    with redirect_stdout(_stdout):
+        exec(_compiled, {{"__builtins__": _safe_builtins}}, _local_vars)
+    _output = _stdout.getvalue()[:{self.max_output_length}]
+    _success = True
+except Exception:
+    import traceback
+    _error = traceback.format_exc()
+
+_result = {{"success": _success, "output": _output, "error": _error}}
+sys.stdout.write(json.dumps(_result))
+'''
+
+        def _set_resource_limits():
+            """Set resource limits in the child process."""
+            try:
+                import resource
+                # CPU time limit (seconds) — kills process if exceeded
+                resource.setrlimit(resource.RLIMIT_CPU, (
+                    self.timeout_seconds,
+                    self.timeout_seconds + 1
+                ))
+                # Memory limit (bytes) — 256MB max
+                mem_limit = 256 * 1024 * 1024
+                resource.setrlimit(resource.RLIMIT_AS, (mem_limit, mem_limit))
+                # No core dumps
+                resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            except (ImportError, ValueError, OSError):
+                pass  # resource module not available on all platforms
+
         try:
-            with redirect_stdout(stdout_capture):
-                exec(compiled, safe_globals, local_vars)  # noqa: S102
-            output = stdout_capture.getvalue()[: self.max_output_length]
-            return output, None, True
-        except Exception:
-            error_msg = traceback.format_exc()
-            return None, error_msg, False
+            result = subprocess.run(
+                [sys.executable, "-c", sandbox_script],
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds + 2,  # Extra margin beyond ulimit
+                preexec_fn=_set_resource_limits,
+                # Security: close file descriptors beyond stdin/stdout/stderr
+                close_fds=True,
+            )
+        except subprocess.TimeoutExpired:
+            return None, f"Execution timed out after {self.timeout_seconds}s", False
+        except OSError as e:
+            return None, f"Failed to start sandbox process: {e}", False
+
+        if result.returncode != 0:
+            # Process was killed (signal) or had a fatal error
+            stderr = result.stderr.strip()
+            if "resource.RLIMIT_CPU" in stderr or "CPU time limit" in stderr:
+                return None, f"Execution timed out after {self.timeout_seconds}s", False
+            return None, f"Process error (exit code {result.returncode}): {stderr}", False
+
+        # Parse JSON result from subprocess
+        try:
+            parsed = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return None, f"Failed to parse sandbox output: {result.stdout[:500]}", False
+
+        if parsed.get("success"):
+            return parsed.get("output"), None, True
+        else:
+            return None, parsed.get("error", "Unknown error"), False
 
     def verify(
         self,

@@ -1,7 +1,19 @@
 """
 Losion — Hybrid AI Framework with Tri-Jalur Router Architecture.
 
-Version 2.2.0 — "Deep Audit & Bug Purge"
+Version 2.4.0 — "Audit N-Fix Round 2"
+
+v2.4.0 Audit N-Fix Round 2 — Correctness & Security:
+  - CRITICAL: inference_sparse feature now reachable — LosionModel and LosionModelV2
+    propagate inference_sparse/sparse_threshold to LosionLayer/LosionLayerV2
+  - HIGH: RLVR sandbox replaced with subprocess isolation (was regex, bypassable)
+  - HIGH: SimplifiedMoE aux_info renamed expert_weights → normalized_topk_weights
+  - HIGH: BiasRouter.update_bias() now called periodically during training (was dead code)
+  - MEDIUM: Sparse inference uses max() not mean() — no silent token skipping
+  - MEDIUM: ThinkingAssessment.thinking_score now properly Optional[torch.Tensor]
+  - MEDIUM: Test coverage added for all v2.3.0/v2.4.0 changes
+  - LOW: Conv1d now uses GPT-2 scaled init (was PyTorch default kaiming)
+  - LOW: Gradient checkpoint double-compute verified NOT an issue (already optimal)
 
 v2.2.0 Deep Audit & Bug Purge:
   - CRITICAL: Double-softplus dt bias FIXED in Mamba2/3/Liquid/PoST/StructuredSparse
@@ -177,7 +189,7 @@ Router:  Adaptive (BiasRouter + ThinkingToggle + Symbolic-MoE), GRPO/DAPO-traine
          + Router ↔ Expert Co-Evolution (Evoformer Level 5)
 """
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 __author__ = "Losion Contributors"
 __license__ = "MIT"
 

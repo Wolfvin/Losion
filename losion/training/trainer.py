@@ -90,6 +90,10 @@ class TrainerConfig:
         resume_from_checkpoint: Path ke checkpoint untuk resume
         use_fsdp: Aktifkan FSDP (Fully Sharded Data Parallel)
         use_ddp: Aktifkan DDP (Distributed Data Parallel)
+        bias_update_interval: Interval update bias router (dalam langkah).
+            BiasRouter.update_bias() dipanggil setiap N langkah untuk
+            menyeimbangkan distribusi token ke setiap jalur (DeepSeek-V3
+            style aux-loss-free load balancing). Default 1000 langkah.
     """
 
     output_dir: str = "./checkpoints"
@@ -114,6 +118,7 @@ class TrainerConfig:
     resume_from_checkpoint: Optional[str] = None
     use_fsdp: bool = False
     use_ddp: bool = False
+    bias_update_interval: int = 1000
 
 
 # ============================================================================
@@ -368,6 +373,14 @@ class LosionTrainer:
                     optimizer.zero_grad()
 
                     self.global_step += 1
+
+                    # ---- Update BiasRouter bias for load balancing ----
+                    # v2.4.0: BiasRouter.update_bias() adjusts routing bias
+                    # based on running load statistics, implementing DeepSeek-V3
+                    # style aux-loss-free load balancing. Without this call, the
+                    # bias stays at zeros and load balancing is inactive (N-04).
+                    if self.global_step % self.trainer_config.bias_update_interval == 0:
+                        self._update_router_bias()
 
                     # ---- Logging ----
                     epoch_loss += loss.item() * self.trainer_config.gradient_accumulation_steps
@@ -712,6 +725,54 @@ class LosionTrainer:
         if not self.is_distributed:
             return True
         return self.local_rank == 0
+
+    def _update_router_bias(self) -> None:
+        """Update BiasRouter bias for aux-loss-free load balancing.
+
+        v2.4.0: Calls BiasRouter.update_bias() on every layer's router
+        that uses an AdaptiveRouter with a BiasRouter component. This
+        implements the DeepSeek-V3 style bias-based load balancing —
+        pathways that receive too many tokens get negative bias (reducing
+        their routing probability), while under-utilized pathways get
+        positive bias. Without this call, the bias stays at zeros and
+        load balancing is completely inactive.
+
+        Only runs on the main process to avoid conflicting updates across
+        distributed workers.
+        """
+        if not self._is_main_process():
+            return
+
+        try:
+            from losion.core.router.router import AdaptiveRouter
+            model = self.model
+            # Handle DDP/FSDP wrapped models
+            if hasattr(model, 'module'):
+                model = model.module
+
+            if not hasattr(model, 'model') or not hasattr(model.model, 'layers'):
+                return
+
+            n_updated = 0
+            for layer in model.model.layers:
+                router = getattr(layer, 'router', None)
+                if router is None:
+                    continue
+                if isinstance(router, AdaptiveRouter):
+                    router.update_bias()
+                    n_updated += 1
+                elif hasattr(router, 'update_bias'):
+                    # Direct BiasRouter (V1 model uses nn.Linear, but just in case)
+                    router.update_bias()
+                    n_updated += 1
+
+            if n_updated > 0 and self.global_step % (self.trainer_config.logging_steps * 10) == 0:
+                logger.info(
+                    f"BiasRouter update_bias() called on {n_updated} layers "
+                    f"at step {self.global_step}"
+                )
+        except ImportError:
+            pass  # AdaptiveRouter not available — skip silently
 
     def _log(self, log_dict: Dict[str, Any]) -> None:
         """

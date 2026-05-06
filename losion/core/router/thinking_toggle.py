@@ -49,7 +49,7 @@ class ThinkingAssessment:
     dominant_task: TaskType
     depth_multiplier: torch.Tensor  # [batch] — differentiable! Berapa kali lipat depth untuk Jalur 2+3
     confidence: torch.Tensor  # [batch] — differentiable! Confidence dalam assessment
-    thinking_score: torch.Tensor = None  # [batch] — differentiable thinking score dari context_integrator
+    thinking_score: Optional[torch.Tensor] = None  # [batch] — differentiable thinking score dari context_integrator
 
 
 class ThinkingToggle(nn.Module):

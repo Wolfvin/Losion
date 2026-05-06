@@ -519,6 +519,8 @@ class LosionLayerV2(nn.Module):
         past_kv: Optional[Any] = None,
         position_ids: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
+        inference_sparse: bool = False,
+        sparse_threshold: float = 0.05,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Forward pass through the Tri-Jalur layer.
 
@@ -559,42 +561,70 @@ class LosionLayerV2(nn.Module):
             route_weights = route_weights.unsqueeze(1).expand(-1, seq_len, -1)
 
         # ===================================================================
+        # Inference sparse execution (v2.4.0)
+        # During inference, skip pathways where ALL tokens have routing
+        # weight below threshold. Uses max() (not mean) to avoid silently
+        # skipping a pathway that any token depends on. During training,
+        # all pathways are always computed for gradient flow.
+        # ===================================================================
+        compute_ssm = True
+        compute_attn = True
+        compute_ret = True
+        if inference_sparse and not self.training:
+            w_ssm_max = route_weights[:, :, 0].max().item()
+            w_attn_max = route_weights[:, :, 1].max().item()
+            w_ret_max = route_weights[:, :, 2].max().item()
+            compute_ssm = w_ssm_max >= sparse_threshold
+            compute_attn = w_attn_max >= sparse_threshold
+            compute_ret = w_ret_max >= sparse_threshold
+
+        # ===================================================================
         # Jalur 1: SSM — Unified interface adapter
         # v0.9.1: Handles `initial_state` vs `state` kwarg mismatch,
         # and 3-tuple (output, state, aux_loss) vs 2-tuple (output, state)
         # ===================================================================
-        ssm_input = self.ssm_norm(x)
-        ssm_out, ssm_state_new, ssm_aux_loss = self._forward_ssm(
-            ssm_input, ssm_state
-        )
+        if compute_ssm:
+            ssm_input = self.ssm_norm(x)
+            ssm_out, ssm_state_new, ssm_aux_loss = self._forward_ssm(
+                ssm_input, ssm_state
+            )
+            ssm_out = self._align_dim(ssm_out, 'ssm_proj')
+        else:
+            ssm_out = torch.zeros(batch, seq_len, self.d_model, device=x.device, dtype=x.dtype)
+            ssm_state_new = ssm_state
+            ssm_aux_loss = None
 
         # ===================================================================
         # Jalur 2: Attention — Unified interface adapter
         # v0.9.1: Handles `position_offset` vs `position_ids`, and
         # `past_key_value` vs `past_kv` kwarg mismatches
         # ===================================================================
-        attn_input = self.attn_norm(x)
-        attn_out = self._forward_attention(
-            attn_input, attention_mask, past_kv, position_ids
-        )
+        if compute_attn:
+            attn_input = self.attn_norm(x)
+            attn_out = self._forward_attention(
+                attn_input, attention_mask, past_kv, position_ids
+            )
+            attn_out = self._align_dim(attn_out, 'attn_proj')
+        else:
+            attn_out = torch.zeros(batch, seq_len, self.d_model, device=x.device, dtype=x.dtype)
 
         # ===================================================================
         # Jalur 3: MoE/Retrieval — Unified interface adapter
         # v0.9.1: Handles 3-tuple returns (output, routing_info/aux_loss, extra)
         # and normalizes to (output, aux_info) for consistent downstream use
         # ===================================================================
-        ret_input = self.retrieval_norm(x)
-        ret_out, ret_aux = self._forward_moe(ret_input, targets=labels)
+        if compute_ret:
+            ret_input = self.retrieval_norm(x)
+            ret_out, ret_aux = self._forward_moe(ret_input, targets=labels)
+            ret_out = self._align_dim(ret_out, 'ret_proj')
+        else:
+            ret_out = torch.zeros(batch, seq_len, self.d_model, device=x.device, dtype=x.dtype)
+            ret_aux = None
 
         # Combine with routing weights
         w_ssm = route_weights[:, :, 0:1]
         w_attn = route_weights[:, :, 1:2]
         w_ret = route_weights[:, :, 2:3]
-
-        # Handle dimension mismatch via learned projection
-        ssm_out = self._align_dim(ssm_out, 'ssm_proj')
-        attn_out = self._align_dim(attn_out, 'attn_proj')
-        ret_out = self._align_dim(ret_out, 'ret_proj')
 
         combined = w_ssm * ssm_out + w_attn * attn_out + w_ret * ret_out
 
@@ -1091,8 +1121,31 @@ class LosionModelV2(nn.Module):
 
     @staticmethod
     def _init_weights(module: nn.Module) -> None:
+        """LLM-standard weight initialization.
+
+        v2.4.0: Updated from Kaiming to GPT-2/NeoX style init.
+        - Linear: normal(0, 0.02 / sqrt(2 * n_layers)) — residual stream scaling
+        - Conv1d: same as Linear — consistent with SSM causal conv
+        - Embedding: normal(0, 0.02)
+        - Biases: zeros
+
+        Note: This is a static method and cannot access self.n_layers.
+        We use a fixed depth scaling factor. For very deep models (>50 layers),
+        consider re-initializing with the actual n_layers value.
+        """
         if isinstance(module, nn.Linear):
-            nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="linear")
+            # Scaled init for residual stream stability
+            # Default scaling assumes ~12 layers; for deeper models,
+            # re-apply with the correct n_layers via model.apply()
+            n_layers = 12  # Conservative default
+            std = 0.02 / math.sqrt(2 * n_layers)
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Conv1d):
+            n_layers = 12
+            std = 0.02 / math.sqrt(2 * n_layers)
+            nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -1115,10 +1168,13 @@ class LosionModelV2(nn.Module):
         return_routing_info: bool = False,
         return_all_hidden_states: bool = False,
         labels: Optional[torch.Tensor] = None,
+        inference_sparse: bool = False,
+        sparse_threshold: float = 0.05,
     ) -> Dict[str, Any]:
         """Forward pass through the Losion V2 backbone.
 
         v1.6.1: Added labels parameter for MTP loss computation in MoE layers.
+        v2.4.0: Added inference_sparse and sparse_threshold parameters.
         """
         batch, seq_len = input_ids.shape
 
@@ -1502,6 +1558,8 @@ class LosionForCausalLMV2(nn.Module):
         labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         thinking_mode: Optional[bool] = None,
+        inference_sparse: bool = False,
+        sparse_threshold: float = 0.05,
     ) -> Dict[str, Any]:
         """Forward pass with optional loss computation.
 
@@ -1510,6 +1568,10 @@ class LosionForCausalLMV2(nn.Module):
             labels: Optional target token IDs for loss (batch, seq_len).
             attention_mask: Optional attention mask.
             thinking_mode: If True, bias towards thinking pathways.
+            inference_sparse: If True, skip pathways with low routing weight
+                during inference (saves compute, training always computes all).
+            sparse_threshold: Minimum routing weight to compute a pathway.
+                Default 0.05 (5%). Only used when inference_sparse=True.
 
         Returns:
             Dict with logits, loss, and optional aux info.
@@ -1520,6 +1582,8 @@ class LosionForCausalLMV2(nn.Module):
             thinking_mode=thinking_mode,
             return_routing_info=True,
             labels=labels,  # v1.6.1: Forward labels to MoE layers for MTP loss
+            inference_sparse=inference_sparse,
+            sparse_threshold=sparse_threshold,
         )
         hidden_states = outputs["hidden_states"]
 
