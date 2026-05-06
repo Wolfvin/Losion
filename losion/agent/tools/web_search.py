@@ -21,6 +21,9 @@ Design:
 from __future__ import annotations
 
 import logging
+import threading
+import time as _time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -67,6 +70,10 @@ class SearchConfig:
         timeout: Timeout for search requests in seconds.
         cache_results: Whether to cache search results.
         cache_ttl: Cache time-to-live in seconds.
+        max_cache_entries: Maximum number of cached queries (LRU eviction).
+        allow_mock_fallback: Whether to fall back to mock results on backend failure.
+            In production, set to False to prevent fabricated data from being
+            treated as real evidence.
         language: Preferred search language.
         safe_search: Whether to enable safe search filtering.
     """
@@ -76,6 +83,8 @@ class SearchConfig:
     timeout: float = 30.0
     cache_results: bool = True
     cache_ttl: float = 3600.0  # 1 hour
+    max_cache_entries: int = 1000  # LRU cap
+    allow_mock_fallback: bool = False  # Fail-closed by default
     language: str = "en"
     safe_search: bool = True
 
@@ -105,7 +114,8 @@ class WebSearchInterface:
     ) -> None:
         self.config = config or SearchConfig()
         self._custom_handler = custom_handler
-        self._cache: Dict[str, tuple] = {}  # query → (results, timestamp)
+        self._cache: OrderedDict[str, tuple] = OrderedDict()  # query → (results, timestamp)
+        self._cache_lock = threading.Lock()
         self._search_count = 0
 
     def search(
@@ -207,11 +217,25 @@ class WebSearchInterface:
             return results
 
         except ImportError:
-            logger.warning("z-ai-web-dev-sdk not available, falling back to mock search")
-            return self._search_mock(query, num_results)
+            if self.config.allow_mock_fallback:
+                logger.warning("z-ai-web-dev-sdk not available, falling back to mock search")
+                return self._search_mock(query, num_results)
+            else:
+                logger.error("z-ai-web-dev-sdk not available and mock fallback is disabled")
+                raise RuntimeError(
+                    "Web search backend unavailable and mock fallback is disabled. "
+                    "Set allow_mock_fallback=True for development."
+                )
         except Exception as e:
-            logger.warning(f"z-ai search failed: {e}, falling back to mock")
-            return self._search_mock(query, num_results)
+            if self.config.allow_mock_fallback:
+                logger.warning(f"z-ai search failed: {e}, falling back to mock")
+                return self._search_mock(query, num_results)
+            else:
+                logger.error(f"z-ai search failed: {e}, mock fallback disabled")
+                raise RuntimeError(
+                    f"Web search failed: {e}. Mock fallback is disabled — "
+                    f"set allow_mock_fallback=True for development."
+                ) from e
 
     def _search_mock(
         self,
@@ -234,6 +258,7 @@ class WebSearchInterface:
                 source="example.com",
                 rank=i + 1,
                 relevance_score=max(0.8 - i * 0.15, 0.1),
+                metadata={"synthetic": True},
             ))
         return results
 
@@ -290,28 +315,53 @@ class WebSearchInterface:
 
     def _check_cache(self, query: str) -> Optional[List[SearchResult]]:
         """Check the cache for previous search results."""
-        if query in self._cache:
-            results, timestamp = self._cache[query]
-            age = __import__("time").time() - timestamp
-            if age < self.config.cache_ttl:
-                return results
-            else:
-                del self._cache[query]
+        with self._cache_lock:
+            if query in self._cache:
+                results, timestamp = self._cache[query]
+                age = _time.time() - timestamp
+                if age < self.config.cache_ttl:
+                    # Move to end (most recently used)
+                    self._cache.move_to_end(query)
+                    return results
+                else:
+                    del self._cache[query]
         return None
 
     def _cache_results(self, query: str, results: List[SearchResult]) -> None:
-        """Cache search results."""
-        import time as _time
-        self._cache[query] = (results, _time.time())
+        """Cache search results with LRU eviction.
+
+        If the cache exceeds max_cache_entries, the least-recently-used
+        entry is evicted. Expired entries are also pruned on write.
+        """
+        with self._cache_lock:
+            # Evict expired entries on write
+            now = _time.time()
+            expired = [
+                q for q, (_, ts) in self._cache.items()
+                if now - ts >= self.config.cache_ttl
+            ]
+            for q in expired:
+                del self._cache[q]
+
+            # Insert / update
+            self._cache[query] = (results, now)
+            self._cache.move_to_end(query)
+
+            # LRU eviction if over capacity
+            while len(self._cache) > self.config.max_cache_entries:
+                self._cache.popitem(last=False)  # Remove oldest (LRU)
 
     def clear_cache(self) -> None:
         """Clear the search result cache."""
-        self._cache.clear()
+        with self._cache_lock:
+            self._cache.clear()
 
     def get_stats(self) -> Dict[str, Any]:
         """Get search statistics."""
+        with self._cache_lock:
+            cache_size = len(self._cache)
         return {
             "total_searches": self._search_count,
-            "cache_size": len(self._cache),
+            "cache_size": cache_size,
             "backend": self.config.backend,
         }

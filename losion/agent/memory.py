@@ -469,7 +469,12 @@ class EpisodicMemory:
                 del self._domain_index[episode.domain]
 
     def _load(self) -> None:
-        """Load episodes from persistent storage."""
+        """Load episodes from persistent storage.
+
+        On corruption, preserves the broken file for forensic analysis
+        (renamed to .corrupt.<timestamp>) and skips bad entries individually
+        instead of nuking the full store. Errors are surfaced via logging.
+        """
         episodes_dir = self.store_dir / "episodes"
         if not episodes_dir.exists():
             return
@@ -479,9 +484,29 @@ class EpisodicMemory:
             try:
                 with open(index_path, "r", encoding="utf-8") as f:
                     index = json.load(f)
-                for episode_id in index.get("episode_ids", []):
-                    ep_path = episodes_dir / f"{episode_id}.json"
-                    if ep_path.exists():
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                # Corrupt index — preserve broken file, log, reset
+                logger.error(
+                    f"EpisodicMemory: corrupt index at {index_path}: {exc!r}. "
+                    f"Renaming to .corrupt.<ts> and resetting in-memory store."
+                )
+                try:
+                    corrupt_name = f"index.json.corrupt.{int(time.time())}"
+                    index_path.rename(index_path.parent / corrupt_name)
+                except OSError:
+                    pass
+                self._episodes = {}
+                self._query_index = {}
+                self._domain_index = {}
+                return
+
+            # Load each episode individually — skip bad entries instead of
+            # nuking the entire store on a single bad file.
+            episode_ids = index.get("episode_ids", [])
+            for episode_id in episode_ids:
+                ep_path = episodes_dir / f"{episode_id}.json"
+                if ep_path.exists():
+                    try:
                         with open(ep_path, "r", encoding="utf-8") as f:
                             episode = Episode.from_dict(json.load(f))
                         self._episodes[episode_id] = episode
@@ -494,10 +519,13 @@ class EpisodicMemory:
                             if episode.domain not in self._domain_index:
                                 self._domain_index[episode.domain] = set()
                             self._domain_index[episode.domain].add(episode_id)
-            except (json.JSONDecodeError, KeyError, TypeError):
-                self._episodes = {}
-                self._query_index = {}
-                self._domain_index = {}
+                    except (json.JSONDecodeError, KeyError, TypeError) as ep_exc:
+                        # Skip this bad entry but continue loading others
+                        logger.error(
+                            f"EpisodicMemory: skipping corrupt episode "
+                            f"{episode_id} at {ep_path}: {ep_exc!r}"
+                        )
+                        continue
 
     def _save(self) -> None:
         """Save episodes to persistent storage."""

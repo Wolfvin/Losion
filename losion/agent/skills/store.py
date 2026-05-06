@@ -27,6 +27,9 @@ import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -207,11 +210,18 @@ class SkillEntry:
 
         raise RuntimeError(f"Skill {self.name} failed after 3 attempts")
 
+    # Recognized postcondition tokens — unknown tokens must NOT silently pass.
+    _KNOWN_POSTCONDITIONS = frozenset({
+        "result_is_valid_json",
+        "result_is_non_empty",
+    })
+
     def _verify_postconditions(self, result: Any) -> bool:
         """Verify that the result meets postconditions.
 
-        Simple heuristic check: if postconditions are specified,
-        verify that the result satisfies them.
+        Recognized conditions are evaluated explicitly.
+        Unknown condition tokens are treated as a verification failure
+        (fail-closed) and logged, preventing silent policy bypass.
         """
         if not self.postconditions:
             return True  # No postconditions = always pass
@@ -227,12 +237,25 @@ class SkillEntry:
             elif condition == "result_is_non_empty":
                 if not result or not str(result).strip():
                     return False
-            elif condition.lower() in result_str:
-                continue  # Condition found in result
+            elif condition in self._KNOWN_POSTCONDITIONS:
+                # Future-known conditions handled here
+                continue
+            else:
+                # Unknown condition token — fail closed and alert
+                logger.error(
+                    f"Skill {self.name}: unknown postcondition '{condition}' — "
+                    f"treating as verification failure to prevent silent bypass"
+                )
+                return False
         return True
 
     def to_dict(self) -> Dict[str, Any]:
-        """Serialize to dictionary."""
+        """Serialize to dictionary.
+
+        v3: Includes Voyager-style executable fields (executable_code,
+        preconditions, postconditions, error_patterns) to ensure
+        behavioral round-trip on persistence reload.
+        """
         return {
             "name": self.name,
             "description": self.description,
@@ -242,14 +265,32 @@ class SkillEntry:
             "version": self.version,
             "inputs": self.inputs,
             "outputs": self.outputs,
+            # v3: Voyager-style executable fields (must round-trip)
+            "executable_code": self.executable_code,
+            "preconditions": self.preconditions,
+            "postconditions": self.postconditions,
+            "error_patterns": self.error_patterns,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SkillEntry":
-        """Deserialize from dictionary."""
+        """Deserialize from dictionary.
+
+        Backward-compatible: if executable fields are missing from older
+        serialized data, defaults are used via .get().
+        """
         metadata_data = data.pop("metadata", {})
+        # Backward-compatible defaults for Voyager-style fields
+        executable_code = data.pop("executable_code", "")
+        preconditions = data.pop("preconditions", [])
+        postconditions = data.pop("postconditions", [])
+        error_patterns = data.pop("error_patterns", {})
         return cls(
             metadata=SkillMetadata.from_dict(metadata_data),
+            executable_code=executable_code,
+            preconditions=preconditions,
+            postconditions=postconditions,
+            error_patterns=error_patterns,
             **data,
         )
 
@@ -307,7 +348,13 @@ class SkillStore:
         self._load()
 
     def _load(self) -> None:
-        """Load skills from persistent storage."""
+        """Load skills from persistent storage.
+
+        On corruption, preserves the broken file for forensic analysis
+        (renamed to .corrupt.<timestamp>) instead of silently discarding data.
+        The in-memory store is still reset so the process can continue, but
+        the error is surfaced via logging so operators can investigate.
+        """
         skills_dir = self.store_dir / "skills"
         if not skills_dir.exists():
             return
@@ -329,8 +376,18 @@ class SkillStore:
                             if entry.domain not in self._domain_index:
                                 self._domain_index[entry.domain] = set()
                             self._domain_index[entry.domain].add(name)
-            except (json.JSONDecodeError, KeyError, TypeError):
-                # Corrupt index — start fresh
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                # Corrupt index — preserve broken file, reset in-memory, log loudly
+                logger.error(
+                    f"SkillStore: corrupt index at {index_path}: {exc!r}. "
+                    f"Renaming to .corrupt.<ts> and resetting in-memory store."
+                )
+                # Rename broken file for forensic recovery
+                try:
+                    corrupt_name = f"index.json.corrupt.{int(time.time())}"
+                    index_path.rename(index_path.parent / corrupt_name)
+                except OSError:
+                    pass  # Best-effort rename; don't mask the original error
                 self._skills = {}
                 self._hash_index = {}
                 self._domain_index = {}
@@ -422,12 +479,17 @@ class SkillStore:
         Returns:
             List of matching SkillEntry objects, sorted by confidence.
         """
+        # Snapshot BOTH structures atomically under lock to prevent
+        # torn reads between candidates and domain_index.
         with self._lock:
             candidates = list(self._skills.values())
+            domain_index_snapshot: Dict[str, Set[str]] = {
+                k: set(v) for k, v in self._domain_index.items()
+            }
 
-        # Filter by domain
+        # Filter by domain using snapshot only
         if domain is not None:
-            domain_names = self._domain_index.get(domain, set())
+            domain_names = domain_index_snapshot.get(domain, set())
             candidates = [s for s in candidates if s.name in domain_names]
 
         # Filter by skill type

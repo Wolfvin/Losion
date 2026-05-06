@@ -32,6 +32,7 @@ helps, the threshold goes down (more likely to trigger web search).
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -262,6 +263,9 @@ class CalibrationEngine:
         # Outcome history for calibration: domain → action → [(success, confidence_delta)]
         self._outcome_history: Dict[str, Dict[str, List[Tuple[bool, float]]]] = {}
 
+        # Thread safety: protect shared mutable dicts
+        self._lock = threading.RLock()
+
     def get_thresholds(self, domain: Optional[str] = None) -> Dict[str, float]:
         """Get adaptive thresholds for the given domain.
 
@@ -279,41 +283,42 @@ class CalibrationEngine:
         Returns:
             Dictionary of threshold_name → threshold_value.
         """
-        # Get base thresholds from domain profile
-        if domain and domain in self._profiles:
-            profile = self._profiles[domain]
-            thresholds = {
-                "web_search": profile.web_search_threshold,
-                "skill_lookup": profile.skill_lookup_threshold,
-                "tool_search": profile.tool_search_threshold,
-                "verify": profile.verify_threshold,
-                "terminal": profile.terminal_threshold,
+        with self._lock:
+            # Get base thresholds from domain profile
+            if domain and domain in self._profiles:
+                profile = self._profiles[domain]
+                thresholds = {
+                    "web_search": profile.web_search_threshold,
+                    "skill_lookup": profile.skill_lookup_threshold,
+                    "tool_search": profile.tool_search_threshold,
+                    "verify": profile.verify_threshold,
+                    "terminal": profile.terminal_threshold,
+                }
+            else:
+                thresholds = dict(self.DEFAULT_THRESHOLDS)
+
+            # Adjust based on tool trust scores
+            tool_action_map = {
+                "web_search": "web_search",
+                "skill_lookup": "skill_lookup",
+                "tool_search": "tool_search",
+                "terminal": "terminal_execute",
+                "verify": "verify_output",
             }
-        else:
-            thresholds = dict(self.DEFAULT_THRESHOLDS)
 
-        # Adjust based on tool trust scores
-        tool_action_map = {
-            "web_search": "web_search",
-            "skill_lookup": "skill_lookup",
-            "tool_search": "tool_search",
-            "terminal": "terminal_execute",
-            "verify": "verify_output",
-        }
+            for action, tool_name in tool_action_map.items():
+                trust = self._tool_trust.get(tool_name)
+                if trust and trust.total_uses >= self.min_samples:
+                    # High trust → lower threshold (use more eagerly)
+                    # Low trust → higher threshold (use more cautiously)
+                    trust_delta = (trust.trust_score - 0.5) * 0.2  # Max ±0.1 adjustment
+                    domain_trust = trust.domain_scores.get(domain or "", trust.trust_score)
+                    domain_delta = (domain_trust - 0.5) * 0.1
 
-        for action, tool_name in tool_action_map.items():
-            trust = self._tool_trust.get(tool_name)
-            if trust and trust.total_uses >= self.min_samples:
-                # High trust → lower threshold (use more eagerly)
-                # Low trust → higher threshold (use more cautiously)
-                trust_delta = (trust.trust_score - 0.5) * 0.2  # Max ±0.1 adjustment
-                domain_trust = trust.domain_scores.get(domain or "", trust.trust_score)
-                domain_delta = (domain_trust - 0.5) * 0.1
+                    adjusted = thresholds[action] - trust_delta - domain_delta
+                    thresholds[action] = max(self.min_threshold, min(self.max_threshold, adjusted))
 
-                adjusted = thresholds[action] - trust_delta - domain_delta
-                thresholds[action] = max(self.min_threshold, min(self.max_threshold, adjusted))
-
-        return thresholds
+            return thresholds
 
     def record_outcome(
         self,
@@ -343,27 +348,28 @@ class CalibrationEngine:
             confidence_before: Confidence before the action.
             confidence_after: Confidence after the action.
         """
-        # Update tool trust
-        if action not in self._tool_trust:
-            self._tool_trust[action] = ToolTrustScore(tool_name=action)
-        self._tool_trust[action].record_outcome(success, domain)
+        with self._lock:
+            # Update tool trust
+            if action not in self._tool_trust:
+                self._tool_trust[action] = ToolTrustScore(tool_name=action)
+            self._tool_trust[action].record_outcome(success, domain)
 
-        # Record in outcome history
-        if domain not in self._outcome_history:
-            self._outcome_history[domain] = {}
-        if action not in self._outcome_history[domain]:
-            self._outcome_history[domain][action] = []
+            # Record in outcome history
+            if domain not in self._outcome_history:
+                self._outcome_history[domain] = {}
+            if action not in self._outcome_history[domain]:
+                self._outcome_history[domain][action] = []
 
-        confidence_delta = confidence_after - confidence_before
-        self._outcome_history[domain][action].append((success, confidence_delta))
+            confidence_delta = confidence_after - confidence_before
+            self._outcome_history[domain][action].append((success, confidence_delta))
 
-        # Keep history bounded
-        if len(self._outcome_history[domain][action]) > 100:
-            self._outcome_history[domain][action] = self._outcome_history[domain][action][-100:]
+            # Keep history bounded
+            if len(self._outcome_history[domain][action]) > 100:
+                self._outcome_history[domain][action] = self._outcome_history[domain][action][-100:]
 
-        # Adapt domain profile if enough samples
-        if domain and domain in self._profiles:
-            self._adapt_profile(domain, action, success, confidence_delta)
+            # Adapt domain profile if enough samples
+            if domain and domain in self._profiles:
+                self._adapt_profile(domain, action, success, confidence_delta)
 
     def _adapt_profile(
         self,
@@ -438,34 +444,36 @@ class CalibrationEngine:
         Returns:
             Trust score [0.0, 1.0].
         """
-        trust = self._tool_trust.get(action)
-        if trust is None:
-            return 0.5  # Neutral
+        with self._lock:
+            trust = self._tool_trust.get(action)
+            if trust is None:
+                return 0.5  # Neutral
 
-        if domain and domain in trust.domain_scores:
-            return trust.domain_scores[domain]
+            if domain and domain in trust.domain_scores:
+                return trust.domain_scores[domain]
 
-        return trust.trust_score
+            return trust.trust_score
 
     def get_stats(self) -> Dict[str, Any]:
         """Get calibration statistics."""
-        return {
-            "domain_profiles": {
-                name: {
-                    "web_search": prof.web_search_threshold,
-                    "skill_lookup": prof.skill_lookup_threshold,
-                    "tool_search": prof.tool_search_threshold,
-                    "sample_count": prof.sample_count,
-                }
-                for name, prof in self._profiles.items()
-            },
-            "tool_trust": {
-                name: {
-                    "trust": score.trust_score,
-                    "reliability": score.reliability,
-                    "uses": score.total_uses,
-                }
-                for name, score in self._tool_trust.items()
-            },
-            "learning_rate": self.learning_rate,
-        }
+        with self._lock:
+            return {
+                "domain_profiles": {
+                    name: {
+                        "web_search": prof.web_search_threshold,
+                        "skill_lookup": prof.skill_lookup_threshold,
+                        "tool_search": prof.tool_search_threshold,
+                        "sample_count": prof.sample_count,
+                    }
+                    for name, prof in self._profiles.items()
+                },
+                "tool_trust": {
+                    name: {
+                        "trust": score.trust_score,
+                        "reliability": score.reliability,
+                        "uses": score.total_uses,
+                    }
+                    for name, score in self._tool_trust.items()
+                },
+                "learning_rate": self.learning_rate,
+            }
