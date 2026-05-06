@@ -81,31 +81,33 @@ def _derive_fernet_key(passphrase: str, salt: bytes) -> bytes:
     Uses PBKDF2-HMAC-SHA256 with 100,000 iterations for key derivation.
     The derived key is base64-encoded to match Fernet's expected format.
 
+    v2.5.2: Removed unreachable else branch that used _base64 (not in scope
+    when cryptography is not installed). This function is ONLY called when
+    _FERNET_AVAILABLE is True, so the fallback was dead code with a NameError.
+
     Args:
         passphrase: The encryption passphrase.
         salt: Random salt bytes (16 bytes).
 
     Returns:
         Base64-encoded 32-byte key suitable for Fernet.
+
+    Raises:
+        RuntimeError: If cryptography package is not installed.
     """
-    if _FERNET_AVAILABLE:
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            iterations=100_000,
+    if not _FERNET_AVAILABLE:
+        raise RuntimeError(
+            "_derive_fernet_key() requires the 'cryptography' package. "
+            "Install with: pip install cryptography"
         )
-        key = kdf.derive(passphrase.encode("utf-8"))
-        return _base64.urlsafe_b64encode(key)
-    else:
-        # Fallback: derive 32 bytes using stdlib hashlib
-        raw = hashlib.pbkdf2_hmac(
-            "sha256",
-            passphrase.encode("utf-8"),
-            salt,
-            iterations=100_000,
-        )
-        return _base64.urlsafe_b64encode(raw)
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=100_000,
+    )
+    key = kdf.derive(passphrase.encode("utf-8"))
+    return _base64.urlsafe_b64encode(key)
 
 
 def _xor_encrypt_decrypt(data: bytes, key: bytes) -> bytes:
@@ -439,9 +441,15 @@ class EpisodicMemory:
     def store_episode(self, episode: Episode) -> None:
         """Store an episode in memory.
 
+        v2.5.2: Moved auto_save (which involves encryption + disk I/O) outside
+        the lock to prevent blocking other threads during PBKDF2 key derivation
+        (~100-300ms per call). The in-memory store update is still inside the
+        lock for thread safety, but I/O is deferred.
+
         Args:
             episode: Episode to store.
         """
+        should_save = False
         with self._lock:
             # Check capacity
             if (
@@ -465,8 +473,12 @@ class EpisodicMemory:
                     self._domain_index[episode.domain] = set()
                 self._domain_index[episode.domain].add(episode.episode_id)
 
-            if self.auto_save:
-                self._save()
+            should_save = self.auto_save
+
+        # v2.5.2: Save OUTSIDE the lock — encryption + disk I/O can take
+        # 100-300ms per call, blocking all other threads during that time.
+        if should_save:
+            self._save()
 
     def retrieve_similar(
         self,
@@ -668,6 +680,10 @@ class EpisodicMemory:
     def _load(self) -> None:
         """Load episodes from persistent storage.
 
+        v2.5.2: Moved decryption outside the lock to avoid blocking during
+        PBKDF2 key derivation. Files are read and decrypted first, then the
+        lock is acquired briefly to populate the in-memory store.
+
         On corruption, preserves the broken file for forensic analysis
         (renamed to .corrupt.<timestamp>) and skips bad entries individually
         instead of nuking the full store. Errors are surfaced via logging.
@@ -692,13 +708,15 @@ class EpisodicMemory:
                     index_path.rename(index_path.parent / corrupt_name)
                 except OSError:
                     pass
-                self._episodes = {}
-                self._query_index = {}
-                self._domain_index = {}
+                with self._lock:
+                    self._episodes = {}
+                    self._query_index = {}
+                    self._domain_index = {}
                 return
 
-            # Load each episode individually — skip bad entries instead of
-            # nuking the entire store on a single bad file.
+            # === Phase 1: Read and decrypt all files (outside lock) ===
+            # This is the slow part — PBKDF2 + Fernet decryption per file.
+            loaded_episodes: List[Episode] = []
             episode_ids = index.get("episode_ids", [])
             for episode_id in episode_ids:
                 ep_path = episodes_dir / f"{episode_id}.json"
@@ -717,16 +735,7 @@ class EpisodicMemory:
                             # Load plain JSON episode
                             with open(ep_path, "r", encoding="utf-8") as f:
                                 episode = Episode.from_dict(json.load(f))
-                        self._episodes[episode_id] = episode
-                        # Rebuild indices
-                        query_hash = self._hash_query(episode.query)
-                        if query_hash not in self._query_index:
-                            self._query_index[query_hash] = set()
-                        self._query_index[query_hash].add(episode_id)
-                        if episode.domain:
-                            if episode.domain not in self._domain_index:
-                                self._domain_index[episode.domain] = set()
-                            self._domain_index[episode.domain].add(episode_id)
+                        loaded_episodes.append(episode)
                     except (json.JSONDecodeError, KeyError, TypeError) as ep_exc:
                         # Skip this bad entry but continue loading others
                         logger.error(
@@ -735,31 +744,67 @@ class EpisodicMemory:
                         )
                         continue
 
+            # === Phase 2: Populate in-memory store (inside lock, fast) ===
+            with self._lock:
+                for episode in loaded_episodes:
+                    self._episodes[episode.episode_id] = episode
+                    query_hash = self._hash_query(episode.query)
+                    if query_hash not in self._query_index:
+                        self._query_index[query_hash] = set()
+                    self._query_index[query_hash].add(episode.episode_id)
+                    if episode.domain:
+                        if episode.domain not in self._domain_index:
+                            self._domain_index[episode.domain] = set()
+                        self._domain_index[episode.domain].add(episode.episode_id)
+
     def _save(self) -> None:
         """Save episodes to persistent storage.
 
-        v2.5.0: When encryption is enabled, episode JSON files are encrypted
-        at rest using the _EncryptionManager. The salt is stored in a
-        separate ``.salt`` file alongside the episode file.
+        v2.5.2: Refactored to move encryption and disk I/O outside the lock.
+        Previously, _save() was called inside `with self._lock`, which meant
+        PBKDF2 key derivation (~100-300ms) blocked all other threads. Now we
+        snapshot the state under a brief lock, then perform crypto + I/O
+        without holding the lock.
+
+        The trade-off is that concurrent store_episode() calls between the
+        snapshot and the disk write may not be reflected in this particular
+        save — but they will trigger their own auto_save. This is acceptable
+        because the in-memory store is always the source of truth during
+        runtime, and disk is a persistent backup.
         """
+        # === Phase 1: Snapshot state under lock (fast, no I/O) ===
+        with self._lock:
+            episodes_snapshot = {
+                eid: ep.to_dict() for eid, ep in self._episodes.items()
+            }
+            index_data = {
+                "episode_ids": list(self._episodes.keys()),
+                "last_updated": time.time(),
+            }
+            stats_data = {
+                "total_episodes": len(self._episodes),
+                "successful_episodes": sum(1 for e in self._episodes.values() if e.success),
+                "success_rate": sum(1 for e in self._episodes.values() if e.success) / max(len(self._episodes), 1),
+                "domains": {d: len(ids) for d, ids in self._domain_index.items()},
+                "total_lessons_learned": sum(len(e.key_lessons) for e in self._episodes.values()),
+                "max_capacity": self.max_episodes if self.max_episodes > 0 else "unlimited",
+            }
+
+        # === Phase 2: Encrypt + write to disk (outside lock, can be slow) ===
         episodes_dir = self.store_dir / "episodes"
         episodes_dir.mkdir(parents=True, exist_ok=True)
 
         # Save index
-        index = {
-            "episode_ids": list(self._episodes.keys()),
-            "last_updated": time.time(),
-        }
         with open(self.store_dir / "index.json", "w", encoding="utf-8") as f:
-            json.dump(index, f, indent=2)
+            json.dump(index_data, f, indent=2)
 
-        # Save each episode (with optional encryption)
-        for episode_id, episode in self._episodes.items():
+        # Save each episode (with optional encryption — this is the slow part)
+        for episode_id, episode_dict in episodes_snapshot.items():
             ep_path = episodes_dir / f"{episode_id}.json"
-            episode_json = json.dumps(episode.to_dict(), indent=2, ensure_ascii=False)
+            episode_json = json.dumps(episode_dict, indent=2, ensure_ascii=False)
 
             if self._encryption.enabled:
-                # Encrypt the JSON data
+                # Encrypt the JSON data (PBKDF2 + Fernet happens here)
                 data_bytes = episode_json.encode("utf-8")
                 encrypted_bytes, salt = self._encryption.encrypt(data_bytes)
 
@@ -776,21 +821,9 @@ class EpisodicMemory:
                 with open(ep_path, "w", encoding="utf-8") as f:
                     f.write(episode_json)
 
-        # Save stats (compute inline to avoid deadlock — _save is called within _lock)
-        total = len(self._episodes)
-        successful = sum(1 for e in self._episodes.values() if e.success)
-        domains = {d: len(ids) for d, ids in self._domain_index.items()}
-        total_lessons = sum(len(e.key_lessons) for e in self._episodes.values())
-        stats = {
-            "total_episodes": total,
-            "successful_episodes": successful,
-            "success_rate": successful / max(total, 1),
-            "domains": domains,
-            "total_lessons_learned": total_lessons,
-            "max_capacity": self.max_episodes if self.max_episodes > 0 else "unlimited",
-        }
+        # Save stats
         with open(self.store_dir / "stats.json", "w", encoding="utf-8") as f:
-            json.dump(stats, f, indent=2)
+            json.dump(stats_data, f, indent=2)
 
     def get_stats(self) -> Dict[str, Any]:
         """Get memory statistics."""

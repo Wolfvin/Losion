@@ -5,6 +5,32 @@ All notable changes to the Losion project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.2] — 2026-05-06
+
+### "Code Quality & Performance — Weight Init Fix, Lock Contention, Dead Code, Silent Swallows"
+
+Follow-up patch addressing 4 findings from the v2.5.1 audit (score 9.4/10). Focus on incomplete refactoring from v2.5.0/v2.5.1, performance bottleneck in encryption, and silent exception swallowing.
+
+#### Fixed — MEDIUM (3 issues)
+
+- **2.1: `_derive_fernet_key()` has unreachable and buggy else branch** (`agent/memory.py`): The `else` branch used `_base64` which is only imported inside the `try` block with `cryptography`. When `cryptography` is not installed, `_base64` doesn't exist in scope, causing a `NameError`. However, since `_derive_fernet_key()` is only called when `_FERNET_AVAILABLE=True`, this branch was unreachable in practice. Fix: Removed the entire `else` branch and replaced the `if _FERNET_AVAILABLE` guard with `if not _FERNET_AVAILABLE: raise RuntimeError(...)`. This makes the function's contract explicit: it REQUIRES the cryptography package.
+
+- **2.2: `LosionForCausalLMV2._init_weights()` still uses Kaiming (regression)** (`models/losion_model_v2.py`): When `WeightInitMixin` was created in v2.5.0, only `LosionModel` (V1) was migrated. `LosionModelV2` had a `@staticmethod` with hardcoded `n_layers=12`, and `LosionForCausalLMV2` still used `kaiming_normal_` — which was identified as a bug in the v2.3.0 audit (finding I-11). Since `self.apply(self._init_weights)` in the wrapper also re-initializes layers already initialized by the backbone, the kaiming init was OVERWRITING the correct GPT-2 style init from the backbone. Fix: Both `LosionModelV2` and `LosionForCausalLMV2` now inherit from `WeightInitMixin`. Removed the old `@staticmethod` methods. Added `self.n_layers = config.n_layers` to `LosionForCausalLMV2.__init__()` (required by the mixin). This also fixes the hardcoded `n_layers=12` bug in `LosionModelV2`.
+
+- **2.3: PBKDF2 100k iterations inside lock causes thread contention** (`agent/memory.py`): `_save()` was called inside `with self._lock`, and `_save()` calls `encrypt()` which performs PBKDF2 key derivation (~100-300ms per call). This blocked all other threads (`store_episode()`, `retrieve_similar()`, etc.) during the entire crypto + I/O operation. For active deployments with multiple concurrent agents, this was a significant bottleneck. Fix: Refactored `_save()` to use a two-phase approach: (1) snapshot state under a brief lock (no I/O), (2) encrypt + write to disk outside the lock. Similarly, `_load()` now decrypts all files outside the lock, then populates the in-memory store inside a brief lock. `store_episode()` now calls `_save()` outside the lock. The trade-off is that concurrent writes between snapshot and disk write may not be reflected — but they trigger their own auto_save, and the in-memory store is always the source of truth.
+
+#### Fixed — LOW (1 issue)
+
+- **2.4: Two `except (ImportError, Exception)` blocks silently swallow all router errors** (`models/losion_model_v2.py`): In `LosionLayerV2.forward()` and the V1-compat forward, the router try/except caught `(ImportError, Exception)` which is equivalent to catching just `Exception` — it swallowed `RuntimeError`, `AttributeError`, `ValueError`, and all other real bugs silently, falling back to basic routing without any indication that something was wrong. Fix: Split into two separate `except` clauses: `except ImportError` for module-not-available (silent fallback is correct), and `except Exception as e` with `logger.warning(exc_info=True)` for all other errors (fallback still happens for robustness, but the error is now logged with full traceback). Added `import logging` and `logger = logging.getLogger(__name__)` to the file.
+
+#### Version Updates
+
+- `losion/__init__.py`: `__version__` bumped to `"2.5.2"`
+- `setup.py`: version bumped to `"2.5.2"`
+- `pyproject.toml`: version bumped to `"2.5.2"`
+- `README.md`: badge updated to `2.5.2`
+- `requirements.txt`: header updated to `v2.5.2`
+
 ## [2.5.1] — 2026-05-06
 
 ### "Security & Correctness Patch — Docker, Encryption, Negation Detection, Secure Defaults"

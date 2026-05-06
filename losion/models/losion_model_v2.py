@@ -23,6 +23,7 @@ Credits & References:
 from __future__ import annotations
 
 import math
+import logging
 import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -30,6 +31,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 from losion.config import LosionConfig, RecurrentConfig, JEPAConfig
 from losion.models.shared import RMSNorm as _SharedRMSNorm, WeightInitMixin
@@ -574,7 +577,22 @@ class LosionLayerV2(nn.Module):
                 else:
                     route_logits = self.router(x)
                     route_weights = F.softmax(route_logits, dim=-1)
-            except (ImportError, Exception):
+            except ImportError:
+                # Module not available — fall back to basic routing
+                route_logits = self.router(x)
+                if isinstance(route_logits, torch.Tensor):
+                    route_weights = F.softmax(route_logits, dim=-1)
+                else:
+                    route_weights = route_logits
+            except Exception as e:
+                # v2.5.2: Log the exception instead of silently swallowing it
+                # (audit finding 2.4). Previously (ImportError, Exception)
+                # caught ALL exceptions silently, hiding real bugs like
+                # RuntimeError, AttributeError, etc.
+                logger.warning(
+                    "AdaptiveRouter forward failed, falling back to basic "
+                    "routing: %s: %s", type(e).__name__, e, exc_info=True
+                )
                 route_logits = self.router(x)
                 if isinstance(route_logits, torch.Tensor):
                     route_weights = F.softmax(route_logits, dim=-1)
@@ -932,7 +950,20 @@ class LosionLayerV2(nn.Module):
                 else:
                     route_logits = self.router(x)
                     route_weights = F.softmax(route_logits, dim=-1)
-            except (ImportError, Exception):
+            except ImportError:
+                # Module not available — fall back to basic routing
+                route_logits = self.router(x)
+                if isinstance(route_logits, torch.Tensor):
+                    route_weights = F.softmax(route_logits, dim=-1)
+                else:
+                    route_weights = route_logits
+            except Exception as e:
+                # v2.5.2: Log the exception (audit finding 2.4)
+                logger.warning(
+                    "AdaptiveRouter forward failed in _forward_v1_compat, "
+                    "falling back to basic routing: %s: %s",
+                    type(e).__name__, e, exc_info=True
+                )
                 route_logits = self.router(x)
                 if isinstance(route_logits, torch.Tensor):
                     route_weights = F.softmax(route_logits, dim=-1)
@@ -1036,7 +1067,7 @@ def _checkpoint_layer_fn(
 # ============================================================================
 
 
-class LosionModelV2(nn.Module):
+class LosionModelV2(nn.Module, WeightInitMixin):
     """Losion V2 backbone with fully integrated Tri-Jalur architecture.
 
     Config-driven module selection replaces all Simplified* placeholders.
@@ -1184,40 +1215,8 @@ class LosionModelV2(nn.Module):
         # Gradient checkpointing
         self.gradient_checkpointing: bool = False
 
-        # Initialize weights
+        # Initialize weights (v2.5.2: uses WeightInitMixin from shared.py)
         self.apply(self._init_weights)
-
-    @staticmethod
-    def _init_weights(module: nn.Module) -> None:
-        """LLM-standard weight initialization.
-
-        v2.4.0: Updated from Kaiming to GPT-2/NeoX style init.
-        - Linear: normal(0, 0.02 / sqrt(2 * n_layers)) — residual stream scaling
-        - Conv1d: same as Linear — consistent with SSM causal conv
-        - Embedding: normal(0, 0.02)
-        - Biases: zeros
-
-        Note: This is a static method and cannot access self.n_layers.
-        We use a fixed depth scaling factor. For very deep models (>50 layers),
-        consider re-initializing with the actual n_layers value.
-        """
-        if isinstance(module, nn.Linear):
-            # Scaled init for residual stream stability
-            # Default scaling assumes ~12 layers; for deeper models,
-            # re-apply with the correct n_layers via model.apply()
-            n_layers = 12  # Conservative default
-            std = 0.02 / math.sqrt(2 * n_layers)
-            nn.init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Conv1d):
-            n_layers = 12
-            std = 0.02 / math.sqrt(2 * n_layers)
-            nn.init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.token_embedding
@@ -1579,7 +1578,7 @@ class MTPHead(nn.Module):
 # ============================================================================
 
 
-class LosionForCausalLMV2(nn.Module):
+class LosionForCausalLMV2(nn.Module, WeightInitMixin):
     """Losion V2 Causal Language Model with full generation support.
 
     Integrates:
@@ -1598,6 +1597,8 @@ class LosionForCausalLMV2(nn.Module):
         self.config = config
         self.model = LosionModelV2(config)
         self.vocab_size = config.vocab_size
+        # v2.5.2: Required by WeightInitMixin for residual stream scaling
+        self.n_layers = config.n_layers
 
         # LM head
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
@@ -1619,15 +1620,8 @@ class LosionForCausalLMV2(nn.Module):
             except Exception:
                 self.use_jepa = False
 
-        # Initialize weights
+        # Initialize weights (v2.5.2: uses WeightInitMixin — fixes kaiming regression)
         self.apply(self._init_weights)
-
-    @staticmethod
-    def _init_weights(module: nn.Module) -> None:
-        if isinstance(module, nn.Linear):
-            nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="linear")
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
 
     def forward(
         self,

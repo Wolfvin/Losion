@@ -209,7 +209,7 @@ Router:  Adaptive (BiasRouter + ThinkingToggle + Symbolic-MoE), GRPO/DAPO-traine
          + Router ↔ Expert Co-Evolution (Evoformer Level 5)
 """
 
-__version__ = "2.5.1"
+__version__ = "2.5.2"
 __author__ = "Losion Contributors"
 __license__ = "MIT"
 
