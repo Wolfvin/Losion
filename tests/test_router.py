@@ -179,7 +179,7 @@ class TestThinkingToggle:
         """Test bahwa confidence di [0, 1]."""
         x = torch.randn(2, 16, 64)
         assessment = thinking_toggle(x)
-        assert 0.0 <= assessment.confidence <= 1.0
+        assert (0.0 <= assessment.confidence).all() and (assessment.confidence <= 1.0).all()
 
     def test_set_force_mode(self, thinking_toggle):
         """Test force mode setting."""
@@ -286,7 +286,7 @@ class TestAdaptiveRouter:
         output = adaptive_router(x)
         # depth_multiplier bisa < 1.0 tergantung thinking assessment
         # Yang penting adalah nilainya valid (non-negative)
-        assert output.depth_multiplier >= 0.0
+        assert (output.depth_multiplier >= 0.0).all()
 
     def test_input_validation(self, adaptive_router):
         """Test validasi input."""

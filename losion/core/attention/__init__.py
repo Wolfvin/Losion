@@ -88,6 +88,12 @@ from losion.core.attention.child_3w import (
     Child3WRouter,
     Child3WAttention,
 )
+from losion.core.attention.attention_komposisi import (
+    AttentionState,
+    MLAKVCache,
+    AdaptiveInterleaving,
+    AttentionKompresiLayer,
+)
 
 __all__ = [
     "InterleavedRoPE",
@@ -121,4 +127,9 @@ __all__ = [
     "Child3WSet",
     "Child3WRouter",
     "Child3WAttention",
+    # Composite attention layer
+    "AttentionState",
+    "MLAKVCache",
+    "AdaptiveInterleaving",
+    "AttentionKompresiLayer",
 ]

@@ -80,19 +80,19 @@ class TestMLA:
         """Test bahwa output MLA memiliki shape yang benar."""
         batch, seq, d = 2, 16, 64
         x = torch.randn(batch, seq, d)
-        output, kv_latent, kv_cache = small_mla(x)
+        output, (kv_latent, _) = small_mla(x)
         assert output.shape == (batch, seq, d)
 
     def test_forward_no_nan(self, small_mla):
         """Test bahwa output tidak mengandung NaN."""
         x = torch.randn(2, 16, 64)
-        output, _, _ = small_mla(x)
+        output, _ = small_mla(x)
         assert not torch.isnan(output).any(), "MLA output mengandung NaN"
 
     def test_kv_latent_shape(self, small_mla):
         """Test bahwa KV latent memiliki shape yang benar."""
         x = torch.randn(2, 16, 64)
-        _, kv_latent, _ = small_mla(x)
+        _, (kv_latent, _) = small_mla(x)
         assert kv_latent.shape == (2, 16, 32)  # mla_latent_dim=32
 
     def test_memory_savings(self, small_mla):
@@ -104,9 +104,8 @@ class TestMLA:
     def test_forward_with_cache(self, small_mla):
         """Test forward dengan KV cache."""
         x = torch.randn(2, 16, 64)
-        _, kv_latent, kv_cache = small_mla(x)
-        # kv_cache bisa None jika tidak dibuat secara eksplisit
-        # Yang penting kv_latent harus ada
+        _, (kv_latent, _) = small_mla(x)
+        # kv_latent berisi compressed KV representation
         assert kv_latent is not None
 
     def test_forward_inference(self, small_mla):
@@ -116,7 +115,7 @@ class TestMLA:
         kv_cache = small_mla.create_kv_cache(
             batch_size=2, max_seq_len=64, dtype=torch.float32, device=torch.device("cpu")
         )
-        output, kv_cache = small_mla.forward_inference(
+        output, present_kv = small_mla.forward_inference(
             x, kv_cache=kv_cache, start_pos=0, rope_enabled=True
         )
         assert output.shape == (2, 1, 64)

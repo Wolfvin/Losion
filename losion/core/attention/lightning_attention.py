@@ -67,6 +67,9 @@ class InterleavedRoPE(nn.Module):
         base: Basis frekuensi sinusoidal (default 10000).
         interleaved: Jika True, dimensi RoPE dan non-RoPE di-interleave.
             Jika False, dimensi RoPE di awal dan non-RoPE di akhir.
+        ratio: Rasio RoPE:NoPE untuk pola interleaving per layer (default None).
+            Jika diberikan, mengaktifkan metode should_use_rope() dan get_layer_pattern().
+            Ratio R berarti dari setiap R+1 layer, R layer menggunakan RoPE dan 1 NoPE.
     """
 
     def __init__(
@@ -75,6 +78,7 @@ class InterleavedRoPE(nn.Module):
         d_rope: Optional[int] = None,
         base: float = 10000.0,
         interleaved: bool = True,
+        ratio: Optional[int] = None,
     ):
         super().__init__()
 
@@ -85,6 +89,7 @@ class InterleavedRoPE(nn.Module):
         self.d_rope = d_rope if d_rope is not None else dim
         self.base = base
         self.interleaved = interleaved
+        self.ratio = ratio  # Rasio RoPE:NoPE untuk pola per-layer
 
         if self.d_rope % 2 != 0:
             raise ValueError(f"d_rope must be even, got {self.d_rope}")
@@ -233,6 +238,39 @@ class InterleavedRoPE(nn.Module):
 
         return torch.cat([out1, out2], dim=-1)
 
+    def should_use_rope(self, layer_idx: int) -> bool:
+        """
+        Tentukan apakah layer pada indeks tertentu menggunakan RoPE.
+
+        Menggunakan rasio yang diberikan saat inisialisasi (self.ratio).
+        Jika ratio tidak diset, selalu mengembalikan True (semua layer RoPE).
+
+        Dengan ratio R, dari setiap (R+1) layer berturut-turut,
+        R layer menggunakan RoPE dan 1 layer menggunakan NoPE.
+        Layer dengan indeks i % (R+1) == R tidak menggunakan RoPE.
+
+        Args:
+            layer_idx: Indeks layer (0-based).
+
+        Returns:
+            True jika layer ini menggunakan RoPE.
+        """
+        if self.ratio is None:
+            return True
+        return (layer_idx % (self.ratio + 1)) != self.ratio
+
+    def get_layer_pattern(self, n_layers: int) -> list:
+        """
+        Hitung pola RoPE/NoPE untuk seluruh model.
+
+        Args:
+            n_layers: Jumlah total layer.
+
+        Returns:
+            List boolean dengan panjang n_layers. True = RoPE, False = NoPE.
+        """
+        return [self.should_use_rope(i) for i in range(n_layers)]
+
 
 # ============================================================================
 # MLA — Multi-head Latent Attention
@@ -280,8 +318,16 @@ class MLA(nn.Module):
         d_rope: Optional[int] = None,
         rope_base: float = 10000.0,
         dropout: float = 0.0,
+        d_kv: Optional[int] = None,
+        mla_latent_dim: Optional[int] = None,
         **kwargs,
     ):
+        # Backward-compatible aliases: d_kv -> d_head, mla_latent_dim -> kv_lora_rank
+        if d_kv is not None:
+            d_head = d_kv
+        if mla_latent_dim is not None:
+            kv_lora_rank = mla_latent_dim
+
         super().__init__()
 
         self.d_model = d_model
@@ -292,6 +338,10 @@ class MLA(nn.Module):
         self.q_lora_rank = q_lora_rank or d_model
         self.d_rope = d_rope or (d_head // 2)
         self.rope_base = rope_base
+
+        # Alias attributes untuk backward compatibility
+        self.d_kv = self.d_head
+        self.mla_latent_dim = self.kv_lora_rank
 
         # ---- KV compression ----
         # Down-projection: x → c_kv latent
@@ -446,6 +496,9 @@ class MLA(nn.Module):
         self,
         x: torch.Tensor,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        kv_cache: Optional[Any] = None,
+        start_pos: int = 0,
+        rope_enabled: bool = True,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Forward pass untuk inferensi token-per-token.
@@ -455,15 +508,71 @@ class MLA(nn.Module):
         Args:
             x: Tensor input satu token, (batch, 1, d_model).
             past_key_value: Tuple (cached_kv_latent, None).
+            kv_cache: MLAKVCache instance (backward-compatible alias untuk past_key_value).
+            start_pos: Posisi awal (backward-compatible, default 0).
+            rope_enabled: Apakah RoPE diaktifkan (backward-compatible, default True).
 
         Returns:
             Tuple (output, present_key_value).
         """
+        # Backward-compatible: jika kv_cache diberikan, gunakan sebagai past_key_value
+        if past_key_value is None and kv_cache is not None:
+            from losion.core.attention.attention_komposisi import MLAKVCache
+            if isinstance(kv_cache, MLAKVCache):
+                past_key_value = (kv_cache.get_cached(), None)
+            elif isinstance(kv_cache, tuple):
+                past_key_value = kv_cache
+
         return self.forward(
             x,
             attention_mask=None,
             past_key_value=past_key_value,
-            position_offset=0,
+            position_offset=start_pos,
+        )
+
+    @property
+    def memory_savings_ratio(self) -> float:
+        """
+        Rasio penghematan memori MLA vs standard attention.
+
+        Standard KV cache: 2 * n_heads * d_head per token
+        MLA KV cache: kv_lora_rank per token
+
+        Returns:
+            Float antara 0 dan 1 (misalnya 0.75 = 75% penghematan).
+        """
+        standard_kv_per_token = 2 * self.n_heads * self.d_head
+        mla_kv_per_token = self.kv_lora_rank
+        if standard_kv_per_token == 0:
+            return 0.0
+        return 1.0 - (mla_kv_per_token / standard_kv_per_token)
+
+    def create_kv_cache(
+        self,
+        batch_size: int,
+        max_seq_len: int,
+        dtype: torch.dtype = torch.float32,
+        device: torch.device = torch.device("cpu"),
+    ):
+        """
+        Buat KV cache untuk inference.
+
+        Args:
+            batch_size: Jumlah batch.
+            max_seq_len: Panjang sequence maksimum.
+            dtype: Data type tensor.
+            device: Device tensor.
+
+        Returns:
+            MLAKVCache instance.
+        """
+        from losion.core.attention.attention_komposisi import MLAKVCache
+        return MLAKVCache(
+            batch_size=batch_size,
+            max_seq_len=max_seq_len,
+            kv_lora_rank=self.kv_lora_rank,
+            dtype=dtype,
+            device=device,
         )
 
 

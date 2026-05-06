@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/Wolfvin/Losion/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"/></a>
-  <a href="https://github.com/Wolfvin/Losion/releases"><img src="https://img.shields.io/badge/version-2.0.0-brightgreen.svg" alt="Version 2.0.0"/></a>
+  <a href="https://github.com/Wolfvin/Losion/releases"><img src="https://img.shields.io/badge/version-2.2.0-brightgreen.svg" alt="Version 2.2.0"/></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"/></a>
   <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.1%2B-red.svg" alt="PyTorch"/></a>
 </p>
