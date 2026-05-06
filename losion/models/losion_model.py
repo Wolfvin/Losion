@@ -845,7 +845,14 @@ class LosionModel(nn.Module):
                     route_weights = F.softmax(route_logits, dim=-1)
 
                 # Step 2: Checkpoint the heavy computation only
-                def _checkpoint_compute(layer_module, attn_mask, r_weights):
+                # v2.4.1: inference_sparse and sparse_threshold are passed through
+                # for architectural consistency. During training, inference_sparse
+                # is always False (the layer's own check: `inference_sparse and
+                # not self.training`), so this has zero effect on training.
+                # However, if gradient checkpointing is ever enabled during eval
+                # (unusual but valid for memory-constrained inference), the
+                # sparse logic will work correctly.
+                def _checkpoint_compute(layer_module, attn_mask, r_weights, inf_sparse, sparse_thresh):
                     def _forward(*args):
                         hidden = args[0]
                         # Pass pre-computed routing weights to avoid re-computation
@@ -853,12 +860,14 @@ class LosionModel(nn.Module):
                             hidden,
                             attention_mask=attn_mask,
                             routing_weights=r_weights,
+                            inference_sparse=inf_sparse,
+                            sparse_threshold=sparse_thresh,
                         )
                         return out
                     return _forward
 
                 x = torch.utils.checkpoint.checkpoint(
-                    _checkpoint_compute(layer, attention_mask, route_weights),
+                    _checkpoint_compute(layer, attention_mask, route_weights, inference_sparse, sparse_threshold),
                     x,
                     use_reentrant=False,
                 )

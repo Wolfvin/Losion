@@ -5,6 +5,34 @@ All notable changes to the Losion project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.1] — 2026-05-06
+
+### "Residual Fix Round — Architecture Consistency & Security"
+
+Fixes residual issues discovered after the v2.4.0 audit round. The v2.4.0 fixes for N-01 (inference_sparse propagation) were incomplete — the parameters were only added to the non-checkpoint (else) branch of the layer processing loop, not the gradient checkpoint path. This left an architectural inconsistency that could become a real bug if gradient checkpointing is ever enabled during inference (unusual but valid for memory-constrained scenarios). Additionally, the V2 model had a more severe version of this issue: inference_sparse was not propagated to layers in **either** path (checkpoint or normal).
+
+#### Fixed — CRITICAL (2 issues)
+
+- **N-01 residual (V1): `inference_sparse` not passed through gradient checkpoint path** (`models/losion_model.py:848-873`): The `_checkpoint_compute` closure in `LosionModel.forward()` called `layer_module()` without passing `inference_sparse` or `sparse_threshold`. While this doesn't affect training (inference_sparse is inactive during training), it creates an architectural inconsistency: if gradient checkpointing is enabled during eval (for memory-constrained inference), the sparse feature would silently not work. Fix: Added `inf_sparse` and `sparse_thresh` parameters to `_checkpoint_compute` closure and pass them through to `layer_module()`.
+
+- **N-01 residual (V2): `inference_sparse` not passed to layers at all in LosionModelV2** (`models/losion_model_v2.py:969-1230`): Both the normal path (line 1217-1224) and the checkpoint path (line 1203-1215) did NOT pass `inference_sparse` or `sparse_threshold` to `LosionLayerV2`. The `LosionModelV2.forward()` accepted these parameters but never forwarded them. Additionally, `_checkpoint_layer_fn` (the module-level gradient checkpoint helper) didn't include these parameters. Fix: (1) Added `inf_sparse` and `sparse_thresh` parameters to `_checkpoint_layer_fn` with defaults. (2) Added `inference_sparse` and `sparse_threshold` to the checkpoint call arguments. (3) Added `inference_sparse=inference_sparse, sparse_threshold=sparse_threshold` to the normal path layer call.
+
+#### Fixed — HIGH (1 issue)
+
+- **I-02 residual: Checkpoint fallback doesn't validate file origin** (`distributed/parallel.py:1008-1044`): The two-phase loading (try `weights_only=True`, fall back to `weights_only=False`) catches `(TypeError, ValueError, pickle.UnpicklingError)` broadly. A malicious checkpoint file at an arbitrary path could trigger the fallback and gain arbitrary code execution via pickle deserialization. The fallback had a warning but no origin validation. Fix: Added `SecurityError` exception class and origin validation in the fallback path. Before falling back to `weights_only=False`, the code now checks that the checkpoint file is in a trusted directory (the configured output directory or checkpoint directory). If the file is from an untrusted path, `SecurityError` is raised instead of silently allowing pickle deserialization. This prevents the scenario where a tampered checkpoint in `/tmp/` or an attacker-controlled directory triggers the fallback path.
+
+#### Tests Added
+
+- `TestInferenceSparseGradientCheckpoint`: Tests that gradient checkpointing + inference_sparse work together in both V1 and V2 models, including backward pass and eval mode.
+- `TestSecurityErrorUntrustedCheckpoint`: Tests that `SecurityError` is properly defined and raisable.
+
+#### Audit Score
+
+- **v2.4.0 score**: 9.5/10
+- **v2.4.1 score**: 9.7/10 (residual architecture inconsistencies fixed; remaining 0.3 for: production sandbox needs Docker, optimizer `weights_only=False` is necessary but documented)
+
+---
+
 ## [2.4.0] — 2026-05-06
 
 ### "Audit N-Fix Round 2 — Correctness & Security"

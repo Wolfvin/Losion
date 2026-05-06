@@ -973,6 +973,8 @@ def _checkpoint_layer_fn(
     p: Optional[torch.Tensor],
     thinking_mode: Optional[bool],
     l: Optional[torch.Tensor],
+    inf_sparse: bool = False,
+    sparse_thresh: float = 0.05,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """Standalone function for gradient checkpointing.
 
@@ -983,8 +985,14 @@ def _checkpoint_layer_fn(
     reference from the LAST iteration, causing incorrect computation.
 
     A module-level function with explicit arguments avoids this entirely.
+
+    v2.4.1: Added inference_sparse and sparse_threshold parameters for
+    architectural consistency with the non-checkpoint path.
     """
-    return layer(h, attention_mask=m, position_ids=p, thinking_mode=thinking_mode, labels=l)
+    return layer(
+        h, attention_mask=m, position_ids=p, thinking_mode=thinking_mode,
+        labels=l, inference_sparse=inf_sparse, sparse_threshold=sparse_thresh,
+    )
 
 
 # ============================================================================
@@ -1200,9 +1208,13 @@ class LosionModelV2(nn.Module):
                 # `thinking_mode` and `layer` by reference, which could cause
                 # all layers to point to the last layer in some PyTorch versions.
                 # Now uses a standalone function with explicit argument capture.
+                # v2.4.1: Also pass inference_sparse/sparse_threshold for
+                # architectural consistency (no effect during training since
+                # inference_sparse is only active during eval).
                 x, layer_routing = torch.utils.checkpoint.checkpoint(
                     _checkpoint_layer_fn,
                     layer, x, attention_mask, position_ids, thinking_mode, labels,
+                    inference_sparse, sparse_threshold,
                     use_reentrant=False,
                 )
             else:
@@ -1213,6 +1225,8 @@ class LosionModelV2(nn.Module):
                     ssm_state=ssm_states.get(layer.layer_idx),
                     position_ids=position_ids,
                     labels=labels,
+                    inference_sparse=inference_sparse,
+                    sparse_threshold=sparse_threshold,
                 )
 
             # Update SSM states for next forward call

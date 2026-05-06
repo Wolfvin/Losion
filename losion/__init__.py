@@ -1,9 +1,16 @@
 """
 Losion — Hybrid AI Framework with Tri-Jalur Router Architecture.
 
-Version 2.4.0 — "Audit N-Fix Round 2"
+Version 2.4.1 — "Residual Fix Round"
 
-v2.4.0 Audit N-Fix Round 2 — Correctness & Security:
+v2.4.1 Residual Fix Round — Architecture Consistency & Security:
+  - CRITICAL: inference_sparse now propagated through gradient checkpoint path
+    in LosionModel (was only in the non-checkpoint/else branch)
+  - CRITICAL: inference_sparse now propagated to LosionLayerV2 in BOTH
+    checkpoint and normal paths in LosionModelV2 (was missing entirely)
+  - HIGH: parallel.py checkpoint fallback validates file origin before
+    weights_only=False — SecurityError raised for untrusted paths
+  - Tests added for gradient checkpoint + inference_sparse propagation
   - CRITICAL: inference_sparse feature now reachable — LosionModel and LosionModelV2
     propagate inference_sparse/sparse_threshold to LosionLayer/LosionLayerV2
   - HIGH: RLVR sandbox replaced with subprocess isolation (was regex, bypassable)
@@ -189,7 +196,7 @@ Router:  Adaptive (BiasRouter + ThinkingToggle + Symbolic-MoE), GRPO/DAPO-traine
          + Router ↔ Expert Co-Evolution (Evoformer Level 5)
 """
 
-__version__ = "2.4.0"
+__version__ = "2.4.1"
 __author__ = "Losion Contributors"
 __license__ = "MIT"
 

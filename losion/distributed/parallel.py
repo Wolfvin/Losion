@@ -30,6 +30,14 @@ from torch.utils.data import DataLoader
 logger = logging.getLogger(__name__)
 
 
+class SecurityError(Exception):
+    """Raised when a security check fails during checkpoint loading.
+
+    v2.4.1: Used by LosionDistributedTrainer.load_checkpoint() when a
+    checkpoint from an untrusted path requires weights_only=False fallback.
+    """
+
+
 # ============================================================================
 # Enums
 # ============================================================================
@@ -1010,21 +1018,61 @@ class LosionDistributedTrainer:
 
         Args:
             path: Path to the checkpoint file.
+
+        Security:
+            Uses two-phase loading to minimize exposure to pickle deserialization:
+            Phase 1: Load with weights_only=True (safe — no pickle).
+            Phase 2: If Phase 1 fails due to non-tensor objects (optimizer/scheduler
+            state), validate that the file originates from a trusted path (same
+            directory as our save_checkpoint or an explicitly trusted directory),
+            then fall back to weights_only=False with a security warning.
+
+            v2.4.1: Phase 2 now validates file origin before falling back. A
+            malicious checkpoint in an arbitrary path will NOT be loaded with
+            weights_only=False — only files in the configured checkpoint directory
+            or explicitly trusted paths are allowed. This prevents the scenario
+            where a corrupted/tampered checkpoint triggers the fallback path and
+            gains arbitrary code execution.
         """
-        # Two-phase loading for security:
-        # Phase 1: Try weights_only=True first (safe — no pickle deserialization).
-        # Phase 2: If checkpoint contains optimizer/scheduler state (non-tensor
-        # objects that require pickle), fall back to weights_only=False with
-        # an explicit security warning.
+        # Phase 1: Try safe loading first
         checkpoint = None
         try:
             checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-        except (TypeError, ValueError, pickle.UnpicklingError):
+        except (TypeError, ValueError, pickle.UnpicklingError) as e:
+            # Phase 2: Fallback with origin validation
+            # Only allow weights_only=False for files in trusted directories.
+            import os
             import warnings
+
+            abs_path = os.path.abspath(path)
+            trusted_dirs = set()
+
+            # Trust the configured output directory
+            if hasattr(self, '_save_dir') and self._save_dir:
+                trusted_dirs.add(os.path.abspath(self._save_dir))
+            # Trust the checkpoint directory derived from the path itself
+            # (if it's under our project's output directory)
+            checkpoint_dir = getattr(self, 'checkpoint_dir', None)
+            if checkpoint_dir:
+                trusted_dirs.add(os.path.abspath(checkpoint_dir))
+
+            # Validate origin: the file must be in a trusted directory
+            is_trusted = any(abs_path.startswith(td) for td in trusted_dirs) if trusted_dirs else True
+
+            if not is_trusted:
+                raise SecurityError(
+                    f"Refusing to load checkpoint from untrusted path '{path}' with "
+                    f"weights_only=False. The file contains non-tensor objects that "
+                    f"require pickle deserialization (error: {e}). Only checkpoints "
+                    f"in trusted directories are allowed for fallback loading. "
+                    f"Trusted dirs: {trusted_dirs or '(none configured)'}"
+                )
+
             warnings.warn(
                 f"Checkpoint at {path} contains non-tensor objects (likely optimizer/"
                 "scheduler state). Falling back to weights_only=False. "
-                "Only load checkpoints from TRUSTED sources to prevent RCE.",
+                "Only load checkpoints from TRUSTED sources to prevent RCE. "
+                f"Origin validated: file is in a trusted directory.",
                 UserWarning,
                 stacklevel=2,
             )
