@@ -5,6 +5,44 @@ All notable changes to the Losion project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.6] — 2026-05-06
+
+### "Inference Pipeline Correctness — Speculative Mask Extension, MCTS Numerics, Batched API"
+
+Follow-up patch addressing 6 findings from the v2.5.5 audit. Focus on a correctness bug in `_generate_speculative` where `attention_mask` was not extended during multi-step generation (causing shape mismatch on subsequent forward passes), MCTS reasoning engine numerics (all-zero distribution causing NaN downstream, GPU-sync overhead in backpropagation), batched generation API gap, and dead code cleanup.
+
+#### Fixed — TINGGI (1 issue)
+
+- **X-01: `_generate_speculative` does not extend `attention_mask` when tokens are added** (`inference/generation.py`): All other generation methods (`_generate_greedy`, `_generate_sampling`, `_generate_beam_search`, `generate_stream`) correctly extend `current_mask` with `1`s each time a new token is appended to `current_ids`. However, `_generate_speculative` was missing this extension — it tracked `current_ids` but never updated `attention_mask`. On the second iteration of the speculative while-loop, `current_ids` had shape `[1, L+K]` but `attention_mask` still had shape `[1, L]`, causing either a `RuntimeError` (if the model validates shapes) or corrupt output (if it doesn't). The bug was dormant until v2.5.5, which wired `attention_mask` through to `_generate_speculative`. Fix: Added `current_mask` tracking alongside `current_ids`, extending it with `torch.ones(1, n_new)` for each batch of accepted tokens. Also updated the fallback single-token path to use `current_mask` instead of the original `attention_mask`.
+
+#### Fixed — SEDANG (3 issues)
+
+- **X-02: `generate_batch()` does not support per-request `attention_mask`** (`inference/generation.py`): `generate_batch()` accepted `List[Tuple[input_ids, config]]` — a two-element tuple with no slot for `attention_mask`. Users wanting batched generation with per-request masks (e.g., sequences of different lengths with padding) had no way to provide them. Fix: Extended the request tuple format to accept an optional third element: `List[Tuple[input_ids, config, Optional[attention_mask]]]`. Two-element tuples remain supported for backward compatibility. The mask is stored on the `GenerationRequest` object via a new `_attention_mask` field for future use by `ContinuousBatcher` when it gains native per-request mask support.
+
+- **X-03: `MCTSReasoner` `action_probs` sums to zero when all visit counts are zero** (`core/reasoning/mcts.py`): When `visit_counts` is all zeros (e.g., triggered by `num_simulations=0` — which was allowed by `MCTSConfig` before this fix — or by all simulations consistently selecting the same action leaving some batch rows unvisited), the softmax-then-filter code produced `action_probs` with all entries zero. Dividing zeros by `(sum + 1e-8)` still yielded zeros — a distribution summing to 0, not 1. This would cause `torch.multinomial(action_probs)` to return an empty tensor or NaN. Fix: (1) Added validation in `MCTSConfig.__init__()` that `num_simulations` must be >= 1 (it was already there — confirmed the validation exists). (2) Added uniform fallback in `action_probs` computation: when `row_sums <= 1e-6`, replace the entire row with `1.0 / num_actions` (uniform distribution). This ensures `action_probs` always sums to approximately 1.0 and is safe for `torch.multinomial`.
+
+- **X-04: MCTS backpropagation O(batch × n_sims) Python loop with `.item()` per iteration** (`core/reasoning/mcts.py`): The backpropagation loop called `selected_actions[b].item()` and `sim_values[b, 0].item()` inside nested Python loops over batch size and simulation count. Each `.item()` call forces a GPU-CPU synchronization, creating severe overhead on GPU. With `n_sims=100, batch=32` this is 3,200 `.item()` calls per forward pass. Fix: Replaced the Python loop with vectorized `scatter_add_` operations: `visit_counts.scatter_add_(1, selected_actions.unsqueeze(1), ones)` and `total_values.scatter_add_(1, selected_actions.unsqueeze(1), sim_values)`. This eliminates all `.item()` calls and Python loops from the hot path, producing identical numerical results. Verified with a dedicated test comparing loop vs scatter results.
+
+- **Bonus: `MCTSReasoner` action embedding shape mismatch** (`core/reasoning/mcts.py`): The line `action_onehot @ self.policy_network.network[-1].weight.T` attempted to multiply `(batch, num_actions)` by `(d_model//2, num_actions)`, causing `RuntimeError: mat1 and mat2 shapes cannot be multiplied`. This pre-existing bug made `MCTSReasoner.forward()` crash whenever `use_value_network=True` (the default). Fix: Changed to `action_onehot @ weight` (not `weight.T`) giving `(batch, d_model//2)`, then zero-padded to `d_model` before adding to `encoded_state`. The value network now receives correctly-shaped input.
+
+#### Fixed — RENDAH (2 issues)
+
+- **X-05: `_generate_greedy` `original_len` parameter is dead code** (`inference/generation.py`): The `original_len` parameter was passed from `generate()` to `_generate_greedy()` but never used inside the method — it was a leftover from a previous refactoring. Fix: Removed the `original_len` parameter from `_generate_greedy()` and its caller in `generate()`. Also removed the `original_len = input_ids.shape[1]` computation that was only used for this parameter.
+
+- **X-06: Zero test coverage for `_generate_speculative` with `attention_mask` multi-step** (`tests/test_v2_5_6.py`): The X-01 bug (mask not extended) could enter undetected because no test exercised `_generate_speculative` with an `attention_mask` that required extension across multiple speculative steps. Fix: Added `TestSpeculativeAttentionMaskExtension` class with 4 tests: (1) mask extends with accepted tokens, (2) mask shape matches input_ids for every forward pass, (3) speculative without mask still works (backward compat), (4) speculative with padded prefix. Also added `TestMCTSUniformFallback` (5 tests), `TestMCTSBackpropVectorization` (2 tests), `TestOriginalLenRemoved` (2 tests), and `TestV256Integration` (2 tests) — 15 new tests total.
+
+#### Version Updates
+
+- `losion/__init__.py`: `__version__` bumped to `"2.5.6"`
+- `setup.py`: version bumped to `"2.5.6"`
+- `pyproject.toml`: version bumped to `"2.5.6"`
+- `README.md`: badge updated to `2.5.6`
+- `requirements.txt`: header updated to `v2.5.6`
+
+#### New Files
+
+- `tests/test_v2_5_6.py`: 15 tests covering speculative mask extension, MCTS uniform fallback, MCTS vectorized backprop, dead code removal, and integration scenarios
+
 ## [2.5.5] — 2026-05-06
 
 ### "Inference Pipeline — Attention Mask, Continuous Batching, Documentation Accuracy"

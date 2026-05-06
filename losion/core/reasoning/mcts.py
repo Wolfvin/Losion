@@ -318,10 +318,24 @@ class MCTSReasoner(nn.Module):
                     selected_actions, self.num_actions
                 ).float()  # [batch, num_actions]
 
+                # Project action through the policy network's last layer weight.
+                # The policy network maps d_model → d_model//2 → num_actions,
+                # so the last layer weight has shape (num_actions, d_model//2).
+                # action_onehot @ last_weight gives (batch, d_model//2).
+                # v2.5.6: Fixed shape mismatch — previously used weight.T which
+                # produced (d_model//2, num_actions), incompatible with
+                # (batch, num_actions). Now we correctly compute:
+                #   action_proj = action_onehot @ last_weight → (batch, d_model//2)
+                # then zero-pad to d_model for addition with encoded_state.
+                action_proj = action_onehot @ self.policy_network.network[-1].weight  # (batch, d_model//2)
+                padding = torch.zeros(
+                    batch_size, self.d_model - action_proj.shape[-1],
+                    device=x.device,
+                )
+                action_embedding = torch.cat([action_proj, padding], dim=-1)  # (batch, d_model)
+
                 # Gabungkan state + action
-                state_action = encoded_state + (
-                    action_onehot @ self.policy_network.network[-1].weight.T
-                )  # Approximation
+                state_action = encoded_state + action_embedding
                 sim_values = self.value_network(state_action)  # [batch, 1]
             else:
                 # Rollout-based: gunakan random value
@@ -330,10 +344,20 @@ class MCTSReasoner(nn.Module):
                 ) * 2 - 1  # [-1, 1]
 
             # === Backpropagation: update visit counts dan values ===
-            for b in range(batch_size):
-                a = selected_actions[b].item()
-                visit_counts[b, a] += 1
-                total_values[b, a] += sim_values[b, 0].item()
+            # v2.5.6: Vectorized with scatter_add_ — no Python loop,
+            # no .item() GPU sync. Previously O(batch * n_sims) Python
+            # iterations with .item() forcing GPU synchronization each
+            # time, causing severe overhead on GPU for large batches.
+            visit_counts.scatter_add_(
+                1,
+                selected_actions.unsqueeze(1),  # [batch, 1]
+                torch.ones(batch_size, 1, device=x.device, dtype=visit_counts.dtype),
+            )
+            total_values.scatter_add_(
+                1,
+                selected_actions.unsqueeze(1),  # [batch, 1]
+                sim_values,  # [batch, 1]
+            )
 
         # === Action Selection ===
         # Gunakan visit counts sebagai prioritas
@@ -341,14 +365,23 @@ class MCTSReasoner(nn.Module):
             action_probs = F.softmax(
                 visit_counts.log() / self.config.temperature, dim=-1
             )
-            # Handle zero visit counts
+            # Handle zero visit counts: zero out entries where no visits occurred
             action_probs = torch.where(
                 visit_counts > 0,
                 action_probs,
                 torch.zeros_like(action_probs),
             )
-            # Renormalize
-            action_probs = action_probs / (action_probs.sum(dim=-1, keepdim=True) + 1e-8)
+            # Renormalize, with uniform fallback if all visit counts are zero.
+            # This prevents action_probs from summing to 0 (which would cause
+            # NaN in torch.multinomial downstream). v2.5.6: Previously
+            # division by (sum + 1e-8) yielded all-zeros when the numerator
+            # was also zero.
+            row_sums = action_probs.sum(dim=-1, keepdim=True)
+            action_probs = torch.where(
+                row_sums > 1e-6,
+                action_probs / (row_sums + 1e-8),
+                torch.full_like(action_probs, 1.0 / self.num_actions),
+            )
         else:
             # Greedy: pilih aksi dengan visit count tertinggi
             action_probs = F.one_hot(

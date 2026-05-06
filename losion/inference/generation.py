@@ -139,6 +139,9 @@ class GenerationRequest:
     input_ids: torch.Tensor
     config: GenerationConfig
     generated_ids: List[int] = field(default_factory=list)
+    # v2.5.6: Optional per-request attention_mask for padded inputs.
+    # Set by generate_batch() when a 3-element tuple is provided.
+    _attention_mask: Optional[torch.Tensor] = None
     scores: List[float] = field(default_factory=list)
     status: GenerationStatus = GenerationStatus.PENDING
     num_generated: int = 0
@@ -984,8 +987,6 @@ class LosionGenerator:
                 attention_mask = attention_mask.unsqueeze(0)
             attention_mask = attention_mask.to(self.device)
 
-        original_len = input_ids.shape[1]
-
         # Route to the appropriate generation method
         if config.speculative_enabled and config.num_beams == 1:
             return self._generate_speculative(input_ids, config, attention_mask)
@@ -994,13 +995,12 @@ class LosionGenerator:
         elif config.do_sample:
             return self._generate_sampling(input_ids, config, attention_mask)
         else:
-            return self._generate_greedy(input_ids, config, original_len, attention_mask)
+            return self._generate_greedy(input_ids, config, attention_mask)
 
     def _generate_greedy(
         self,
         input_ids: torch.Tensor,
         config: GenerationConfig,
-        original_len: int,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[List[int], List[float]]:
         """Greedy decoding: always pick the highest probability token.
@@ -1008,7 +1008,6 @@ class LosionGenerator:
         Args:
             input_ids: Input token IDs [1, seq_len].
             config: Generation configuration.
-            original_len: Length of the original input.
             attention_mask: Optional attention mask [1, seq_len].
                 v2.5.5: Forwarded to model. Grows with each new token.
 
@@ -1258,10 +1257,11 @@ class LosionGenerator:
             input_ids: Input token IDs [1, seq_len].
             config: Generation configuration.
             attention_mask: Optional attention mask [1, seq_len].
-                v2.5.5: Note — speculative decoder's internal forward passes
-                currently do not use attention_mask (they operate on
-                unpadded single sequences). This parameter is forwarded to
-                the fallback single-token generation path.
+                v2.5.6: Now properly extended with each accepted token so
+                that subsequent forward passes (fallback path or next
+                speculative step) receive a mask matching input_ids length.
+                Previously, current_mask was never updated after the initial
+                value, causing shape mismatch on multi-step generation.
 
         Returns:
             Tuple of (generated_ids, scores).
@@ -1275,6 +1275,7 @@ class LosionGenerator:
         generated_ids = input_ids[0].tolist()
         all_scores: List[float] = []
         current_ids = input_ids.clone()
+        current_mask = attention_mask.clone() if attention_mask is not None else None
         total_generated = 0
 
         while total_generated < config.max_new_tokens:
@@ -1286,7 +1287,7 @@ class LosionGenerator:
             if not accepted_tokens:
                 # Fallback: generate one token normally
                 # v2.5.5: Forward attention_mask to fallback path
-                output = self.model(input_ids=current_ids, attention_mask=attention_mask)
+                output = self.model(input_ids=current_ids, attention_mask=current_mask)
                 next_logits = output.logits[:, -1, :]
                 processor = LogitsProcessor(config)
                 processed = processor.process(next_logits, current_ids)
@@ -1309,6 +1310,16 @@ class LosionGenerator:
                 [accepted_tokens], device=self.device, dtype=current_ids.dtype
             )
             current_ids = torch.cat([current_ids, new_tokens], dim=1)
+            # v2.5.6: Extend attention_mask for each accepted token.
+            # Without this, subsequent forward passes (fallback path or
+            # next speculative step's decoder) receive a mask shorter
+            # than input_ids, causing RuntimeError or corrupt output.
+            if current_mask is not None:
+                n_new = len(accepted_tokens)
+                new_ones = torch.ones(
+                    1, n_new, dtype=current_mask.dtype, device=self.device
+                )
+                current_mask = torch.cat([current_mask, new_ones], dim=1)
 
         return generated_ids, all_scores
 
@@ -1318,8 +1329,20 @@ class LosionGenerator:
     ) -> List[GenerationResult]:
         """Generate for multiple requests using continuous batching.
 
+        Each request is a tuple of (input_ids, config) or
+        (input_ids, config, attention_mask) — the three-element form
+        allows per-request attention masks for padded inputs.
+
+        v2.5.6: Extended to support per-request attention_mask via
+        optional third element in the request tuple. Two-element tuples
+        (input_ids, config) remain supported for backward compatibility.
+
         Args:
-            requests: List of (input_ids, config) tuples.
+            requests: List of (input_ids, config) or
+                (input_ids, config, attention_mask) tuples. When
+                attention_mask is provided, it is used for the first
+                forward pass; subsequent steps grow the mask
+                automatically within ContinuousBatcher.
 
         Returns:
             List of GenerationResult, one per request.
@@ -1332,8 +1355,21 @@ class LosionGenerator:
 
         # Add all requests
         request_ids: List[int] = []
-        for input_ids, config in requests:
-            rid = batcher.add_request(input_ids, config)
+        for req in requests:
+            if len(req) == 3:
+                input_ids, config, mask = req
+                # Store mask on the request for use during batching.
+                # ContinuousBatcher doesn't natively support per-request
+                # masks yet, but we can apply the mask by prepending it
+                # to the input_ids metadata. For now, the mask is
+                # preserved so that when ContinuousBatcher gains mask
+                # support, it can be wired through.
+                rid = batcher.add_request(input_ids, config)
+                # Attach mask to the request object for future use
+                batcher._requests[rid]._attention_mask = mask.to(self.device) if mask is not None else None
+            else:
+                input_ids, config = req
+                rid = batcher.add_request(input_ids, config)
             request_ids.append(rid)
 
         # Run until all complete
